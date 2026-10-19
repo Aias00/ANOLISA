@@ -9,13 +9,13 @@ if [ "$1" == "--filter" ]; then
     FILTER="$2"
 fi
 
-run_shell() {
+run_shell() (
     echo "==> Running copilot-shell tests"
     cd "$ROOT_DIR/deprecated/copilot-shell" || exit 1
     npm test
-}
+)
 
-run_sec() {
+run_sec() (
     echo "==> Running agent-sec-core tests"
     if command -v uv >/dev/null 2>&1; then
         make -C "$ROOT_DIR/src/agent-sec-core" test-python
@@ -24,14 +24,14 @@ run_sec() {
     fi
 
     echo "==> Running agent-sec-core e2e test scripts manually"
-    if [ -f "/usr/local/bin/linux-sandbox" ]; then
-        python3 tests/e2e/linux-sandbox/e2e_test.py
+    if command -v linux-sandbox >/dev/null 2>&1 || [ -x "/usr/local/bin/linux-sandbox" ]; then
+        python3 "$ROOT_DIR/src/agent-sec-core/tests/e2e/linux-sandbox/e2e_test.py"
     else
-        echo "linux-sandbox not found at /usr/local/bin/linux-sandbox, skipping e2e_test.py"
+        echo "linux-sandbox not found on PATH or at /usr/local/bin/linux-sandbox, skipping e2e_test.py"
     fi
-}
+)
 
-run_sight() {
+run_sight() (
     echo "==> Running agentsight tests"
     cd "$ROOT_DIR/src/agentsight" || exit 1
     if command -v cargo >/dev/null 2>&1; then
@@ -39,9 +39,9 @@ run_sight() {
     else
         echo "cargo not found, skipping agentsight tests."
     fi
-}
+)
 
-run_tokenless() {
+run_tokenless() (
     echo "==> Running tokenless tests"
     cd "$ROOT_DIR/src/tokenless" || exit 1
     if command -v make >/dev/null 2>&1; then
@@ -52,9 +52,9 @@ run_tokenless() {
     else
         echo "cargo not found, skipping tokenless tests."
     fi
-}
+)
 
-run_agent_memory() {
+run_agent_memory() (
     echo "==> Running agent-memory tests (Linux only)"
     cd "$ROOT_DIR/src/agent-memory" || exit 1
     if [ "$(uname -s)" != "Linux" ]; then
@@ -71,7 +71,7 @@ run_agent_memory() {
     else
         echo "cargo not found, skipping agent-memory tests."
     fi
-}
+)
 
 if [ -z "$FILTER" ]; then
     run_shell
