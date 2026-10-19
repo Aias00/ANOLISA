@@ -13,7 +13,7 @@ it is a real capture.
 | Privileges | `trace` needs root (or `CAP_BPF` + `CAP_PERFMON`). Query commands need read access to `/var/log/sysak/.agentsight`, which the packaged service owns — use `sudo`. |
 | Config file | Commands that read rules accept `--config`, default `/etc/agentsight/config.json`. `discover` reads the same file `trace` does, so it reflects your custom rules. |
 | Data location | Fixed at `/var/log/sysak/.agentsight`. `serve`, `dashboard`, `skill-metrics`, `audit`, `metrics`, `summary`, and `interruption` accept `--db` to point at a different database file. |
-| Machine output | `--json` is available on `discover`, `token`, `audit`, `summary`, `interruption *`, and `skill-metrics *`. |
+| Machine output | `--json` is available on `discover`, `token`, `metrics`, `audit`, `summary`, `interruption *`, and `skill-metrics *`. |
 | Output language | `summary`, `metrics`, and `interruption` print English; `discover` and `token` print Chinese regardless of locale. Use `--json` for stable, language-neutral text. |
 | Platform | On macOS only `trace` (trajectory collector) and `serve` exist. |
 | Sample IDs | Session, conversation, trace, and interruption IDs in the examples are placeholders — substitute the ones from your own output. |
@@ -158,6 +158,7 @@ One-command health picture for a recent window.
 FLAGS:
         --json                          Output as JSON
 OPTIONS:
+        --agent <agent>                 Scope the session and interruption totals to one agent
         --db <db>                       Override the sessions database path
         --last <last>                   Query the last N hours (default: 24) [default: 24]
         --tokenless-db <tokenless-db>   Override the tokenless stats database path
@@ -189,6 +190,20 @@ the reading host's own data.
 ```bash
 agentsight summary --last 24 --db /backup/agentsight/genai_events.db
 ```
+
+`--agent` narrows the Sessions and Interruptions sections to one agent, and the two sections match
+the same way their own stores do. Sessions compare the label the session listing already resolves —
+the recorded agent name, falling back to the process name — while interrupts compare the
+`agent_name` column only, which is what `interruption list --agent` filters on. Both matches are
+case-insensitive. The heading and the JSON gain an `agent` key naming the scope; without the flag
+both sections cover every agent and the report keeps its previous shape.
+
+```bash
+agentsight summary --last 24 --agent CoshNG
+```
+
+Tokenless savings are recorded per session and carry no agent, so an agent-scoped report leaves
+that section out and says so rather than printing host-wide numbers beside agent-scoped totals.
 
 ## agentsight token
 
@@ -334,6 +349,23 @@ agentsight_token_input_total{agent="Cosh"} 50000
 agentsight_token_output_total{agent="CoshNG"} 10000
 ```
 
+`--json` prints the same per-agent rows as objects (`agent_name`, `input_tokens`, `output_tokens`,
+`total_tokens`, `request_count`) instead of the exposition format, for scripts that would otherwise
+have to parse it:
+
+```bash
+$ sudo agentsight metrics --json
+[
+  {
+    "agent_name": "CoshNG",
+    "input_tokens": 100000,
+    "output_tokens": 10000,
+    "total_tokens": 110000,
+    "request_count": 42
+  }
+]
+```
+
 The running server exposes the same content at `GET /metrics` (localhost only), which is usually
 easier to scrape. See [Data and storage](data-and-storage.md#prometheus-metrics).
 
@@ -386,6 +418,21 @@ OPTIONS:
         --severity <severity>    [possible values: critical, high, medium, low]
 ```
 
+`stats` and `count` take the same `--agent` filter `list` does, so one agent's breakdown can be
+read without post-processing `list --json`:
+
+```
+FLAGS:
+        --json          Output as JSON
+
+OPTIONS:
+        --agent <agent>          Filter by agent name (exact match)
+        --last <last>            Query last N hours (default: 24) [default: 24]
+```
+
+Both keep their existing scopes: `stats` reports the whole window (resolved and unresolved), and
+`count` reports unresolved events only. Without `--agent` they cover every agent on the host.
+
 ```bash
 $ sudo agentsight interruption list --last 24
 INTERRUPTION_ID                    TYPE          SEVERITY  OCCURRED_AT              RESOLVED  AGENT    SESSION_ID
@@ -420,8 +467,14 @@ Interruption Event Detail
 # per-type counts for the last week
 sudo agentsight interruption stats --last 168
 
+# the same breakdown for one agent only
+sudo agentsight interruption stats --last 168 --agent CoshNG
+
 # unresolved counts by severity
 sudo agentsight interruption count --last 24
+
+# unresolved counts for one agent only
+sudo agentsight interruption count --last 24 --agent CoshNG
 
 # everything that hit one session, then close one event
 sudo agentsight interruption session 00000000-1111-2222-3333-444444444444

@@ -12,7 +12,7 @@
 | 权限 | `trace` 需要 root（或 `CAP_BPF` + `CAP_PERFMON`）。查询类命令需要读取 `/var/log/sysak/.agentsight`，该目录归服务所有，请加 `sudo`。 |
 | 配置文件 | 需要读取规则的命令支持 `--config`，默认 `/etc/agentsight/config.json`。`discover` 读取与 `trace` 相同的文件，因此会反映你的自定义规则。 |
 | 数据位置 | 固定为 `/var/log/sysak/.agentsight`。`serve`、`dashboard`、`skill-metrics`、`audit`、`metrics`、`summary`、`interruption` 支持用 `--db` 指定其他数据库文件。 |
-| 机器可读输出 | `discover`、`token`、`audit`、`summary`、`interruption *`、`skill-metrics *` 都支持 `--json`。 |
+| 机器可读输出 | `discover`、`token`、`metrics`、`audit`、`summary`、`interruption *`、`skill-metrics *` 都支持 `--json`。 |
 | 输出语言 | `summary`、`metrics`、`interruption` 输出英文；`discover`、`token` 无论 locale 都输出中文。需要稳定文本时请用 `--json`。 |
 | 平台 | macOS 上只有 `trace`（轨迹采集）和 `serve`。 |
 | 示例 ID | 示例里的会话、对话、调用、中断 ID 都是占位值，请替换成你自己输出里的实际 ID。 |
@@ -150,6 +150,7 @@ AgentSight 仪表盘状态
 FLAGS:
         --json                          Output as JSON
 OPTIONS:
+        --agent <agent>                 Scope the session and interruption totals to one agent
         --db <db>                       Override the sessions database path
         --last <last>                   Query the last N hours (default: 24) [default: 24]
         --tokenless-db <tokenless-db>   Override the tokenless stats database path
@@ -179,6 +180,19 @@ Tokenless     10% saved (110.0K -> 99.0K, 20 ops)
 ```bash
 agentsight summary --last 24 --db /backup/agentsight/genai_events.db
 ```
+
+`--agent` 把 Sessions 与 Interruptions 两节收窄到单个 Agent，两节分别沿用各自存储的匹配口径：
+Sessions 比较会话列表本就解析出的标签——优先记录到的 Agent 名，缺省时回退到进程名；Interruptions
+只比较 `agent_name` 列，也就是 `interruption list --agent` 过滤的那一列。两者都大小写不敏感。
+带上它时标题与 JSON 会多出一个 `agent` 键标明范围；不带时两节覆盖所有 Agent，报告形状与之前
+完全一致。
+
+```bash
+agentsight summary --last 24 --agent CoshNG
+```
+
+Tokenless 节省量是按会话记录的、不带 Agent 归属，因此按 Agent 的报告不再输出该节，并明确说明，
+而不是把全主机的数字摆在按 Agent 的汇总旁边。
 
 ## agentsight token
 
@@ -322,6 +336,22 @@ agentsight_token_input_total{agent="Cosh"} 50000
 agentsight_token_output_total{agent="CoshNG"} 10000
 ```
 
+`--json` 把同样的按 Agent 汇总的行输出为对象（`agent_name`、`input_tokens`、`output_tokens`、
+`total_tokens`、`request_count`），而不是 exposition 文本，供本来要解析文本的脚本直接使用：
+
+```bash
+$ sudo agentsight metrics --json
+[
+  {
+    "agent_name": "CoshNG",
+    "input_tokens": 100000,
+    "output_tokens": 10000,
+    "total_tokens": 110000,
+    "request_count": 42
+  }
+]
+```
+
 运行中的服务在 `GET /metrics`（仅本机）暴露同样的内容，抓取时通常用它更方便，见
 [数据与存储](data-and-storage.md#prometheus-指标)。
 
@@ -373,6 +403,21 @@ OPTIONS:
         --severity <severity>    [possible values: critical, high, medium, low]
 ```
 
+`stats` 与 `count` 接受和 `list` 相同的 `--agent` 过滤，不用再自己去处理 `list --json` 的输出来
+得到单个 Agent 的分布：
+
+```
+FLAGS:
+        --json          Output as JSON
+
+OPTIONS:
+        --agent <agent>          Filter by agent name (exact match)
+        --last <last>            Query last N hours (default: 24) [default: 24]
+```
+
+两者各自原有的统计口径不变：`stats` 统计整个窗口（含已解决与未解决），`count` 只统计未解决事件。
+不带 `--agent` 时覆盖主机上的所有 Agent。
+
 ```bash
 $ sudo agentsight interruption list --last 24
 INTERRUPTION_ID                    TYPE          SEVERITY  OCCURRED_AT              RESOLVED  AGENT    SESSION_ID
@@ -407,8 +452,14 @@ Interruption Event Detail
 # 最近一周按类型统计
 sudo agentsight interruption stats --last 168
 
+# 只看某个 Agent 的同一份分布
+sudo agentsight interruption stats --last 168 --agent CoshNG
+
 # 未解决事件按严重级别计数
 sudo agentsight interruption count --last 24
+
+# 只看某个 Agent 的未解决计数
+sudo agentsight interruption count --last 24 --agent CoshNG
 
 # 查某个会话命中的全部中断，然后关闭其中一条
 sudo agentsight interruption session 00000000-1111-2222-3333-444444444444

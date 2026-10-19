@@ -29,7 +29,7 @@ function buildCronLine(workspace: string, schedule: string): string {
   );
 }
 
-async function withLock<T>(fn: () => Promise<T>): Promise<T> {
+async function withLock(fn: () => Promise<boolean>): Promise<boolean> {
   const maxWait = 5000;
   const interval = 50;
   let waited = 0;
@@ -38,8 +38,14 @@ async function withLock<T>(fn: () => Promise<T>): Promise<T> {
     try {
       mkdirSync(LOCK_DIR);
       acquired = true;
-    } catch {
-      if (waited >= maxWait) break; // proceed unlocked rather than fail
+    } catch (error) {
+      // A read-modify-write without ownership can overwrite another caller.
+      if (
+        (error as NodeJS.ErrnoException).code !== "EEXIST" ||
+        waited >= maxWait
+      ) {
+        return false;
+      }
       await new Promise((r) => setTimeout(r, interval));
       waited += interval;
     }
@@ -47,11 +53,13 @@ async function withLock<T>(fn: () => Promise<T>): Promise<T> {
   try {
     return await fn();
   } finally {
-    // Only the owner removes the lock. A timed-out caller runs unlocked by
-    // design, but removing the directory here would evict whoever still
-    // holds it and admit a third writer underneath both.
+    // Acquisition failures return before entering the operation or its cleanup.
     if (acquired) {
-      try { rmdirSync(LOCK_DIR); } catch { /* already removed */ }
+      try {
+        rmdirSync(LOCK_DIR);
+      } catch {
+        /* already removed */
+      }
     }
   }
 }

@@ -152,6 +152,16 @@ pub fn extract_response_content(
                         }
                     }
                 }
+            } else if let Some(text) = choice.get("text").and_then(|t| t.as_str()) {
+                // Legacy `/v1/completions` answers put the generated text
+                // directly on the choice, without a `message` or `delta`
+                // object. The path is an admitted LLM endpoint, so without
+                // this arm a stream that reported no usage counted zero
+                // output tokens for the text it generated.
+                if !text.is_empty() {
+                    content.push_str(text);
+                    has_data = true;
+                }
             }
         }
     }
@@ -440,6 +450,10 @@ pub(crate) fn merge_response_output_text(chunks: &[Value]) -> (String, String, V
         // delta was captured. Treat it as a replacement rather than another
         // fragment so the same answer is not appended twice.
         let closing = is_closing_response_event(chunk);
+        // Reasoning items are the exception: an agentic response interleaves
+        // one with each call it precedes, so several closing items carry
+        // different thinking rather than a repeat of one another.
+        let closing_reasoning = closing && chunk.get("item").is_some_and(is_reasoning_item);
         if let Some((chunk_content, chunk_reasoning, chunk_tool_calls)) =
             extract_response_content(Some(chunk))
         {
@@ -454,7 +468,7 @@ pub(crate) fn merge_response_output_text(chunks: &[Value]) -> (String, String, V
             }
             if let Some(reasoning_chunk) = chunk_reasoning {
                 if !reasoning_chunk.is_empty() {
-                    if closing {
+                    if closing && !closing_reasoning {
                         reasoning = reasoning_chunk;
                     } else if snapshot {
                         accumulate_text(&mut reasoning, &reasoning_chunk);
@@ -928,6 +942,26 @@ mod tests {
         assert!(result.is_none());
     }
 
+    /// Legacy `/v1/completions` streams put each fragment on `choices[].text`
+    /// instead of a `message`/`delta` object, so the shared extractor used to
+    /// return nothing and the manual counter reported zero output tokens.
+    #[test]
+    fn test_legacy_completion_choice_text_counts_as_output() {
+        let first = serde_json::json!({"choices": [{"index": 0, "text": "hello "}]});
+        let second = serde_json::json!({"choices": [{"index": 0, "text": "there"}]});
+
+        let (content, _, tools) =
+            extract_response_content(Some(&first)).expect("legacy text must extract");
+        assert_eq!(content, "hello ");
+        assert!(tools.is_empty());
+
+        assert_eq!(
+            merge_response_output_text(&[first, second]).0,
+            "hello there",
+            "the manual counter must join the streamed fragments"
+        );
+    }
+
     #[test]
     fn test_responses_api_output_text_delta() {
         let chunk = serde_json::json!({
@@ -1082,6 +1116,46 @@ mod tests {
                 "get_weather: {}",
                 serde_json::json!({"city":"Beijing"})
             )]
+        );
+    }
+
+    /// A capture that attached after both thinking deltas has only the
+    /// closing reasoning items, and an agentic response interleaves one with
+    /// each call it precedes. They carry different thinking, so the closing
+    /// replacement rule that keeps a repeated answer from being counted twice
+    /// must not throw the earlier items away here.
+    #[test]
+    fn test_merge_response_output_text_keeps_every_closing_reasoning_item() {
+        let chunks = vec![
+            serde_json::json!({"type": "response.output_item.done",
+                "item": {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "Check the logs. "}]}}),
+            serde_json::json!({"type": "response.output_item.done",
+                "item": {"type": "reasoning", "summary": [{"type": "summary_text", "text": "Then retry."}]}}),
+            serde_json::json!({"type": "response.output_item.done",
+                "item": {"type": "message", "content": [{"type": "output_text", "text": "Done"}]}}),
+        ];
+        let (content, reasoning, _tool_calls) = merge_response_output_text(&chunks);
+        assert_eq!(content, "Done");
+        assert_eq!(
+            reasoning, "Check the logs. Then retry.",
+            "every closing reasoning item carries different thinking and must be kept"
+        );
+
+        // Accumulating the closing items must not weaken the delta-wins rule:
+        // when the thinking arrived as deltas, `repeats_delivered_text` drops
+        // every closing reasoning item whatever their number.
+        let with_deltas = vec![
+            serde_json::json!({"type": "response.reasoning_text.delta", "delta": "Check the logs. "}),
+            serde_json::json!({"type": "response.reasoning_text.delta", "delta": "Then retry."}),
+            serde_json::json!({"type": "response.output_item.done",
+                "item": {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "Check the logs. "}]}}),
+            serde_json::json!({"type": "response.output_item.done",
+                "item": {"type": "reasoning", "summary": [{"type": "summary_text", "text": "Then retry."}]}}),
+        ];
+        let (_content, reasoning, _tool_calls) = merge_response_output_text(&with_deltas);
+        assert_eq!(
+            reasoning, "Check the logs. Then retry.",
+            "delivered deltas supersede every closing reasoning item"
         );
     }
 
