@@ -126,6 +126,33 @@ refuses to load with it.
 - Node.js ≥ 20 and npm (for source build — bundles the OpenClaw adapter)
 - Optional: embedding provider (OpenAI or Ollama) for vector search
 
+## GitHub build artifacts
+
+Release (`memory/v<version>`) and manual Preview builds produce Linux x86_64 and
+ARM64 raw packages on fixed Cross profiles, with a glibc 2.28 baseline. Each
+platform supplies `agent-memory-<version>-linux-<arch>.tar.gz`, `.sha256`,
+`.tar.gz.cdx.json` and its `.sha256` (eight files total). The archive contains
+both the Rust binary and the bundled OpenClaw adapter; its CycloneDX SBOM covers
+target Rust dependencies and npm code actually embedded in the plugin.
+Contracts, build inputs and packaging scripts come from the same source commit.
+Preview validation does not publish a version or switch the local release pipeline.
+
+## Raw package development
+
+Linux x86_64 and ARM64 packages contain the binary, configuration, user service
+and bundled OpenClaw adapter. Build the plugin with Node 22.23.2 using
+`make build-openclaw-plugin-ci`; this checks version consistency before using
+`npm ci --legacy-peer-deps` and emits an esbuild dependency manifest.
+
+`python3 packaging/raw/package.py --help` lists the explicit binary directory,
+plugin output directory, target, timestamp and TOML build metadata inputs.
+Metadata binds `version`, `target_os`, `target_arch`,
+`binaries.agent-memory` (SHA256) and `plugin.sha256` to the supplied files.
+The packager does not build or execute binaries. It renders the raw installation
+contract from `.anolisa/component.raw.toml.in` and Cargo.toml; the RPM contract
+remains separate. Both installation modes leave the user service stopped.
+Run `python3 tests/test_raw_packaging.py` for packaging regressions.
+
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE).

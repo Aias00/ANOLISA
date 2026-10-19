@@ -4,6 +4,7 @@ use std::path::{Component, Path};
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
+use ws_ckpt_common::backend::DiffError;
 use ws_ckpt_common::{
     validate_checkpoint_id_v2, validate_workspace_id_v2, ErrorCode, GuardedCheckpointEvidenceV2,
     GuardedCheckpointOutcomeV2, GuardedCheckpointRejectionCodeV2, GuardedRollbackEvidenceV2,
@@ -186,11 +187,27 @@ pub(crate) async fn checkpoint(
         }
     };
 
-    if !state.check_workspace_quiescent(ws_id).await {
-        return rejected(
-            GuardedCheckpointRejectionCodeV2::WriteLockConflict,
-            "workspace has active write operations; retry after it becomes quiescent",
-        );
+    // The guarded flow holds the workspace write lock here, so the check
+    // receives the registration path directly: its opportunistic heal must
+    // not depend on the lock it can never take.
+    match state
+        .check_workspace_quiescent(ws_id, Some(&workspace.path))
+        .await
+    {
+        crate::state::Quiescence::Safe => {}
+        crate::state::Quiescence::Writing => {
+            return rejected(
+                GuardedCheckpointRejectionCodeV2::WriteLockConflict,
+                "workspace has active write operations; retry after it becomes quiescent",
+            )
+        }
+        crate::state::Quiescence::MonitoringUnavailable => {
+            return rejected(
+                GuardedCheckpointRejectionCodeV2::WriteLockConflict,
+                "write monitoring is unavailable (the write watcher is stale and re-arming \
+                 failed); retry after the watcher recovers",
+            )
+        }
     }
 
     let Some(registered_path) = workspace.path.to_str().map(str::to_owned) else {
@@ -366,10 +383,7 @@ pub(crate) async fn rollback_preview(
     let changes = match state.backend.diff(ws_id, target_snapshot_id, None).await {
         Ok(changes) => changes,
         Err(error) => {
-            return rollback_rejected(
-                GuardedRollbackRejectionCodeV2::DaemonNotReady,
-                format!("failed to compute guarded rollback preview: {error:#}"),
-            )
+            return rollback_diff_rejected(error, "failed to compute guarded rollback preview")
         }
     };
     let diff_digest = rollback_diff_digest(&changes);
@@ -476,11 +490,26 @@ pub(crate) async fn rollback(
             "workspace generation no longer matches the guarded rollback",
         );
     }
-    if !state.check_workspace_quiescent(ws_id).await {
-        return rollback_rejected(
-            GuardedRollbackRejectionCodeV2::WriteLockConflict,
-            "workspace has active write operations; retry after it becomes quiescent",
-        );
+    // Same as the checkpoint pre-flight: this flow holds the workspace
+    // write lock, so the registration path is handed to the check directly.
+    match state
+        .check_workspace_quiescent(ws_id, Some(Path::new(&registered_path)))
+        .await
+    {
+        crate::state::Quiescence::Safe => {}
+        crate::state::Quiescence::Writing => {
+            return rollback_rejected(
+                GuardedRollbackRejectionCodeV2::WriteLockConflict,
+                "workspace has active write operations; retry after it becomes quiescent",
+            )
+        }
+        crate::state::Quiescence::MonitoringUnavailable => {
+            return rollback_rejected(
+                GuardedRollbackRejectionCodeV2::WriteLockConflict,
+                "write monitoring is unavailable (the write watcher is stale and re-arming \
+                 failed); retry after the watcher recovers",
+            )
+        }
     }
     if let Some(response) = crate::util::guard_cwd_occupants(registered_path).await {
         return rollback_cwd_rejection(response);
@@ -546,10 +575,8 @@ pub(crate) async fn rollback(
     let changes = match state.backend.diff(ws_id, target_snapshot_id, None).await {
         Ok(changes) => changes,
         Err(error) => {
-            let response = rollback_rejected(
-                GuardedRollbackRejectionCodeV2::DaemonNotReady,
-                format!("failed to recompute guarded rollback diff: {error:#}"),
-            );
+            let response =
+                rollback_diff_rejected(error, "failed to recompute guarded rollback diff");
             return abort_reserved_rollback(state, &mut workspace, operation_id, response).await;
         }
     };
@@ -584,6 +611,11 @@ pub(crate) async fn rollback(
     };
 
     update_live_head(&mut workspace.index, target_snapshot_id);
+    // The backend swapped the live subvolume (rename aside + snapshot
+    // recreate + delete); the inotify watch still names the retired inode,
+    // so re-arm it or every later guarded checkpoint's quiescence check —
+    // including this operation's own pre-flight on a retry — is a no-op.
+    state.rearm_watcher(ws_id, std::path::Path::new(registered_path));
     let succeeded = GuardedRollbackOutcomeV2::Succeeded {
         resulting_generation,
     };
@@ -901,6 +933,16 @@ fn rollback_workspace_not_found(workspace: &str) -> Response {
         GuardedRollbackRejectionCodeV2::WorkspaceNotFound,
         format!("workspace is not registered: {workspace}"),
     )
+}
+
+fn rollback_diff_rejected(error: anyhow::Error, context: &str) -> Response {
+    let code = match error.downcast_ref::<DiffError>() {
+        Some(DiffError::UnsupportedWorkspacePath { .. }) => {
+            GuardedRollbackRejectionCodeV2::UnsupportedWorkspacePath
+        }
+        None => GuardedRollbackRejectionCodeV2::DaemonNotReady,
+    };
+    rollback_rejected(code, format!("{context}: {error:#}"))
 }
 
 fn rollback_rejected(code: GuardedRollbackRejectionCodeV2, message: impl Into<String>) -> Response {

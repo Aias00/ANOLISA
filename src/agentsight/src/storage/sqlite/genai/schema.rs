@@ -1,39 +1,46 @@
 //! Schema initialization, migrations, and size limit management for GenAI SQLite store.
 
-use rusqlite::params;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use agentsight_sqlite_lifecycle::{
+    CheckpointOutcome, MaintenanceStatus, SizeBasis, SizePolicy, checkpoint_truncate,
+    enforce_size_policy, measure_database, retention_cutoff_ns,
+};
+use rusqlite::{Connection, params};
 
 use super::GenAISqliteStore;
 
-// ─── Size limit configuration ──────────────────────────────────────────────────
-
-/// Environment variable name for max database size in MB
-const ENV_MAX_DB_SIZE_MB: &str = "AGENTSIGHT_GENAI_DB_MAX_SIZE_MB";
-/// Default max database size: 200 MB
-const DEFAULT_MAX_DB_SIZE_MB: u64 = 200;
-/// Percentage of records to prune per attempt
+/// Percentage of records pruned before retrying a `SQLITE_FULL` write.
 const PRUNE_PERCENT: f64 = 0.05;
-/// Maximum prune retry attempts to avoid infinite loop
+/// Maximum prune retry attempts to avoid infinite loops.
 pub(super) const MAX_PRUNE_RETRIES: u32 = 3;
+const MAINTENANCE_BATCH_BYTES: usize = 4 * 1024 * 1024;
+const MAINTENANCE_BATCH_ROWS: usize = 128;
 
-/// Get max database size from environment variable or use default
-pub(super) fn get_max_db_size() -> u64 {
-    std::env::var(ENV_MAX_DB_SIZE_MB)
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(DEFAULT_MAX_DB_SIZE_MB)
-        * 1024
-        * 1024
-}
-
-/// Get prune threshold (90% of max)
-pub(super) fn get_prune_threshold() -> u64 {
-    (get_max_db_size() as f64 * 0.9) as u64
+/// Growth sources sharing the GenAI database's capacity policy.
+#[derive(Clone, Copy)]
+pub(super) enum PruneTable {
+    /// Captured semantic events.
+    Events,
+    /// Process resource samples.
+    Resources,
+    /// Evaluation results owned by the same physical database.
+    Evaluations,
+    /// Saved metadata and explicitly fetched Tokenless content.
+    Tokenless,
 }
 
 impl GenAISqliteStore {
     /// Initialize database tables
     pub(super) fn init_tables(&self) -> Result<(), Box<dyn std::error::Error>> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        super::tokenless::init_tables(&conn)?;
+        // This migration must run before any index that references the added
+        // column: on databases created before conversation_id existed,
+        // creating the index first aborts the batch and the `?` below returns
+        // before the later ALTER runs (same defect as issue #3314 in the
+        // interruption store).
+        let _ = conn.execute_batch("ALTER TABLE genai_events ADD COLUMN conversation_id TEXT;");
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS genai_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -188,11 +195,8 @@ impl GenAISqliteStore {
         // v4: per-call interruption type
         ensure_col!("interruption_type", "TEXT", "idx_genai_interruption_type");
 
-        // Migration: add conversation_id column for existing databases
-        let _ = conn.execute(
-            "ALTER TABLE genai_events ADD COLUMN conversation_id TEXT",
-            [],
-        );
+        // conversation_id is migrated at the top of this function, before the
+        // index batch that references it.
 
         // v5: tool_call_ids JSON array for output tool calls
         ensure_col!("tool_call_ids", "TEXT");
@@ -217,261 +221,429 @@ impl GenAISqliteStore {
         // v9: first provider event that carries model output
         ensure_col!("first_output_timestamp_ns", "INTEGER");
 
+        // v10: distinguish semantic input totals from legacy raw provider input
+        ensure_col!("input_tokens_includes_cache", "INTEGER NOT NULL DEFAULT 0");
+
+        // v11: reclassify legacy analyzer rows (#2750, #7271). Builds before
+        // the CallKind::Analyzer split persisted the cosh-ng personal-analyzer
+        // background summary as 'recap'; with the session predicate now
+        // admitting recap-only sessions, those rows would resurface as
+        // 0-token noise sessions on hosts that already have data. The fixed
+        // prompt is written to user_query on every row, so a prefix match is
+        // sufficient. Idempotent: after the first pass it matches zero rows.
+        // Guarded on user_query because hand-built pre-v1 databases (see the
+        // legacy-migration test) predate that base column.
+        if existing_cols.contains("user_query") {
+            let reclassified = conn.execute(
+                "UPDATE genai_events SET call_kind = 'analyzer' \
+                 WHERE call_kind = 'recap' \
+                 AND user_query LIKE 'Summarize only grounded work into the supplied JSON schema%'",
+                [],
+            )?;
+            if reclassified > 0 {
+                log::info!(
+                    "Migrated genai_events: reclassified {reclassified} legacy analyzer recap rows"
+                );
+            }
+        }
+
         Ok(())
     }
 
     // ─── Size limit methods ───────────────────────────────────────────────────
 
-    /// Get total database size (main db + wal + shm)
+    pub(super) fn size_snapshot(
+        &self,
+    ) -> Result<agentsight_sqlite_lifecycle::SizeSnapshot, Box<dyn std::error::Error>> {
+        let conn = self.conn.lock().unwrap_or_else(|error| error.into_inner());
+        measure_database(&self.db_path, &conn).map_err(Into::into)
+    }
+
+    #[cfg(test)]
     pub(super) fn get_total_db_size(&self) -> u64 {
-        let mut total = 0u64;
-
-        // Main database file
-        if let Ok(meta) = std::fs::metadata(&self.db_path) {
-            total += meta.len();
-        }
-
-        // WAL file
-        let wal_path = format!("{}-wal", self.db_path.display());
-        if let Ok(meta) = std::fs::metadata(&wal_path) {
-            total += meta.len();
-        }
-
-        // SHM file
-        let shm_path = format!("{}-shm", self.db_path.display());
-        if let Ok(meta) = std::fs::metadata(&shm_path) {
-            total += meta.len();
-        }
-
-        total
+        self.size_snapshot()
+            .map(|snapshot| snapshot.physical_bytes)
+            .unwrap_or(0)
     }
 
-    /// Logical data size: physical size minus freelist pages.
-    ///
-    /// Purge convergence is measured on this: deleting rows does not shrink
-    /// the file without VACUUM — freed pages go to the freelist and are
-    /// reused by future inserts, so the physical file stabilizes at its
-    /// historical peak while the logical size reflects live data.
+    #[cfg(test)]
     pub(super) fn effective_db_size(&self) -> u64 {
-        let physical = self.get_total_db_size();
-        let free_bytes = {
-            let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-            let freelist: i64 = match conn.query_row("PRAGMA freelist_count", [], |r| r.get(0)) {
-                Ok(v) => v,
-                Err(e) => {
-                    // Fall back to the physical size (conservative: the prune
-                    // loop may over-delete by the freelist amount) — but make
-                    // the degraded measurement visible.
-                    log::warn!(
-                        "freelist_count query failed; logical size falls back \
-                         to physical size: {e}"
-                    );
-                    0
-                }
-            };
-            let page_size: i64 = conn
-                .query_row("PRAGMA page_size", [], |r| r.get(0))
-                .unwrap_or(4096);
-            (freelist.max(0) * page_size.max(0)) as u64
-        };
-        physical.saturating_sub(free_bytes)
+        self.size_snapshot()
+            .map(|snapshot| snapshot.logical_bytes)
+            .unwrap_or(0)
     }
 
-    /// Check database size and prune if approaching limit.
-    ///
-    /// Uses adaptive pruning: the fraction of records deleted per iteration
-    /// scales with how far the database exceeds the configured maximum, so a
-    /// severely oversized database is brought back under control quickly
-    /// instead of inching down 5% at a time.
-    ///
-    /// The loop never runs VACUUM: rebuilding the whole file would push its
-    /// pages through the page cache, which counts against the service's
-    /// cgroup memory limit and can OOM-kill the process on large databases
-    /// (#2888). Deleting rows + a truncating WAL checkpoint is enough — the
-    /// freelist is reused by future inserts, so the physical file stops
-    /// growing once the logical size fits.
-    pub(super) fn check_and_prune_if_needed(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let physical_size = self.get_total_db_size();
-        let threshold = get_prune_threshold();
+    /// Applies age retention followed by capacity enforcement for every table
+    /// in the GenAI physical database, using the configured store limit.
+    #[cfg(test)]
+    pub(crate) fn maintain(&self) -> Result<(), Box<dyn std::error::Error>> {
+        self.maintain_with_limit_mb(self.storage_policy.max_db_size_mb)
+    }
 
-        // Trigger on physical size (disk safety is physical), converge on
-        // logical size (deletes only shrink the logical size via freelist).
-        if physical_size < threshold {
+    /// Same as [`maintain`] with an explicit size limit in MiB, used when the
+    /// global storage budget reduces this store's effective capacity.
+    pub(crate) fn maintain_with_limit_mb(
+        &self,
+        max_db_size_mb: u64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.capture_has_priority() {
             return Ok(());
         }
-
-        let mut current_size = self.effective_db_size();
-        if current_size < threshold {
-            // Physically large but mostly freelist: future writes reuse free
-            // pages, no rows need to be deleted.
+        let _timer = crate::runtime_metrics::StageTimer::start("genai_maintenance");
+        let result = self.maintain_once(max_db_size_mb);
+        if self.maintenance_only
+            && result.as_ref().err().is_some_and(|error| {
+                matches!(error.downcast_ref::<rusqlite::Error>(),
+                    Some(rusqlite::Error::SqliteFailure(code, _))
+                        if matches!(code.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
+            })
+        {
+            log::debug!("GenAI maintenance deferred to the next pass because capture is writing");
             return Ok(());
         }
+        result
+    }
 
-        let max_size = get_max_db_size();
-        let overshoot = current_size as f64 / max_size as f64;
-
-        // Delete a larger fraction when the database is far over the limit.
-        //   1–2× over → 10% per iteration
-        //   2–5× over → 25% per iteration
-        //   5×+  over → 50% per iteration
-        let prune_pct = if overshoot > 5.0 {
-            0.50
-        } else if overshoot > 2.0 {
-            0.25
-        } else {
-            0.10
+    fn maintain_once(&self, max_db_size_mb: u64) -> Result<(), Box<dyn std::error::Error>> {
+        let deleted_by_age = self.purge_expired()?;
+        if self.capture_has_priority() {
+            return Ok(());
+        }
+        let limit_bytes = max_db_size_mb.saturating_mul(1024 * 1024);
+        if (deleted_by_age > 0 || limit_bytes > 0)
+            && self.maintenance_checkpoint()? == CheckpointOutcome::Busy
+        {
+            log::warn!("GenAI WAL checkpoint remained busy before size maintenance");
+            return Ok(());
+        }
+        let policy = SizePolicy {
+            limit_bytes,
+            trigger_bytes: limit_bytes,
+            target_bytes: limit_bytes.saturating_mul(9) / 10,
+            trigger_basis: SizeBasis::Physical,
+            target_basis: SizeBasis::Logical,
+            max_rounds: 20,
+            max_stalled_rounds: 3,
         };
+        let report = enforce_size_policy::<Box<dyn std::error::Error>>(
+            policy,
+            || self.size_snapshot(),
+            |fraction| self.prune_old_records_with_percent(fraction),
+            || self.maintenance_checkpoint(),
+        )?;
+        match report.status {
+            MaintenanceStatus::CheckpointBusy => log::warn!(
+                "GenAI size maintenance stopped at a busy checkpoint after deleting {} rows",
+                report.deleted_rows
+            ),
+            MaintenanceStatus::Stalled | MaintenanceStatus::MaxRounds => log::warn!(
+                "GenAI size maintenance stopped with {:?} at {} logical bytes",
+                report.status,
+                report.after.logical_bytes
+            ),
+            _ => {}
+        }
+        Ok(())
+    }
 
-        log::info!(
-            "Database size {}MB exceeding threshold {}MB (overshoot {:.1}×), \
-             pruning {:.0}% per iteration",
-            current_size / 1024 / 1024,
-            threshold / 1024 / 1024,
-            overshoot,
-            prune_pct * 100.0
-        );
-
-        const MAX_ITERATIONS: u32 = 20;
-        let mut iterations = 0u32;
-
-        while current_size >= threshold && iterations < MAX_ITERATIONS {
-            iterations += 1;
-
-            if let Err(e) = self.prune_old_records_with_percent(prune_pct) {
-                log::warn!("Prune failed on iteration {iterations}: {e}");
-                break;
-            }
-
-            // Flush and truncate the WAL so freed pages are visible and the
-            // WAL does not grow unbounded. Never VACUUM here (#2888). A busy
-            // checkpoint (another connection holds a read snapshot) leaves the
-            // WAL intact — stop pruning: further deletes would keep appending
-            // WAL frames and never converge.
-            match self.wal_checkpoint() {
-                Ok(true) => {
-                    log::warn!(
-                        "WAL checkpoint busy on iteration {iterations}; \
-                         stopping prune (the WAL could not be truncated)"
-                    );
+    fn purge_expired(&self) -> Result<usize, Box<dyn std::error::Error>> {
+        let _timer = crate::runtime_metrics::StageTimer::start("genai_maintenance_age");
+        if self.storage_policy.retention_days == 0 {
+            return Ok(0);
+        }
+        let now_ns = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        let cutoff_ns = retention_cutoff_ns(now_ns, self.storage_policy.retention_days)?;
+        let cutoff_i64 = i64::try_from(cutoff_ns).unwrap_or(i64::MAX);
+        let mut deleted = 0;
+        for table in [
+            PruneTable::Tokenless,
+            PruneTable::Events,
+            PruneTable::Resources,
+            PruneTable::Evaluations,
+        ] {
+            loop {
+                let batch = self.delete_maintenance_batch(table, Some(cutoff_i64), usize::MAX)?;
+                if batch == 0 {
                     break;
                 }
-                Ok(false) => {}
-                Err(e) => {
-                    log::warn!("WAL checkpoint failed on iteration {iterations}: {e}");
-                }
-            }
-
-            let new_size = self.effective_db_size();
-            current_size = new_size;
-
-            if current_size >= threshold {
-                log::info!(
-                    "Database still {}MB (threshold {}MB), continue pruning \
-                     (iteration {iterations}/{MAX_ITERATIONS})",
-                    current_size / 1024 / 1024,
-                    threshold / 1024 / 1024,
-                );
+                deleted += batch;
+                self.yield_maintenance();
             }
         }
-
-        if current_size >= threshold {
-            log::warn!(
-                "Database size {}MB still above threshold {}MB after pruning; \
-                 will retry on next write",
-                current_size / 1024 / 1024,
-                threshold / 1024 / 1024,
-            );
-        } else {
-            log::info!(
-                "Pruning complete, database size now {}MB",
-                current_size / 1024 / 1024
-            );
-        }
-
-        Ok(())
+        Ok(deleted)
     }
 
     /// Prune old records using the default 5% ratio.
     ///
     /// Thin wrapper around [`prune_old_records_with_percent`] for callers that
     /// only need the conservative default (e.g. SQLITE_FULL retry).
-    pub(super) fn prune_old_records(&self) -> Result<(), Box<dyn std::error::Error>> {
+    pub(super) fn prune_old_records(&self) -> Result<usize, Box<dyn std::error::Error>> {
         self.prune_old_records_with_percent(PRUNE_PERCENT)
     }
 
-    /// Delete the oldest `percent` fraction of records, ordered by id.
-    ///
-    /// `percent` is clamped to \[0.0, 1.0\]. At least one record is deleted
-    /// when the table is non-empty and `percent` > 0.
+    /// Deletes the oldest eligible rows from the table contributing the most payload bytes.
     fn prune_old_records_with_percent(
         &self,
         percent: f64,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        let _timer = crate::runtime_metrics::StageTimer::start("genai_maintenance_prune");
         let pct = percent.clamp(0.0, 1.0);
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-
-        let event_count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM genai_events", [], |row| row.get(0))?;
-        let resource_count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM agent_resource_samples", [], |row| {
-                row.get(0)
-            })?;
-
-        if event_count == 0 && resource_count == 0 {
-            return Ok(());
+        if pct == 0.0 {
+            return Ok(0);
         }
-
-        let event_delete_count = if event_count > 0 {
-            ((event_count as f64) * pct).max(1.0) as i64
-        } else {
-            0
+        let Some((table, count)) = self.prune_candidate()? else {
+            return Ok(0);
         };
-        let resource_delete_count = if resource_count > 0 {
-            ((resource_count as f64) * pct).max(1.0) as i64
-        } else {
-            0
+        let delete_count = prune_count(count, pct);
+        let mut deleted = 0;
+        let target = usize::try_from(delete_count)?;
+        while deleted < target {
+            let batch = self.delete_maintenance_batch(table, None, target - deleted)?;
+            if batch == 0 {
+                break;
+            }
+            deleted += batch;
+            self.yield_maintenance();
+        }
+        Ok(deleted)
+    }
+
+    pub(super) fn prune_candidate(
+        &self,
+    ) -> Result<Option<(PruneTable, i64)>, Box<dyn std::error::Error>> {
+        let conn = self.conn.lock().unwrap_or_else(|error| error.into_inner());
+        let (event_count, event_bytes): (i64, i64) = conn.query_row(
+            // Read stored byte lengths without loading and decoding every large
+            // JSON value while holding the connection needed by capture delivery.
+            "SELECT COUNT(*), COALESCE(SUM(octet_length(event_json)), 0)
+             FROM genai_events WHERE status != 'pending'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let (resource_count, resource_bytes): (i64, i64) = conn.query_row(
+            "SELECT COUNT(*), COUNT(*) * 64 FROM agent_resource_samples",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let (evaluation_count, evaluation_bytes): (i64, i64) =
+            if table_exists(&conn, "evaluation_runs")? {
+                conn.query_row(
+                    "SELECT COUNT(*), COALESCE(SUM(octet_length(result_json)), 0)
+                     FROM evaluation_runs",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?
+            } else {
+                (0, 0)
+            };
+
+        let candidates = [
+            {
+                let (count, bytes): (i64,i64) = conn.query_row(
+                    "SELECT COUNT(*),COALESCE(SUM(octet_length(record_json)),0) FROM tokenless_statistics", [],
+                    |row| Ok((row.get(0)?,row.get(1)?)))?;
+                (bytes.max(count), PruneTable::Tokenless, count)
+            },
+            (
+                event_bytes.max(event_count),
+                PruneTable::Events,
+                event_count,
+            ),
+            (
+                resource_bytes.max(resource_count),
+                PruneTable::Resources,
+                resource_count,
+            ),
+            (
+                evaluation_bytes.max(evaluation_count),
+                PruneTable::Evaluations,
+                evaluation_count,
+            ),
+        ];
+        let selected = candidates
+            .into_iter()
+            .filter(|(_, _, count)| *count > 0)
+            .max_by_key(|(bytes, _, _)| *bytes);
+        Ok(selected.map(|(_, table, count)| (table, count)))
+    }
+
+    /// Delete one bounded transaction, allowing one oversized row to make progress.
+    pub(super) fn delete_maintenance_batch(
+        &self,
+        table: PruneTable,
+        expired_before: Option<i64>,
+        limit: usize,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        let _timer = crate::runtime_metrics::StageTimer::start("genai_maintenance_delete_batch");
+        if self.capture_has_priority() {
+            return Ok(0);
+        }
+        let mut conn = self
+            .conn
+            .lock()
+            .map_err(|error| format!("GenAI maintenance mutex poisoned: {error}"))?;
+        if matches!(table, PruneTable::Evaluations) && !table_exists(&conn, "evaluation_runs")? {
+            return Ok(0);
+        }
+        let (select, delete, cutoff) = match table {
+            PruneTable::Tokenless => (
+                "SELECT cache_id, COALESCE(octet_length(record_json), 0)
+                 FROM tokenless_statistics WHERE ?1 IS NULL OR timestamp_ns < ?1
+                 ORDER BY timestamp_ns, cache_id LIMIT ?2",
+                "DELETE FROM tokenless_statistics WHERE cache_id = ?1
+                 AND (?2 IS NULL OR timestamp_ns < ?2)",
+                expired_before,
+            ),
+            PruneTable::Events => (
+                "SELECT id, COALESCE(octet_length(event_json), 0)
+                    + COALESCE(octet_length(input_messages), 0)
+                    + COALESCE(octet_length(output_messages), 0)
+                    + COALESCE(octet_length(system_instructions), 0)
+                    + COALESCE(octet_length(user_query), 0)
+                 FROM genai_events
+                 WHERE (?1 IS NULL AND status != 'pending')
+                    OR (?1 IS NOT NULL AND start_timestamp_ns < ?1)
+                 ORDER BY start_timestamp_ns, id LIMIT ?2",
+                "DELETE FROM genai_events WHERE id = ?1 AND (
+                    (?2 IS NULL AND status != 'pending')
+                    OR (?2 IS NOT NULL AND start_timestamp_ns < ?2))",
+                expired_before,
+            ),
+            PruneTable::Resources => (
+                "SELECT id, 64 FROM agent_resource_samples
+                 WHERE ?1 IS NULL OR timestamp_ns < ?1
+                 ORDER BY timestamp_ns, id LIMIT ?2",
+                "DELETE FROM agent_resource_samples WHERE id = ?1
+                 AND (?2 IS NULL OR timestamp_ns < ?2)",
+                expired_before,
+            ),
+            PruneTable::Evaluations => {
+                let has_payload: bool = conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('evaluation_runs') WHERE name = 'result_json')",
+                    [], |row| row.get(0),
+                )?;
+                let select = if has_payload {
+                    "SELECT id, COALESCE(octet_length(result_json), 0) FROM evaluation_runs
+                     WHERE ?1 IS NULL OR CAST(strftime('%s', created_at) AS INTEGER) < ?1
+                     ORDER BY created_at, id LIMIT ?2"
+                } else {
+                    "SELECT id, 64 FROM evaluation_runs
+                     WHERE ?1 IS NULL OR CAST(strftime('%s', created_at) AS INTEGER) < ?1
+                     ORDER BY created_at, id LIMIT ?2"
+                };
+                (
+                    select,
+                    "DELETE FROM evaluation_runs WHERE id = ?1
+                     AND (?2 IS NULL OR CAST(strftime('%s', created_at) AS INTEGER) < ?2)",
+                    expired_before.map(|ns| ns / 1_000_000_000),
+                )
+            }
         };
+        let ids = {
+            let mut statement = conn.prepare(select)?;
+            let rows = statement.query_map(
+                params![cutoff, limit.min(MAINTENANCE_BATCH_ROWS) as i64],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, usize>(1)?)),
+            )?;
+            let mut ids = Vec::new();
+            let mut bytes: usize = 0;
+            for row in rows {
+                let (id, size) = row?;
+                // Always allow one oversized row so maintenance still makes progress.
+                if !ids.is_empty() && bytes.saturating_add(size) > MAINTENANCE_BATCH_BYTES {
+                    break;
+                }
+                ids.push(id);
+                bytes = bytes.saturating_add(size);
+            }
+            ids
+        };
+        if ids.is_empty() || self.capture_has_priority() {
+            return Ok(0);
+        }
+        let transaction = conn.transaction()?;
+        let mut deleted = 0;
+        for id in ids {
+            // Another connection may have adopted an idle snapshot or refreshed
+            // a record since selection. Recheck eligibility under the write lock.
+            deleted += transaction.execute(delete, params![id, cutoff])?;
+        }
+        transaction.commit()?;
+        Ok(deleted)
+    }
 
-        log::info!(
-            "Pruning {event_delete_count}/{event_count} GenAI events and \
-             {resource_delete_count}/{resource_count} resource samples ({:.1}%)",
-            pct * 100.0
-        );
+    fn yield_maintenance(&self) {
+        if self.maintenance_only {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
 
-        let deleted_events = conn.execute(
-            "DELETE FROM genai_events WHERE id IN (
-                SELECT id FROM genai_events ORDER BY id ASC LIMIT ?1
-            )",
-            params![event_delete_count],
-        )?;
-        let deleted_resources = conn.execute(
-            "DELETE FROM agent_resource_samples WHERE id IN (
-                SELECT id FROM agent_resource_samples ORDER BY id ASC LIMIT ?1
-            )",
-            params![resource_delete_count],
-        )?;
+    /// Copy WAL frames in the worker without waiting for the capture writer.
+    pub(crate) fn checkpoint_passive(
+        &self,
+    ) -> Result<CheckpointOutcome, Box<dyn std::error::Error>> {
+        if self.capture_has_priority() {
+            return Ok(CheckpointOutcome::Busy);
+        }
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|error| format!("GenAI passive checkpoint mutex poisoned: {error}"))?;
+        agentsight_sqlite_lifecycle::checkpoint_passive(&conn).map_err(Into::into)
+    }
 
-        log::info!(
-            "Deleted {deleted_events} GenAI events and {deleted_resources} resource samples"
-        );
+    pub(super) fn maintenance_checkpoint(
+        &self,
+    ) -> Result<CheckpointOutcome, Box<dyn std::error::Error>> {
+        let _timer = crate::runtime_metrics::StageTimer::start("genai_maintenance_checkpoint");
+        if self.capture_has_priority() {
+            return Ok(CheckpointOutcome::Busy);
+        }
+        if !self.maintenance_only {
+            return self.checkpoint_outcome();
+        }
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|error| format!("GenAI maintenance mutex poisoned: {error}"))?;
+        // Copy the bulk of the WAL without excluding the live writer. Only
+        // attempt truncation after every frame was copied; its busy timeout is zero.
+        if agentsight_sqlite_lifecycle::checkpoint_passive(&conn)? == CheckpointOutcome::Busy {
+            return Ok(CheckpointOutcome::Busy);
+        }
+        checkpoint_truncate(&conn).map_err(Into::into)
+    }
 
-        Ok(())
+    fn checkpoint_outcome(&self) -> Result<CheckpointOutcome, Box<dyn std::error::Error>> {
+        let conn = self.conn.lock().unwrap_or_else(|error| error.into_inner());
+        checkpoint_truncate(&conn).map_err(Into::into)
     }
 
     /// Flush WAL frames to the main database and truncate the WAL file.
     ///
-    /// Call during graceful shutdown to clean up `-wal` / `-shm` files —
-    /// mirrors the sibling stores (token, http, audit) which do this via
-    /// `connection::wal_checkpoint` in their own `checkpoint()` methods.
-    ///
-    /// Returns `Ok(true)` when the checkpoint was blocked by another
-    /// connection's read snapshot (busy): the statement succeeds but the WAL
-    /// is NOT truncated. Purge loops must stop deleting in that case — the
-    /// WAL stays in the size measurement while deletes keep appending frames,
-    /// so the loop never converges (#2888).
+    /// Returns `Ok(true)` when another reader keeps the checkpoint busy.
     pub fn wal_checkpoint(&self) -> Result<bool, Box<dyn std::error::Error>> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        let busy: i32 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
-        Ok(busy != 0)
+        Ok(self.checkpoint_outcome()? == CheckpointOutcome::Busy)
+    }
+}
+
+fn table_exists(conn: &Connection, table_name: &str) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?1
+        )",
+        params![table_name],
+        |row| row.get(0),
+    )
+}
+
+fn prune_count(count: i64, fraction: f64) -> i64 {
+    if count > 0 {
+        ((count as f64) * fraction).max(1.0) as i64
+    } else {
+        0
     }
 }

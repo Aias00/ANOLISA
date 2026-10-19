@@ -174,33 +174,41 @@ export async function handleListCheckpoints(): Promise<{
   if (!pluginState.manager || !pluginState.environmentReady) {
     return { text: UNAVAILABLE_MSG, isError: true };
   }
-  const checkpoints = await pluginState.manager.listCheckpoints();
-  if (checkpoints.length === 0) {
-    return {
-      text: "No checkpoints found. The workspace is active and daemon is responding \u2014 there are simply no snapshots yet.",
-      isError: false,
-    };
+  try {
+    const checkpoints = await pluginState.manager.listCheckpoints();
+    if (checkpoints.length === 0) {
+      return {
+        text: "No checkpoints found. The workspace is active and daemon is responding — there are simply no snapshots yet.",
+        isError: false,
+      };
+    }
+    const header = ["ID", "Created At", "Message", "Metadata", "Detail"];
+    const rows = checkpoints.map((cp) => [
+      cp.snapshot,
+      cp.createdAt,
+      cp.message ?? "",
+      cp.metadata ? JSON.stringify(cp.metadata) : "",
+      cp.detail === "summary"
+        ? `summary (omitted: ${(cp.omittedFields ?? []).join(", ") || "details"})`
+        : "full",
+    ]);
+    const widths = header.map((h, i) =>
+      Math.max(h.length, ...rows.map((r) => r[i].length)),
+    );
+    const fmt = (cols: string[]) =>
+      cols.map((c, i) => c.padEnd(widths[i])).join("  ");
+    const lines: string[] = [
+      `Checkpoints (${checkpoints.length}):`,
+      "",
+      fmt(header),
+      widths.map((w) => "-".repeat(w)).join("  "),
+      ...rows.map(fmt),
+    ];
+    return { text: lines.join("\n"), isError: false };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { text: `List checkpoints error: ${message}`, isError: true };
   }
-  const header = ["ID", "Created At", "Message", "Metadata"];
-  const rows = checkpoints.map((cp) => [
-    cp.snapshot,
-    cp.createdAt,
-    cp.message ?? "",
-    cp.metadata ? JSON.stringify(cp.metadata) : "",
-  ]);
-  const widths = header.map((h, i) =>
-    Math.max(h.length, ...rows.map((r) => r[i].length)),
-  );
-  const fmt = (cols: string[]) =>
-    cols.map((c, i) => c.padEnd(widths[i])).join("  ");
-  const lines: string[] = [
-    `Checkpoints (${checkpoints.length}):`,
-    "",
-    fmt(header),
-    widths.map((w) => "-".repeat(w)).join("  "),
-    ...rows.map(fmt),
-  ];
-  return { text: lines.join("\n"), isError: false };
 }
 
 export async function handleDelete(
@@ -436,17 +444,39 @@ export async function handleConfig(
       if (!value) {
         return { text: "workspace requires a path value", isError: true };
       }
+      if (/[\n\r]/.test(value)) {
+        // The workspace path is interpolated into crontab lines; a line
+        // break would install everything after it as an independent cron
+        // entry (see cron.ts buildCronLine).
+        return { text: "workspace must be a single-line path without line breaks", isError: true };
+      }
+      // The new workspace is initialized immediately below (symlink swap /
+      // inode replacement); refuse first when this session's cwd sits inside
+      // it, mirroring the autoCheckpoint branch above and every other entry
+      // point that can init or checkpoint.
+      const cwdCheckNew = cwdInsideWorkspace(value);
+      if (cwdCheckNew.inside) {
+        return { text: cwdInsideWorkspaceReason(cwdCheckNew.cwd, value), isError: true };
+      }
       const oldWs = pluginState.resolvedConfig.workspace;
       pluginState.resolvedConfig.workspace = value;
       const schedules = pluginState.resolvedConfig.cronSchedules ?? [];
       const warnings = await CrontabManager.migrate(oldWs, value, schedules);
       const persistErr = persistConfig({ workspace: value });
-      // Re-initialize manager with new workspace so subsequent commands use it
+      // Re-initialize manager with new workspace so subsequent commands use it.
+      // A failed setup must be surfaced: reporting bare success here would
+      // leave the plugin pointed at a workspace it cannot operate on.
+      let setupFailed = false;
       if (pluginState.manager) {
-        await pluginState.manager.ensureWorkspace(value);
+        setupFailed = !(await pluginState.manager.ensureWorkspace(value));
       }
       let msg = `Config updated: workspace = ${value}`;
       if (persistErr) msg += `\n\nWARNING: Failed to persist config: ${persistErr}. Change is in-memory only.`;
+      if (setupFailed) {
+        msg += `\n\nWARNING: workspace setup failed for ${value} — the config now points at it, ` +
+          `but ws-ckpt commands will fail until it initializes. Check the daemon and ` +
+          `\`ws-ckpt init --workspace ${value}\`, then retry from a session outside that directory.`;
+      }
       if (warnings.length > 0) msg += "\n\n" + warnings.join("\n");
       return { text: msg, isError: false };
     }

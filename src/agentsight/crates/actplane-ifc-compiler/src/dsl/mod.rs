@@ -263,7 +263,7 @@ mod tests {
     fn yaml_get<'a>(value: &'a serde_yaml::Value, key: &str) -> Option<&'a serde_yaml::Value> {
         value
             .as_mapping()?
-            .get(&serde_yaml::Value::String(key.to_string()))
+            .get(serde_yaml::Value::String(key.to_string()))
     }
 
     #[test]
@@ -278,7 +278,7 @@ mod tests {
             declassify SECRET by exec "**/redact"
         "#);
         assert_eq!(c.reasons.len(), 2);
-        assert!(c.bytes.len() > 0);
+        assert!(!c.bytes.is_empty());
     }
 
     #[test]
@@ -455,6 +455,51 @@ rule secret:
     }
 
     #[test]
+    fn positional_arg_on_non_exec_target_is_rejected() {
+        // The engine consults a rule's arg only on the exec path, so an arg on
+        // a file/endpoint target would be a constraint that never applies and
+        // the rule would match every access to the target.
+        let err = match compile_str(
+            "rule r:\n  block read file \"/etc/passwd\" \"secret\" if A\n  because \"x\"\n",
+        ) {
+            Ok(_) => panic!("arg on a read target must be rejected at parse time"),
+            Err(err) => err,
+        };
+        assert!(
+            err.contains("only valid on exec"),
+            "error should name the exec-only rule: {err}"
+        );
+        let err = match compile_str(
+            "rule r:\n  block connect endpoint \"*\" \"junk\" if A\n  because \"x\"\n",
+        ) {
+            Ok(_) => panic!("arg on a connect target must be rejected at parse time"),
+            Err(err) => err,
+        };
+        assert!(err.contains("only valid on exec"));
+    }
+
+    #[test]
+    fn positional_arg_on_non_exec_since_is_rejected() {
+        let err = match compile_str(
+            "rule r:\n  block exec \"git\" if A unless after exec \"**/pytest\" since write \"src/**\" \"arg\"\n  because \"x\"\n",
+        ) {
+            Ok(_) => panic!("arg on a write invalidator must be rejected at parse time"),
+            Err(err) => err,
+        };
+        assert!(err.contains("only valid on exec"));
+    }
+
+    #[test]
+    fn positional_arg_on_exec_target_still_compiles() {
+        let c = ok("rule r:\n  block exec \"git\" \"push\" if A\n  because \"x\"\n");
+        assert_eq!(c.meta[0].target_arg.as_deref(), Some("push"));
+        let c = ok(
+            "rule r:\n  block exec \"git\" if A unless after exec \"**/confirm\" since exec \"git\" \"push\"\n  because \"x\"\n",
+        );
+        assert!(!c.bytes.is_empty());
+    }
+
+    #[test]
     fn exits_is_only_valid_for_exec_gates() {
         assert!(compile_str(
             "rule r:\n  block exec \"git\" if A unless after read \"src/**\" exits 0\n  because \"x\"\n"
@@ -590,7 +635,7 @@ rule secret:
         for ent in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
         {
             let path = ent.expect("policy dir entry").path();
-            if !path.extension().is_some_and(|ext| ext == "yaml") {
+            if path.extension().is_none_or(|ext| ext != "yaml") {
                 continue;
             }
             let src = std::fs::read_to_string(&path)
@@ -652,7 +697,7 @@ rule secret:
     fn rule_effect_is_metadata_and_kernel_config() {
         let c = ok("rule r:\n  kill exec \"git\"\n  because \"x\"\n");
         assert_eq!(c.meta[0].effect, ast::Effect::Kill);
-        assert!(c.bytes.len() > 0);
+        assert!(!c.bytes.is_empty());
     }
 
     #[test]
@@ -661,6 +706,24 @@ rule secret:
             "source AGENT = exec \"**/claude\"\nrule r:\n  block exec \"git\" if AGENT\n  because \"x\"\n",
         );
         assert!(c.labels.contains_key("AGENT"));
+    }
+
+    #[test]
+    fn empty_pattern_literals_are_rejected() {
+        // An empty pattern lowers to a matcher that can never fire (M_EXACT ""
+        // never equals a non-empty runtime path/comm; the engine rejects an
+        // empty M_CONTAINS literal), so a `block`/`kill` clause carrying one
+        // silently installs no enforcement at all. Reject at parse time.
+        for src in [
+            "rule r:\n  block exec \"\" if A\n  because \"x\"\n",
+            "source S = file \"\"\nrule r:\n  block write file \"/x\" if S\n  because \"x\"\n",
+            "rule r:\n  block exec \"git\" if A unless after exec \"\"\n  because \"x\"\n",
+        ] {
+            assert!(
+                compile_str(src).is_err(),
+                "empty pattern literals must be rejected at compile time: {src:?}"
+            );
+        }
     }
 
     #[test]

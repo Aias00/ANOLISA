@@ -7,6 +7,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.10] - 2026-10-15
+
+### Added
+
+- **agent-memory**: Updated to v0.2.10, provides Linux x86_64 and ARM64 raw release packages with the memory server and bundled OpenClaw adapter, users can install verified archives without building from source (#7648, #7649)
+
+### Fixed
+
+- **agent-memory**: Guides agents through the host's available Tool Search or direct tool calls, so deferred memory tools can be discovered and invoked with valid arguments (#7645)
+- **agent-memory**: Waits for the MCP child process to exit and cleans it up when an OpenClaw plugin instance is disposed, preventing leftover memory processes during shutdown and reload (#7482, #7661)
+
+## [0.2.9] - 2026-10-11
+
+### Fixed
+
+- **agent-memory**: Updated to v0.2.9, requires executable files when locating the OpenClaw adapter's binary, users receive a startup configuration error for directory-valued `binaryPath` settings and can use a valid executable or executable symlink later in `PATH` even when an earlier entry contains a directory named `agent-memory` (#4855)
+
+## [0.2.8] - 2026-09-20
+
+### Added
+
+- **agent-memory**: Falls back to a private per-user runtime or temporary directory when the configured session directory is unusable, unprivileged installations can use session logs and `mem_promote` without creating a root-owned directory; fallback paths are checked for ownership, permissions, and symlink redirection (#3266)
+
+### Changed
+
+- **agent-memory**: **Breaking change:** renames the OpenClaw tools to `anolisa_memory_search` and `anolisa_memory_get`, agents can access ANOLISA memories alongside OpenClaw's own memory tools without name conflicts; update prompts and tool allowlists, restart the gateway, and start a new conversation. Internal MCP names and stored memories are unchanged (#3347)
+- **agent-memory**: Declares all four plugin tools in OpenClaw's `coding` profile, agents retain access to the plugin tools under that profile without disabling `memory-core`; custom policies still need explicit tool entries, and disable markers from intermediate installers require the manual recovery described in the [user guide](../../docs/user-guide/en/token-saving/agent-memory.md) (#3347)
+
+### Fixed
+
+- **agent-memory**: Accepts `sessionId` and `sessionDir` in the OpenClaw plugin schema and enforces the server's 128-byte UTF-8 identifier limit at plugin startup, users can pin session scratch across respawns and receive configuration errors before an invalid identifier changes their namespace (#3213)
+- **agent-memory**: Ranks stronger BM25 matches first and aligns keyword scores with the higher-is-better convention, search, hybrid retrieval, and automatic recall prioritize the most relevant matching memories (#3296)
+- **agent-memory**: Rejects the unsupported OpenClaw `expert` profile with guidance to use `basic` or `advanced` and stops the previous client before validating a reload, operators see actionable configuration errors without leaving the old memory process holding storage locks (#3238)
+- **agent-memory**: Restores the required files in `make dist` source archives, source-package and RPM builders receive the example target, configuration, and adapter assets needed to build and install (#3231)
+
 ## [0.2.7] - 2026-09-09
 
 ### Fixed

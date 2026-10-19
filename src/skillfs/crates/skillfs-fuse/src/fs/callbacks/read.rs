@@ -603,7 +603,15 @@ impl SkillFs {
                                     physical = dir.join("SKILL.md");
                                 }
                                 PathType::NestedPassthrough { relative_path, .. } => {
-                                    physical = dir.join(relative_path);
+                                    // I4: grace bypass — whitelisted paths
+                                    // open from the live source, matching
+                                    // the flat open path.
+                                    if !self.is_post_publish_grace_allowed(
+                                        &nested_id,
+                                        Some(relative_path.as_path()),
+                                    ) {
+                                        physical = dir.join(relative_path);
+                                    }
                                 }
                                 _ => {}
                             }
@@ -755,6 +763,7 @@ impl SkillFs {
                 self.send_sync(SyncEvent::Reparse {
                     skill_name: skill_name.clone(),
                     source_path: physical.clone(),
+                    max_skill_size: self.max_skill_size,
                 });
                 self.observe_mutation(
                     skill_name,

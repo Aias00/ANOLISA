@@ -4,6 +4,10 @@ from __future__ import annotations
 
 
 TARGETS = {
+    "os-skills": (
+        {"target-os": "linux", "target-arch": "x86_64", "profile": "static-linux"},
+        {"target-os": "linux", "target-arch": "aarch64", "profile": "static-linux"},
+    ),
     "anolisa": (
         {
             "target-os": "linux",
@@ -19,6 +23,35 @@ TARGETS = {
             "target-os": "macos",
             "target-arch": "aarch64",
             "profile": "darwin11-aarch64",
+        },
+        {
+            "target-os": "macos",
+            "target-arch": "x86_64",
+            "profile": "darwin11-x86_64",
+        },
+    ),
+    "ws-ckpt": (
+        {
+            "target-os": "linux",
+            "target-arch": "x86_64",
+            "profile": "gnu2.28-x86_64",
+        },
+        {
+            "target-os": "linux",
+            "target-arch": "aarch64",
+            "profile": "gnu2.28-aarch64",
+        },
+    ),
+    "skillfs": (
+        {
+            "target-os": "linux",
+            "target-arch": "x86_64",
+            "profile": "gnu2.28-x86_64",
+        },
+        {
+            "target-os": "linux",
+            "target-arch": "aarch64",
+            "profile": "gnu2.28-aarch64",
         },
     ),
     "cosh-ng": (
@@ -37,6 +70,20 @@ TARGETS = {
             "target-arch": "aarch64",
             "profile": "darwin11-aarch64",
         },
+        {
+            "target-os": "macos",
+            "target-arch": "x86_64",
+            "profile": "darwin11-x86_64",
+        },
+    ),
+    "agent-memory": (
+        {"target-os": "linux", "target-arch": "x86_64", "profile": "gnu2.28-x86_64"},
+        {"target-os": "linux", "target-arch": "aarch64", "profile": "gnu2.28-aarch64"},
+    ),
+    "agentsight": (
+        {"target-os": "linux", "target-arch": "x86_64", "profile": "gnu2.28-x86_64"},
+        {"target-os": "linux", "target-arch": "aarch64", "profile": "gnu2.28-aarch64"},
+        {"target-os": "macos", "target-arch": "aarch64", "profile": "darwin11-aarch64"},
     ),
     "tokenless": (
         {

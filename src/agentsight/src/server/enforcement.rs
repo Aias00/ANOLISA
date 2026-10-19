@@ -1,6 +1,12 @@
 //! HTTP boundary for local enforcement control and evidence queries.
 
+#[cfg(unix)]
+use std::ffi::OsStr;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -94,7 +100,8 @@ pub(super) async fn preview_agent_protection(
             false,
         );
     };
-    if query.directory.is_none() {
+    let using_default_directory = query.directory.is_none();
+    if using_default_directory {
         if let Some(coordinator) = data.enforcement.clone() {
             let active_policy = web::block(move || {
                 let binding_id = coordinator
@@ -149,18 +156,17 @@ pub(super) async fn preview_agent_protection(
             true,
         );
     };
-    let root = query.directory.as_deref().unwrap_or(&workspace);
-    let root = match root.canonicalize() {
-        Ok(root) if root.is_dir() && root != Path::new("/") => root,
-        Ok(_) => {
+    let root = match protection_scan_root(query.directory.as_deref(), &workspace) {
+        Ok(root) => root,
+        Err(ProtectionRootError::WorkspaceUnavailable) => {
             return error_response(
-                actix_web::http::StatusCode::BAD_REQUEST,
-                "unsafe_protection_directory",
-                "protection directory cannot be the filesystem root",
-                false,
+                actix_web::http::StatusCode::CONFLICT,
+                "workspace_unavailable",
+                "agent workspace is unavailable",
+                true,
             );
         }
-        _ => {
+        Err(ProtectionRootError::NotADirectory) => {
             return error_response(
                 actix_web::http::StatusCode::BAD_REQUEST,
                 "invalid_protection_directory",
@@ -168,17 +174,39 @@ pub(super) async fn preview_agent_protection(
                 false,
             );
         }
+        Err(ProtectionRootError::FilesystemRoot) => {
+            return error_response(
+                actix_web::http::StatusCode::BAD_REQUEST,
+                "unsafe_protection_directory",
+                "protection directory cannot be the filesystem root",
+                false,
+            );
+        }
+        Err(ProtectionRootError::OutsideWorkspace) => {
+            return error_response(
+                actix_web::http::StatusCode::BAD_REQUEST,
+                "unauthorized_protection_directory",
+                "protection directory must stay inside the agent workspace",
+                false,
+            );
+        }
     };
     // Run the recursive filesystem scan on the blocking pool so a large or slow
-    // directory never ties up an async Actix worker.
+    // directory never ties up an async Actix worker. HOME is only a fallback for
+    // an empty default-workspace scan; an explicit directory remains authoritative.
     let workspace_path = root.to_string_lossy().into_owned();
+    let fallback_pid = using_default_directory.then_some(pid);
     let scan_root = root.clone();
-    let source_paths = web::block(move || discover_sensitive_files(&scan_root, 3, 64))
-        .await
-        .unwrap_or_else(|error| {
-            log::warn!("sensitive-file scan worker failed: {error}");
-            Vec::new()
-        });
+    let source_paths = web::block(move || {
+        let fallback_home =
+            fallback_pid.and_then(|pid| validated_process_home(Path::new("/proc"), pid));
+        discover_sensitive_files_with_fallback(&scan_root, fallback_home.as_deref(), 3, 64)
+    })
+    .await
+    .unwrap_or_else(|error| {
+        log::warn!("sensitive-file scan worker failed: {error}");
+        Vec::new()
+    });
     HttpResponse::Ok().json(ProtectionPreview {
         agent_id: agent.agent_name,
         root_pid: pid,
@@ -188,6 +216,64 @@ pub(super) async fn preview_agent_protection(
         mode: PolicyMode::Audit,
         max_trusted_endpoints: 1,
     })
+}
+
+/// Why a requested protection-scan root was rejected.
+#[derive(Debug, PartialEq, Eq)]
+enum ProtectionRootError {
+    /// The agent workspace could not be resolved, so no boundary exists to enforce.
+    WorkspaceUnavailable,
+    /// The requested path is missing, or exists but is not a directory.
+    NotADirectory,
+    /// The requested path is the filesystem root.
+    FilesystemRoot,
+    /// The requested path resolves outside the agent workspace.
+    OutsideWorkspace,
+}
+
+/// Validates the protection-scan root for one agent.
+///
+/// `candidate` is the caller-supplied `directory` query parameter; `None` scans
+/// the agent's own workspace. An explicit directory must resolve *inside* the
+/// workspace: this preview answers with full sensitive-file paths, loopback
+/// requests reach it without a token, and permissive CORS lets a visited web
+/// page read the response — so an unbounded `directory` would enumerate
+/// credential-file paths anywhere on the machine the server can read. Both
+/// sides are canonicalized before comparison, so a symlinked workspace alias
+/// and an in-workspace symlink that points outside are both judged by their
+/// resolved location.
+fn protection_scan_root(
+    candidate: Option<&Path>,
+    workspace: &Path,
+) -> Result<PathBuf, ProtectionRootError> {
+    let root = candidate.unwrap_or(workspace);
+    let root = root
+        .canonicalize()
+        .map_err(|_| ProtectionRootError::NotADirectory)?;
+    if !root.is_dir() {
+        return Err(ProtectionRootError::NotADirectory);
+    }
+    if root == Path::new("/") {
+        return Err(ProtectionRootError::FilesystemRoot);
+    }
+    if candidate.is_some() {
+        let boundary = workspace
+            .canonicalize()
+            .map_err(|_| ProtectionRootError::WorkspaceUnavailable)?;
+        // A workspace recorded as `/` (possible because it is copied straight
+        // from `/proc/<pid>/cwd`) must not widen the boundary to the whole
+        // filesystem: every absolute path starts with `/`, so the prefix
+        // check below would admit any directory on the machine this
+        // loopback/CORS-readable endpoint can read. Refuse the boundary
+        // itself, exactly like an unresolvable one.
+        if boundary == Path::new("/") {
+            return Err(ProtectionRootError::WorkspaceUnavailable);
+        }
+        if !root.starts_with(&boundary) {
+            return Err(ProtectionRootError::OutsideWorkspace);
+        }
+    }
+    Ok(root)
 }
 
 fn is_active_credential_binding(binding: &Binding, pid: u32) -> bool {
@@ -253,58 +339,198 @@ fn common_source_directory(source_paths: &[String]) -> Option<PathBuf> {
     Some(common)
 }
 
+#[cfg(unix)]
+fn parse_process_uid(status: &str) -> Option<u32> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+#[cfg(unix)]
+fn parse_home_from_environ(environ: &[u8]) -> Option<PathBuf> {
+    let mut homes = environ
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| entry.strip_prefix(b"HOME="))
+        .filter(|value| !value.is_empty());
+    let home = homes.next()?;
+    if homes.next().is_some() {
+        return None;
+    }
+    Some(PathBuf::from(OsStr::from_bytes(home)))
+}
+
+#[cfg(unix)]
+fn validated_process_home(proc_root: &Path, pid: u32) -> Option<PathBuf> {
+    let process_dir = proc_root.join(pid.to_string());
+    // `/proc/<pid>/status` embeds the process name, and the kernel allows
+    // non-UTF-8 bytes in a name; `read_to_string` rejected the whole file, so
+    // the `Uid:` line — ASCII — was lost and the caller silently dropped the
+    // HOME fallback from the scan. Decode lossily, as the cmdline/environ
+    // readers here already do.
+    let status_bytes = fs::read(process_dir.join("status")).ok()?;
+    let status = String::from_utf8_lossy(&status_bytes);
+    let process_uid = parse_process_uid(&status)?;
+    let home = parse_home_from_environ(&fs::read(process_dir.join("environ")).ok()?)?;
+    if !home.is_absolute() || home == Path::new("/") {
+        return None;
+    }
+    let home = home.canonicalize().ok()?;
+    if home == Path::new("/") {
+        return None;
+    }
+    let metadata = fs::metadata(&home).ok()?;
+    if !metadata.is_dir() || metadata.uid() != process_uid {
+        return None;
+    }
+    Some(home)
+}
+
+#[cfg(not(unix))]
+fn validated_process_home(_proc_root: &Path, _pid: u32) -> Option<PathBuf> {
+    None
+}
+
+fn discover_sensitive_files_with_fallback(
+    root: &Path,
+    fallback: Option<&Path>,
+    max_depth: usize,
+    limit: usize,
+) -> Vec<String> {
+    let mut files = discover_sensitive_files(root, max_depth, limit);
+    if files.is_empty()
+        && let Some(fallback) = fallback.filter(|fallback| *fallback != root)
+    {
+        files.extend(discover_sensitive_files(fallback, max_depth, limit));
+        files.sort();
+        files.dedup();
+        files.truncate(limit);
+    }
+    files
+}
+
+/// Returns true when `name` looks like a real credential/secret file rather than
+/// source code that merely mentions credentials in its filename.
+///
+/// The previous heuristic used `name.contains("credential")` which matched
+/// `credential_pool.py`, `test_credential_*.py`, and `.pyc` bytecode across an
+/// agent's source tree, drowning out actual `.env` files.
+fn is_sensitive_file(name: &str) -> bool {
+    // Reject source / bytecode / cache files regardless of stem.
+    const CODE_EXTS: &[&str] = &[
+        "py", "pyc", "pyi", "pyo", "rs", "ts", "tsx", "js", "jsx", "mjs", "cjs", "go", "java", "c",
+        "cc", "cpp", "h", "hpp", "rb", "php", "sh", "bash", "zsh", "toml", "md", "html", "css",
+        "lock", "map",
+    ];
+    if let Some((_, ext)) = name.rsplit_once('.') {
+        if CODE_EXTS.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
+            return false;
+        }
+    }
+    if name.starts_with("test_") || name.ends_with("_test") {
+        return false;
+    }
+
+    // Positive matches: real dotenv / credential / private-key style filenames.
+    name == ".env"
+        || name.starts_with(".env.")
+        || name == ".npmrc"
+        || name == ".pypirc"
+        || name == ".netrc"
+        || name == "credentials"
+        || name == "credentials.json"
+        || name == "credentials.yaml"
+        || name == "credentials.yml"
+        || name == "auth.json"
+        || name.starts_with("id_rsa")
+        || name.starts_with("id_ed25519")
+        || name.starts_with("id_ecdsa")
+        || name.starts_with("id_dsa")
+        || name.ends_with(".pem")
+        || name.ends_with(".key")
+        || name.ends_with(".p12")
+        || name.ends_with(".pfx")
+        // JSON/YAML config files whose filename contains a credential-shaped
+        // word — e.g. `service-credential.json`, `gcp-secret.yaml`. Source
+        // extensions have already returned false above, so this cannot re-admit
+        // `.py`/`.rs`/... names that merely mention credentials.
+        || ((name.ends_with(".json")
+            || name.ends_with(".yaml")
+            || name.ends_with(".yml"))
+            && (name.contains("credential") || name.contains("secret")))
+}
+
 fn discover_sensitive_files(root: &Path, max_depth: usize, limit: usize) -> Vec<String> {
     fn visit(
         root: &Path,
         depth: usize,
         max_depth: usize,
-        limit: usize,
         visited: &mut usize,
         out: &mut Vec<String>,
     ) {
         // Bound the total directory entries inspected so a huge or slow tree
         // with no matches still returns promptly instead of tying up the
-        // scanning worker indefinitely.
+        // scanning worker indefinitely. The `limit` cap is *not* applied here:
+        // stopping the walk at `limit` matches made the surviving subset depend
+        // on readdir order, and this list is what the dashboard submits as the
+        // persisted protection policy. The walk therefore collects every match
+        // (at most `MAX_ENTRIES_VISITED` of them) and the caller keeps the
+        // lexicographically first `limit` of the sorted paths.
         const MAX_ENTRIES_VISITED: usize = 20_000;
-        if depth > max_depth || out.len() >= limit || *visited >= MAX_ENTRIES_VISITED {
+        if depth > max_depth || *visited >= MAX_ENTRIES_VISITED {
             return;
         }
         let Ok(entries) = fs::read_dir(root) else {
             return;
         };
         for entry in entries.flatten() {
-            if out.len() >= limit || *visited >= MAX_ENTRIES_VISITED {
+            if *visited >= MAX_ENTRIES_VISITED {
                 break;
             }
             *visited += 1;
             let path = entry.path();
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if path.is_dir() {
+            // Classify by the entry's own type, never by following a symlink:
+            // a link planted inside the scan root can point anywhere on the
+            // filesystem, and `path.is_dir()`/`path.is_file()` would happily
+            // walk or read through it, widening the bounded scan.
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
                 if !matches!(
                     name.as_ref(),
-                    ".git" | "node_modules" | "target" | "dist" | "build" | ".cache"
+                    ".git"
+                        | "node_modules"
+                        | "target"
+                        | "dist"
+                        | "build"
+                        | ".cache"
+                        | "__pycache__"
+                        | ".venv"
+                        | "venv"
+                        | "site-packages"
+                        | "tests"
+                        | "test"
+                        | "__tests__"
                 ) {
-                    visit(&path, depth + 1, max_depth, limit, visited, out);
+                    visit(&path, depth + 1, max_depth, visited, out);
                 }
-            } else if path.is_file()
-                && (name == ".env"
-                    || name.starts_with(".env.")
-                    || name.contains("credential")
-                    || name == ".npmrc"
-                    || name == ".pypirc"
-                    || name.starts_with("id_rsa")
-                    || name.starts_with("id_ed25519"))
-            {
+            } else if file_type.is_file() && is_sensitive_file(name.as_ref()) {
                 out.push(path.to_string_lossy().into_owned());
             }
         }
     }
     let mut files = Vec::new();
     let mut visited = 0usize;
-    visit(root, 0, max_depth, limit, &mut visited, &mut files);
+    visit(root, 0, max_depth, &mut visited, &mut files);
     files.sort();
     files.dedup();
+    files.truncate(limit);
     files
 }
 
@@ -880,6 +1106,382 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    /// The cap must keep a defined subset. The walk collects matches in
+    /// filesystem order and used to stop at `limit` matches *before* sorting, so
+    /// which secrets survived was decided by readdir order — and the dashboard
+    /// submits exactly this list as the persisted protection policy, leaving the
+    /// rest of the workspace unmonitored without saying so.
+    #[test]
+    fn discover_sensitive_files_keeps_the_first_paths_in_order() {
+        let root = std::env::temp_dir().join(format!("agentsight-scan-order-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("fixture dir should exist");
+        // Created deliberately out of lexical order, and more than the cap.
+        for prefix in ["d", "b", "e", "a", "c"] {
+            for index in 1..=9 {
+                fs::write(root.join(format!("{prefix}{index}.pem")), b"key").expect("key fixture");
+            }
+        }
+
+        let found = discover_sensitive_files(&root, 2, 4);
+
+        let expected: Vec<String> = (1..=4)
+            .map(|index| {
+                root.join(format!("a{index}.pem"))
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(
+            found, expected,
+            "the cap must keep the lexicographically first paths"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn is_sensitive_file_matches_real_secrets_not_source() {
+        // Real credential-shaped filenames must match.
+        assert!(is_sensitive_file(".env"));
+        assert!(is_sensitive_file(".env.local"));
+        assert!(is_sensitive_file(".env.production"));
+        assert!(is_sensitive_file(".netrc"));
+        assert!(is_sensitive_file(".pypirc"));
+        assert!(is_sensitive_file("credentials"));
+        assert!(is_sensitive_file("credentials.json"));
+        assert!(is_sensitive_file("auth.json"));
+        // Real-world variants: JSON/YAML config whose stem carries the word
+        // "credential" or "secret" — must still be picked up so we do not
+        // regress the upstream expectation on files like `service-credential.json`.
+        assert!(is_sensitive_file("service-credential.json"));
+        assert!(is_sensitive_file("gcp-secret.yaml"));
+        assert!(is_sensitive_file("id_rsa"));
+        assert!(is_sensitive_file("id_ed25519.pub"));
+        assert!(is_sensitive_file("server.pem"));
+        assert!(is_sensitive_file("client.key"));
+
+        // Source & bytecode named after credentials must NOT match because an
+        // installed Agent source tree can otherwise produce dozens of false positives.
+        assert!(!is_sensitive_file("credential_pool.py"));
+        assert!(!is_sensitive_file("credential_pool.cpython-311.pyc"));
+        assert!(!is_sensitive_file("credential_sources.py"));
+        assert!(!is_sensitive_file("test_credential_pool.py"));
+        assert!(!is_sensitive_file("test_credential_lifecycle.py"));
+        assert!(!is_sensitive_file("credential_pool_admin.py"));
+    }
+
+    #[test]
+    fn discover_sensitive_files_skips_source_trees_and_finds_env() {
+        // A real `.env` sits next to a source subtree whose filenames merely
+        // mention "credential". The scan must find the `.env` and skip every source
+        // file, `__pycache__` entry, and anything under `tests/`.
+        let root = std::env::temp_dir().join(format!("agentsight-scan-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("hermes-agent/agent/__pycache__")).expect("cache dir fixture");
+        fs::create_dir_all(root.join("hermes-agent/tests/agent")).expect("tests dir fixture");
+        fs::write(root.join(".env"), b"MAAS_API_KEY=x").expect("env fixture");
+        fs::write(
+            root.join("hermes-agent/agent/credential_pool.py"),
+            b"# source",
+        )
+        .expect("source fixture");
+        fs::write(
+            root.join("hermes-agent/agent/__pycache__/credential_pool.cpython-311.pyc"),
+            b"pyc",
+        )
+        .expect("pyc fixture");
+        fs::write(
+            root.join("hermes-agent/tests/agent/test_credential_pool.py"),
+            b"# tests",
+        )
+        .expect("test fixture");
+
+        let found = discover_sensitive_files(&root, 5, 64);
+
+        assert!(
+            found.iter().any(|p| p.ends_with("/.env")),
+            "real .env should be picked up, got {found:?}"
+        );
+        assert!(
+            !found.iter().any(|p| p.ends_with(".py")),
+            "source files must not match, got {found:?}"
+        );
+        assert!(
+            !found.iter().any(|p| p.ends_with(".pyc")),
+            "bytecode must not match, got {found:?}"
+        );
+        assert!(
+            !found.iter().any(|p| p.contains("__pycache__")),
+            "__pycache__ subtree must be skipped, got {found:?}"
+        );
+        assert!(
+            !found.iter().any(|p| p.contains("/tests/")),
+            "tests subtree must be skipped, got {found:?}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protection_scan_root_bounds_explicit_directories_to_the_workspace() {
+        let base = std::env::temp_dir().join(format!("agentsight-boundary-{}", Uuid::new_v4()));
+        let workspace = base.join("workspace");
+        let nested = workspace.join("nested");
+        let outside = base.join("outside");
+        fs::create_dir_all(&nested).expect("workspace fixture");
+        fs::create_dir_all(&outside).expect("outside fixture");
+
+        // The default scan root stays the agent's own workspace.
+        assert_eq!(
+            protection_scan_root(None, &workspace),
+            Ok(workspace.canonicalize().expect("canonical workspace"))
+        );
+        // Explicit directories inside the workspace are accepted, including
+        // the workspace itself.
+        assert_eq!(
+            protection_scan_root(Some(&nested), &workspace),
+            Ok(nested.canonicalize().expect("canonical nested"))
+        );
+        assert_eq!(
+            protection_scan_root(Some(&workspace), &workspace),
+            Ok(workspace.canonicalize().expect("canonical workspace"))
+        );
+
+        // A directory outside the workspace is refused.
+        assert_eq!(
+            protection_scan_root(Some(&outside), &workspace),
+            Err(ProtectionRootError::OutsideWorkspace)
+        );
+        // A symlink planted inside the workspace but resolving outside is
+        // judged by its resolved location, not by where the link lives.
+        let escape = workspace.join("escape");
+        std::os::unix::fs::symlink(&outside, &escape).expect("escape symlink fixture");
+        assert_eq!(
+            protection_scan_root(Some(&escape), &workspace),
+            Err(ProtectionRootError::OutsideWorkspace)
+        );
+
+        // Missing paths, regular files and the filesystem root keep their
+        // established error classes.
+        assert_eq!(
+            protection_scan_root(Some(&base.join("missing")), &workspace),
+            Err(ProtectionRootError::NotADirectory)
+        );
+        let file = workspace.join("SKILL.md");
+        fs::write(&file, b"docs").expect("file fixture");
+        assert_eq!(
+            protection_scan_root(Some(&file), &workspace),
+            Err(ProtectionRootError::NotADirectory)
+        );
+        assert_eq!(
+            protection_scan_root(Some(Path::new("/")), &workspace),
+            Err(ProtectionRootError::FilesystemRoot)
+        );
+
+        // When the workspace itself cannot be resolved there is no boundary to
+        // enforce, so an explicit directory fails closed.
+        assert_eq!(
+            protection_scan_root(Some(&outside), &base.join("vanished")),
+            Err(ProtectionRootError::WorkspaceUnavailable)
+        );
+        // A workspace that resolves to the filesystem root (copied from a
+        // daemon's `/proc/<pid>/cwd`) is not a boundary at all: every absolute
+        // path starts with `/`, so it must be refused before the prefix check
+        // instead of admitting any directory on the machine.
+        assert_eq!(
+            protection_scan_root(Some(&outside), Path::new("/")),
+            Err(ProtectionRootError::WorkspaceUnavailable)
+        );
+        assert_eq!(
+            protection_scan_root(Some(Path::new("/etc")), Path::new("/")),
+            Err(ProtectionRootError::WorkspaceUnavailable)
+        );
+
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_sensitive_files_does_not_follow_directory_symlinks() {
+        let base = std::env::temp_dir().join(format!("agentsight-walk-{}", Uuid::new_v4()));
+        let root = base.join("root");
+        let nested = root.join("nested");
+        let outside = base.join("outside");
+        fs::create_dir_all(&nested).expect("nested fixture");
+        fs::create_dir_all(&outside).expect("outside fixture");
+        fs::write(root.join(".env"), b"SECRET=1").expect("root env fixture");
+        fs::write(nested.join("id_rsa"), b"key").expect("nested key fixture");
+        fs::write(outside.join(".env"), b"SECRET=2").expect("outside env fixture");
+        // A link inside the scan root pointing at a directory outside it must
+        // not widen the walk: recursing through it would enumerate the outside
+        // tree's credential-shaped files.
+        std::os::unix::fs::symlink(&outside, root.join("link")).expect("link fixture");
+
+        let found = discover_sensitive_files(&root, 5, 64);
+
+        assert!(
+            found
+                .iter()
+                .any(|p| p.ends_with("/.env") && p.contains("root")),
+            "the root .env should be found, got {found:?}"
+        );
+        assert!(
+            found.iter().any(|p| p.ends_with("id_rsa")),
+            "the nested key should be found, got {found:?}"
+        );
+        assert!(
+            !found
+                .iter()
+                .any(|p| p.contains("link") || p.contains("outside")),
+            "a symlinked directory must not be followed, got {found:?}"
+        );
+
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validates_process_home_from_proc_metadata() {
+        let root = std::env::temp_dir().join(format!("agentsight-proc-{}", Uuid::new_v4()));
+        let proc_root = root.join("proc");
+        let process_dir = proc_root.join("4242");
+        let home = root.join("home");
+        fs::create_dir_all(&process_dir).expect("process fixture dir");
+        fs::create_dir_all(&home).expect("home fixture dir");
+        let owner_uid = fs::metadata(&home).expect("home metadata").uid();
+        fs::write(
+            process_dir.join("status"),
+            format!("Name:\tfixture\nUid:\t{owner_uid}\t{owner_uid}\t{owner_uid}\t{owner_uid}\n"),
+        )
+        .expect("status fixture");
+        fs::write(
+            process_dir.join("environ"),
+            format!("PATH=/usr/bin\0HOME={}\0", home.display()).as_bytes(),
+        )
+        .expect("environ fixture");
+
+        assert_eq!(
+            validated_process_home(&proc_root, 4242),
+            Some(home.canonicalize().expect("canonical home"))
+        );
+
+        // Relative, root, duplicate, nonexistent, and differently-owned HOME
+        // values all fail closed instead of broadening a privileged scan.
+        for value in ["relative/home", "/", "/does/not/exist"] {
+            fs::write(
+                process_dir.join("environ"),
+                format!("HOME={value}\0").as_bytes(),
+            )
+            .expect("invalid environ fixture");
+            assert_eq!(validated_process_home(&proc_root, 4242), None);
+        }
+        let root_link = root.join("root-link");
+        std::os::unix::fs::symlink("/", &root_link).expect("root symlink fixture");
+        fs::write(
+            process_dir.join("environ"),
+            format!("HOME={}\0", root_link.display()).as_bytes(),
+        )
+        .expect("symlinked root HOME fixture");
+        assert_eq!(validated_process_home(&proc_root, 4242), None);
+
+        fs::write(
+            process_dir.join("environ"),
+            format!("HOME={}\0HOME={}\0", home.display(), home.display()).as_bytes(),
+        )
+        .expect("duplicate HOME fixture");
+        assert_eq!(validated_process_home(&proc_root, 4242), None);
+
+        fs::write(
+            process_dir.join("environ"),
+            format!("HOME={}\0", home.display()).as_bytes(),
+        )
+        .expect("restored environ fixture");
+        let other_uid = owner_uid.wrapping_add(1);
+        fs::write(
+            process_dir.join("status"),
+            format!("Uid:\t{other_uid}\t{other_uid}\t{other_uid}\t{other_uid}\n"),
+        )
+        .expect("mismatched status fixture");
+        assert_eq!(validated_process_home(&proc_root, 4242), None);
+
+        fs::write(
+            process_dir.join("status"),
+            format!("Uid:\t{owner_uid}\t{owner_uid}\t{owner_uid}\t{owner_uid}\n"),
+        )
+        .expect("restored status fixture");
+        fs::remove_file(process_dir.join("environ")).expect("environ fixture should be removed");
+        assert_eq!(validated_process_home(&proc_root, 4242), None);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// `/proc/<pid>/status` embeds the process name, and the kernel allows
+    /// non-UTF-8 bytes in a name; `read_to_string` rejected the whole file, so
+    /// the `Uid:` line — plain ASCII — was lost and the HOME fallback silently
+    /// dropped out of the privileged scan preview.
+    #[cfg(unix)]
+    #[test]
+    fn validates_process_home_despite_a_non_utf8_process_name() {
+        use std::os::unix::fs::MetadataExt;
+
+        let root = std::env::temp_dir().join(format!("agentsight-proc-nu-{}", Uuid::new_v4()));
+        let proc_root = root.join("proc");
+        let process_dir = proc_root.join("4242");
+        let home = root.join("home");
+        fs::create_dir_all(&process_dir).expect("process fixture dir");
+        fs::create_dir_all(&home).expect("home fixture dir");
+        let owner_uid = fs::metadata(&home).expect("home metadata").uid();
+        // The kernel allows raw bytes in comm, so the `Name:` line is not
+        // necessarily valid UTF-8 while `Uid:` stays ASCII.
+        let mut status = b"Name:\tnode".to_vec();
+        status.push(0xa0);
+        status.extend_from_slice(
+            format!("-22\nUid:\t{owner_uid}\t{owner_uid}\t{owner_uid}\t{owner_uid}\n").as_bytes(),
+        );
+        fs::write(process_dir.join("status"), status).expect("status fixture");
+        fs::write(
+            process_dir.join("environ"),
+            format!("PATH=/usr/bin\0HOME={}\0", home.display()).as_bytes(),
+        )
+        .expect("environ fixture");
+
+        assert_eq!(
+            validated_process_home(&proc_root, 4242),
+            Some(home.canonicalize().expect("canonical home")),
+            "a non-UTF-8 Name line must not hide the UID and the HOME fallback"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn sensitive_file_scan_uses_home_only_as_empty_default_fallback() {
+        let root = std::env::temp_dir().join(format!("agentsight-fallback-{}", Uuid::new_v4()));
+        let workspace = root.join("workspace");
+        let home = root.join("home");
+        fs::create_dir_all(&workspace).expect("workspace fixture");
+        fs::create_dir_all(&home).expect("home fixture");
+        fs::write(home.join(".env"), b"SECRET=1").expect("home secret fixture");
+
+        let fallback = discover_sensitive_files_with_fallback(&workspace, Some(&home), 3, 64);
+        assert_eq!(fallback.len(), 1);
+        assert!(fallback[0].ends_with("/home/.env"));
+
+        // Supplying an explicit directory passes no fallback candidate; the
+        // same empty directory therefore stays empty.
+        let explicit = discover_sensitive_files_with_fallback(&workspace, None, 3, 64);
+        assert!(explicit.is_empty());
+
+        // A successful cwd scan remains authoritative and does not merge HOME.
+        fs::write(workspace.join("auth.json"), b"{}").expect("workspace secret fixture");
+        let primary = discover_sensitive_files_with_fallback(&workspace, Some(&home), 3, 64);
+        assert_eq!(primary.len(), 1);
+        assert!(primary[0].ends_with("/workspace/auth.json"));
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[cfg(target_os = "linux")]
     #[actix_web::test]
     async fn preview_agent_protection_scans_workspace_and_reports_secrets() {
         use actix_web::http::StatusCode;
@@ -901,6 +1503,29 @@ mod tests {
         let canonical = workspace
             .canonicalize()
             .expect("workspace should canonicalize");
+
+        // A live process whose cwd has no secrets but whose HOME does. This
+        // exercises the real `/proc/<pid>/{environ,status}` fallback path.
+        let fallback_root =
+            std::env::temp_dir().join(format!("agentsight-home-preview-{}", Uuid::new_v4()));
+        let empty_workspace = fallback_root.join("workspace");
+        let process_home = fallback_root.join("home");
+        fs::create_dir_all(&empty_workspace).expect("empty workspace should exist");
+        fs::create_dir_all(&process_home).expect("process home should exist");
+        fs::write(process_home.join(".env"), b"HOME_SECRET=1").expect("home secret fixture");
+        let canonical_empty_workspace = empty_workspace
+            .canonicalize()
+            .expect("empty workspace should canonicalize");
+        let canonical_process_home = process_home
+            .canonicalize()
+            .expect("process home should canonicalize");
+        let mut fallback_process = std::process::Command::new("sleep")
+            .arg("30")
+            .current_dir(&canonical_empty_workspace)
+            .env("HOME", &canonical_process_home)
+            .spawn()
+            .expect("fallback process should start");
+        let fallback_pid = fallback_process.id();
 
         let pid = std::process::id();
         let agents_health = Arc::new(RwLock::new(HealthStore::new()));
@@ -924,12 +1549,41 @@ mod tests {
                 has_crash: false,
             },
         );
+        agents_health.write().unwrap().update(
+            fallback_pid,
+            AgentHealthStatus {
+                pid: fallback_pid,
+                agent_name: "HomeScanner".into(),
+                category: "test".into(),
+                exe_path: "/usr/bin/sleep".into(),
+                workspace_path: Some(canonical_empty_workspace.to_string_lossy().into_owned()),
+                ports: Vec::new(),
+                status: AgentHealthState::Healthy,
+                last_check_time: 1,
+                latency_ms: None,
+                error_message: None,
+                restart_cmd: None,
+                offline_since: None,
+                role: AgentRole::Client,
+                parent_pid: None,
+                has_crash: false,
+            },
+        );
 
         let auth_dir =
             std::env::temp_dir().join(format!("agentsight-preview-auth-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&auth_dir).expect("auth dir should exist");
         let state = web::Data::new(AppState {
+            config_path: None,
+            storage_budget: std::sync::Arc::new(crate::storage_budget::StorageBudget::new(
+                None,
+                &crate::config::StorageConfig::default(),
+            )),
+            reuse_store: None,
+            reuse_llm_judge_enabled: false,
+            causal_store: None,
             storage_path: PathBuf::from(":memory:"),
+            genai_store: None,
             start_time: Instant::now(),
             health_store: Arc::clone(&agents_health),
             interruption_store: None,
@@ -984,6 +1638,122 @@ mod tests {
                 .any(|p| p.as_str().is_some_and(|s| s.ends_with(".env")))
         );
 
+        // With no explicit directory, an empty cwd scan falls back to the
+        // process-owned HOME while preserving cwd as the displayed workspace.
+        let fallback = awtest::call_service(
+            &app,
+            awtest::TestRequest::get()
+                .uri(&format!("/api/enforcement/agent-protection/{fallback_pid}"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(fallback.status(), StatusCode::OK);
+        let fallback_body: serde_json::Value = awtest::read_body_json(fallback).await;
+        assert_eq!(
+            fallback_body["workspace_path"],
+            canonical_empty_workspace.to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            fallback_body["source_paths"],
+            serde_json::json!([canonical_process_home.join(".env")])
+        );
+
+        // An explicit directory is authoritative and never expands to HOME.
+        let explicit = awtest::call_service(
+            &app,
+            awtest::TestRequest::get()
+                .uri(&format!(
+                    "/api/enforcement/agent-protection/{fallback_pid}?directory={}",
+                    canonical_empty_workspace.display()
+                ))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(explicit.status(), StatusCode::OK);
+        let explicit_body: serde_json::Value = awtest::read_body_json(explicit).await;
+        assert_eq!(explicit_body["source_paths"], serde_json::json!([]));
+
+        // An explicit directory outside the agent's workspace is refused: this
+        // preview lists sensitive-file paths and loopback requests reach it
+        // without a token, so an unbounded directory would enumerate
+        // credentials anywhere the server can read.
+        let outside = awtest::call_service(
+            &app,
+            awtest::TestRequest::get()
+                .uri(&format!(
+                    "/api/enforcement/agent-protection/{fallback_pid}?directory={}",
+                    canonical_process_home.display()
+                ))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(outside.status(), StatusCode::BAD_REQUEST);
+        let outside_body: serde_json::Value = awtest::read_body_json(outside).await;
+        assert_eq!(
+            outside_body["error"]["code"], "unauthorized_protection_directory",
+            "a directory outside the workspace must not be scanned: {outside_body}"
+        );
+        assert!(
+            !outside_body.to_string().contains("HOME_SECRET"),
+            "no file paths from the refused directory may leak: {outside_body}"
+        );
+
+        // A path that exists but is not a directory is not the filesystem
+        // root: the preview must name the real failure.
+        let not_a_dir = awtest::call_service(
+            &app,
+            awtest::TestRequest::get()
+                .uri(&format!(
+                    "/api/enforcement/agent-protection/{fallback_pid}?directory={}",
+                    canonical.join(".env").display()
+                ))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(not_a_dir.status(), StatusCode::BAD_REQUEST);
+        let not_a_dir_body: serde_json::Value = awtest::read_body_json(not_a_dir).await;
+        assert_eq!(
+            not_a_dir_body["error"]["code"], "invalid_protection_directory",
+            "an existing file is not the filesystem root: {not_a_dir_body}"
+        );
+
+        // The root guard keeps its own code, and a missing path stays invalid.
+        let root = awtest::call_service(
+            &app,
+            awtest::TestRequest::get()
+                .uri(&format!(
+                    "/api/enforcement/agent-protection/{fallback_pid}?directory=/"
+                ))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(root.status(), StatusCode::BAD_REQUEST);
+        let root_body: serde_json::Value = awtest::read_body_json(root).await;
+        assert_eq!(root_body["error"]["code"], "unsafe_protection_directory");
+        let missing = awtest::call_service(
+            &app,
+            awtest::TestRequest::get()
+                .uri(&format!(
+                    "/api/enforcement/agent-protection/{fallback_pid}?directory=/nonexistent-{}",
+                    Uuid::new_v4()
+                ))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+        let missing_body: serde_json::Value = awtest::read_body_json(missing).await;
+        assert_eq!(
+            missing_body["error"]["code"],
+            "invalid_protection_directory"
+        );
+
+        fallback_process
+            .kill()
+            .expect("fallback process should stop");
+        fallback_process
+            .wait()
+            .expect("fallback process should exit");
+        fs::remove_dir_all(&fallback_root).ok();
         fs::remove_dir_all(&workspace).ok();
         fs::remove_dir_all(&auth_dir).ok();
     }

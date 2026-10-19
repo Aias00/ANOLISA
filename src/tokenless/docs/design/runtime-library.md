@@ -32,7 +32,9 @@ share that Stash and roll back keys whenever a candidate is discarded. TOON is l
 library and never starts a process. RTK is used only when an adapter supplies `command_field`; every
 rewritten wrapper is anchored to the packaged executable and carries per-execution attribution.
 Content detection, thresholds, TOON selection, diagnostics, authorization, and Stash policy remain
-in Rust Core rather than Python configuration.
+in Rust Core rather than Python configuration. A shell tool's `PostToolRequest` carries the executed
+command line in `command`; Core, not the adapter, reports a plain print of local files as
+`file_read` so that a printed HTML page stays verbatim while data in that output still compresses.
 
 The SDK never stores a process-global current session. `before_model` returns the exact visible
 marker set. An adapter declares whether it has a marker-authorized recovery path and owns any
@@ -47,6 +49,31 @@ tool-name collisions fail fast. Normal Core dispositions such as passthrough, no
 recoverability unavailable return typed results. A candidate is applied only when it is strictly
 smaller; schema and response truncation must also remain retrievable.
 
+OpenClaw 2026.6.6 or later uses declared, explicitly enabled tool-result middleware to call
+PostTool before model consumption. The adapter preserves the result envelope and handles only
+single-text results, declares `recovery.kind = none`, and retains per-call RTK attribution.
+No separate persistence hook reprocesses the result. Adapter failures retain the received
+host result; the adapter catches them because the host treats thrown middleware errors as
+tool failures. Legacy middleware preprocessing can already have clipped text or metadata.
+Tokenless neither rejects such hosts above the API minimum nor reconstructs missing content.
+Only `applied` compression replaces text; tool-error diagnostics may still append context.
+See the [host compatibility boundary](../../../../docs/user-guide/en/token-saving/tokenless/framework-integration.md#openclaw).
+
+After building the CLI and OpenClaw adapter, run the optional container regression from
+`src/tokenless` with a local host image:
+
+```bash
+python3 tests/test-openclaw-gateway.py --image <legacy-image> --host-output-policy legacy
+python3 tests/test-openclaw-gateway.py --image <fixed-image> --host-output-policy normalized
+```
+
+Select the expected policy from the image's source provenance, not its version string.
+The real Gateway uses a scripted local model with no cloud requests. The test covers ordinary
+CSV and 150,000-character plain/JSON results, failure passthrough, first consumption, replay,
+persistence and statistics. Legacy truncation is an expected limitation; the normalized policy
+requires full native input at middleware entry and lossless JSON candidate delivery. This
+checks transport behavior, not model answer quality or billing savings.
+
 ## Search path sharing
 
 PostTool routes detected `search_results` through `SearchResultsCompressor` only when search path
@@ -60,9 +87,9 @@ The applied operation is `search_path_sharing` (`AppliedOperation.SEARCH_PATH_SH
 Python SDK), with `lossless` recoverability and no Stash writes.
 
 Search path sharing is enabled by default. CLI callers can disable it with
-`TOKENLESS_SEARCH_PATH_SHARING_ENABLED=0`. When unset it stays enabled; `1`, `true`, and `yes`
-also enable it (case-insensitively). Empty and other values disable it. This variable is
-independent of the JSON config file.
+`TOKENLESS_SEARCH_PATH_SHARING_ENABLED=0`. When unset or empty it stays enabled; `1`, `true`,
+and `yes` also enable it (case-insensitively), and any other value disables it. This variable
+is independent of the JSON config file.
 Rust callers use `RuntimeConfig.search_path_sharing_enabled`; Python callers use
 `TokenlessConfig(search_path_sharing_enabled=False)` or the matching `TokenlessRuntime` keyword.
 Disabling this domain returns search listings unchanged without computing a search candidate.

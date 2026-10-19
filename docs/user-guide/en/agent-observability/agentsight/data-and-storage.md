@@ -17,50 +17,144 @@ read them.
 | `interruption_events.db` | Detected interruptions with their type, severity, and evidence |
 | `optimization.db` | Results of Dashboard optimization analyses |
 | `trajectories.db` | ATIF v1.7 trajectories, only when `features.trajectory_collection` is enabled |
+| `.agentsight-private/security.db` | Security events, cases, evidence, and containment state |
+| `.agentsight-private/enforcement.db` | Enforcement bindings, violations, and transitions |
+| `.agentsight-private/reuse.db` | Trajectory reuse labels, human decisions, LLM verdicts, and label audit events |
+| `.agentsight-private/causal.db` | Durable causal-attribution cases |
 | `.dashboard_token` | The Dashboard access token (64 hex characters, root-only) |
 | `optimization_config.json` | LLM settings entered on the Dashboard Settings page (API key stored here) |
 | `*.db-wal`, `*.db-shm` | SQLite write-ahead log and shared memory; normal, and checkpointed on clean shutdown |
 
-`--db` on `serve`, `dashboard`, and `skill-metrics` points at a different database file, which is
-how you browse a copy or an archive. The tracer itself always writes to the default directory.
+`--db` on `serve`, `dashboard`, `skill-metrics`, `audit`, `metrics`, `summary`, and `interruption`
+points at a different database file, which is how you browse a copy or an archive. The tracer
+itself always writes to the default directory.
 
 > `serve --db <path>` resolves every sibling store from the `--db` directory — GenAI events, the
-> interruption store, the trajectory store, and the health checker all follow it. So an archived
-> copy is shown in isolation, without mixing in the live host's data. Put the sibling `.db` files in
-> the same directory as the one you pass. A bare relative `--db name.db` uses the current directory.
+> interruption store, the trajectory store, and the health checker all follow it. The private
+> security, enforcement, reuse, and causal stores follow from its `.agentsight-private/`
+> subdirectory. So an archived copy is shown in isolation, without mixing in the live host's data.
+> Put the sibling `.db` files and, when present, `.agentsight-private/` directory beside the file you
+> pass. A bare relative `--db name.db` uses the current directory.
 
 > These files contain full prompts and model responses. Treat them as sensitive: keep the directory
 > permissions as installed, and be careful when copying them off the host.
 
+When SQLite is the only active output, completed calls are saved immediately. A registered default
+Logtail output whose deployment file is missing or telemetry is disabled does not add a session wait.
+If the Agent's session becomes known later, the stored session ID and full-event JSON are updated
+together. FFI callbacks and
+active external exporters keep the existing session-resolution wait before delivering a call.
+Output gates are checked for each call, so enabling or resuming Logtail restores that wait for
+subsequent calls.
+
 ## Retention and size limits
 
-| Store | Limit | How to change it |
-|---|---|---|
-| `genai_events.db` | 200 MB by default; pruning starts at 90% of the cap and removes the oldest LLM calls and process-resource samples | `AGENTSIGHT_GENAI_DB_MAX_SIZE_MB=500` in the service environment |
-| `interruption_events.db` | 30 days and 100 MB | `features.interruption_detection.retention_days` / `max_db_size_mb` |
+Schema v4 gives every AgentSight-owned database a `retention_days`, `max_db_size_mb`, and
+`check_interval_secs` policy:
 
-The limit is a logical-data cap (physical file size minus free pages); pruning
-removes the oldest records first until the logical size fits. The physical file
-does not shrink after pruning: freed pages go to the freelist and are reused by
-future writes, so the file stabilizes at its historical peak. To return disk
-space to the filesystem, run `sudo sqlite3 /var/log/sysak/.agentsight/<db>
-'VACUUM;'` manually during a low-traffic window — VACUUM rebuilds the whole
-file, so stop the service first to avoid tripping the cgroup memory limit.
+| Store | Default policy | Cleanup coverage | Configuration |
+|---|---|---|---|
+| `agentsight.db` | 30 days, 500 MiB, every 60 seconds | Full: audit, Token, HTTP, and consumption history | `storage.primary` |
+| `genai_events.db` | 30 days, 200 MiB, every 60 seconds | Full: GenAI events, resource samples, and evaluation runs share this physical target | `storage.genai` |
+| `interruption_events.db` | 30 days, 100 MiB, every 60 seconds | Full interruption history | `storage.interruptions` |
+| `trajectories.db` | 30 days, 500 MiB, every 300 seconds | Partial: trajectory rows are pruned while recent skipped-file fingerprints remain protected | `storage.trajectories` |
+| `optimization.db` | 30 days, 200 MiB, every 300 seconds | Full optimization-result history | `storage.optimization` |
+| `.agentsight-private/security.db` | 30 days, 200 MiB, every 3,600 seconds | Partial: terminal graphs and unreferenced events are pruned; active case graphs remain protected | `storage.security_audit` |
+| `.agentsight-private/reuse.db` | 30 days, 200 MiB, every 300 seconds | Partial: old label events and unconfirmed, purely automatic labels only | `storage.reuse` |
+| `.agentsight-private/causal.db` | 30 days, 200 MiB, every 300 seconds | Partial: oldest cache entries are evicted, but the latest entry is retained | `storage.causal` |
+| `.agentsight-private/enforcement.db` | 30 days, 100 MiB, every 60 seconds | Partial: violations and terminal transitions only | `storage.enforcement` |
+
+Tokenless's `stats.db` is listed by the status API as external. AgentSight opens it read-only and
+never applies its lifecycle policy; Tokenless remains responsible for that file.
+
+`storage.max_total_size_mb` adds a combined physical-allocation limit across the nine managed
+AgentSight databases. It defaults to `2200` MiB, accepts `0` to disable the combined limit, and
+otherwise must be at least `9` MiB so every database can retain the minimum enforceable allocation.
+
+A zero value disables its corresponding rule: age cleanup, size cleanup, or scheduled checks. An
+interval of zero therefore disables automatic governance for that store even if its age and size
+values are non-zero. The old `check_interval_inserts` key is unsupported; pre-v4 configuration is
+backed up and replaced through the normal schema upgrade mechanism.
+
+Each existing long-running `trace`, `serve`, local trace, or local serve process starts at most one
+lightweight `sqlite-maintenance` thread; no separate maintenance process is launched. That thread
+runs all of its database jobs sequentially. When `trace` and `serve` both cover one physical file,
+they coordinate through `<db>.maintenance.lock`; the process that acquires the lock performs fresh
+retention and size measurements before acting.
+
+GenAI maintenance uses a separate connection from capture delivery and queries. Deletion releases
+the write lock between small batches, and a busy database defers maintenance to the next pass.
+WAL checkpointing copies frames in passive mode before attempting immediate truncation, so a pinned
+reader does not make maintenance wait while excluding the capture writer.
+Maintenance yields before starting another delete batch while capture writes or queued retries
+need the writer, and resumes on a later scheduled pass.
+
+When periodic maintenance is enabled, the trace process delegates primary and GenAI WAL checkpoints
+to that worker instead of triggering them on capture commits. Passive checkpoints run about once a
+second between retention/capacity checks; `check_interval_secs` still controls cleanup. SQLite's
+synchronous durability setting is unchanged. Disabling periodic maintenance retains automatic WAL
+checkpointing on capture connections.
+
+With `runtime_limits.cpu_budget_percent` enabled, primary and GenAI cleanup yield between bounded
+operations and continue on later worker ticks. They share CPU admission with capture delivery;
+retention and capacity targets remain in effect, but a cleanup pass may take longer to finish.
+
+Completed captures that encounter a transient SQLite write lock stay in the existing pending
+queue for retry. They share `pending_genai_max_count` and `pending_genai_max_bytes_mb` with
+session-ID waits. Retries do not resend records to external sinks. Budget rejection and permanent
+write failures are logged; `agentsight_genai_sqlite_retry_total` records queued, busy, stored,
+over-budget and failed outcomes.
+
+Every pass follows the same lifecycle:
+
+1. Delete records older than the retention cutoff, subject to the store's schema-safe eligibility rules.
+2. If age deletion changed the database, require a successful WAL checkpoint before continuing.
+3. Trigger capacity pruning only when physical allocation (database, WAL, and SHM) exceeds the limit.
+4. Delete the oldest eligible records and checkpoint between rounds until logical usage reaches 90% of the limit.
+
+The combined-budget ranking also includes WAL and SHM. A WAL-heavy database can therefore rank first
+for one pass; its maintenance checkpoints before pruning, and subsequent passes rebalance using the
+new physical allocation.
+
+Automatic maintenance never runs `VACUUM`. Freed pages remain on the freelist and are reused by
+future writes, so a large physical file can be healthy when its logical usage is within target. To
+return disk space to the filesystem, stop the service and run
+`sudo sqlite3 /var/log/sysak/.agentsight/<db> 'VACUUM;'` manually during a maintenance window.
+
+The partial stores deliberately preserve durable decisions and control state. Reuse maintenance
+never deletes human-owned, confirmed, or overridden labels. Enforcement maintenance preserves
+bindings, pending or indeterminate transitions, and credential intent/snapshot state. Causal entries
+are caches, so eviction can cause a later request to repeat a billed attribution computation.
 
 > For container deployments: retention only matters when the data directory is
 > persistent. Without a volume mount, every container restart wipes all data —
 > see [Containers and sidecars](deployment.md#containers-and-sidecars).
 
-To raise the GenAI cap for the packaged service:
+The Settings page changes the combined limit through `POST /api/storage/config`. Long-running
+`trace`, `serve`, local trace, and local serve processes started with a configuration file re-read
+valid edits before maintenance, so no restart is required. Local processes started without
+`--config` cannot persist edits. A missing, incomplete, or invalid file leaves the last valid limit
+active. The page also shows physical and logical usage, cleanup coverage, and maintenance-worker
+state.
+
+Check current usage from the API:
 
 ```bash
-sudo systemctl edit agentsight.service
-# [Service]
-# Environment=AGENTSIGHT_GENAI_DB_MAX_SIZE_MB=500
-sudo systemctl restart agentsight.service
+TOKEN=$(sudo cat /var/log/sysak/.agentsight/.dashboard_token)
+curl -s -H "Authorization: Bearer $TOKEN" http://127.0.0.1:7396/api/storage/status \
+  | python3 -m json.tool
 ```
 
-Check current usage:
+The response uses schema version `3`. Each store reports availability, size, policy, coverage, and
+`size_state`, plus a `maintenance` object with `scheduled`, `worker_running`,
+`worker_heartbeat_unix_ms`, `last_attempt_unix_ms`, `last_success_unix_ms`, `last_result`,
+`consecutive_failures`, and `next_run_unix_ms`. Trajectories, security audit, reuse, causal, and
+enforcement report `partial` coverage for their protected data. Runtime fields describe only the
+process serving this response, so an unscheduled trace-owned store does not prove that another trace
+process is stopped. No database path is returned. Treat `within_policy` only as a capacity result:
+worker health comes from the scheduling, heartbeat, attempt, result, and failure fields.
+
+You can also inspect the directory directly:
 
 ```bash
 sudo du -sh /var/log/sysak/.agentsight
@@ -104,9 +198,13 @@ Endpoint groups in 0.11:
 | Metrics | `GET /api/timeseries`, `GET /api/metrics/latency`, `GET /api/agent-names` | Token time series, latency percentiles, Agent filter values |
 | Interruptions | `GET /api/interruptions`, `/count`, `/stats`, `/session-counts`, `/conversation-counts`, `POST /api/interruptions/{id}/resolve` | Triage and resolution |
 | Agent health | `GET /api/agent-health`, `DELETE /api/agent-health/{pid}`, `POST /api/agent-health/{pid}/restart` | Live Agent state and recovery actions |
+| Tokenless records | `POST /api/tokenless/refresh`, `GET /api/tokenless/records`, `GET /api/tokenless/records/{cache_id}` | Refresh saved statistics, list metadata, and read details; content requires explicit `include_content=true`. All three routes require Dashboard credentials, including on loopback |
 | Token savings | `GET /api/token-savings`, `GET /api/token-savings/session/{id}` | Tokenless savings |
 | ATIF export | `GET /api/export/atif/session/{id}` (also `trace` and `conversation`) | Trajectory export |
-| Trajectories | `GET /api/trajectories`, `/filters`, `/{session_id}` | Collected trajectories |
+| Trajectories | `GET /api/trajectories`, `/filters`, `/steps`, `/{session_id}` | Collected trajectories. The list accepts optional `label`, `exclude_label`, and `human_backed` filters; `label` is comma-separated effective labels such as `good,bad` |
+| Reuse labels | `POST /api/reuse/triage`, `GET /api/reuse/sessions`, `POST /api/reuse/sessions/{session_id}/label`, `POST /api/reuse/sessions/labels:batch-confirm`, `GET /api/reuse/label-stats`, `POST /api/reuse/judge` | Rule triage and human label decisions. The judge requires `features.reuse_llm_judge=true` and configured LLM credentials; it makes billed model calls |
+| Preferences | `GET /api/preferences`, `/export`, `/turns` | User preference analysis, Markdown export, and source user turns for agent-side reasoning |
+| Storage | `GET /api/storage/status`, `POST /api/storage/config` | Schema-v3 combined limit, capacity, coverage, and maintenance-worker status; POST persists the combined limit when a config file is available |
 | Skill metrics | `GET /api/skill-metrics`, `/downloads`, `/loads`, `/usage-ratio`, `/distribution`, `/hotness` | Skill adoption |
 | Optimization | `POST /api/optimize/sessions/{id}/{dimension}`, `GET /api/optimize/results`, `GET` and `POST /api/optimize/config` | LLM-assisted analysis |
 | Quality and attribution | `POST /api/grader/evaluate`, `GET /api/grader/latest`, `POST /api/causal-attribution` | Session quality scoring, root-cause attribution |
@@ -135,6 +233,13 @@ and response timestamps; a Tool Call interval is inferred from the LLM response 
 tool to the next LLM request carrying the matching tool result. Gaps not covered by an LLM call or
 a matched Tool Call are returned as `idle`; unmatched Tool Calls are not assigned a fabricated end
 timestamp.
+
+## Process output in Chrome traces
+
+For an aggregated process lifecycle, Chrome Trace output retains the beginning of stdout and
+stderr, at most 64 KiB per stream. Once a stream reaches that limit, its later output is omitted;
+the other stream can continue up to its own limit. If the limit cuts through a UTF-8 character,
+the incomplete tail is omitted. Other invalid bytes use lossy text decoding.
 
 ## Prometheus metrics
 
@@ -197,3 +302,8 @@ Stopping the service first ensures the WAL is checkpointed, so the archive is co
 - [CLI reference](cli-reference.md) — query the same data from the shell
 - [Dashboard guide](dashboard.md) — the UI over these databases
 - [Configuration](configuration.md) — storage and retention switches
+
+Queried Tokenless statistics are saved in `genai_events.db` alongside the existing GenAI
+store. Repeating a query replaces metadata for the same endpoint, source ID and original
+timestamp, preserving explicitly fetched content. Original source session IDs are retained.
+These copies follow `storage.genai` age and capacity cleanup; they do not modify Tokenless's database.

@@ -7,7 +7,9 @@ use async_trait::async_trait;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
-use ws_ckpt_common::backend::{BackendType, EnvironmentStatus, GcResult, StorageBackend};
+use ws_ckpt_common::backend::{
+    BackendType, DiffError, EnvironmentStatus, GcResult, StorageBackend,
+};
 use ws_ckpt_common::{
     decode_payload, encode_frame, ChangeType, DaemonConfig, DiffEntry, GuardedCheckpointOutcomeV2,
     GuardedCheckpointRejectionCodeV2, GuardedRollbackOutcomeV2, GuardedRollbackRejectionCodeV2,
@@ -39,6 +41,7 @@ struct TestBackend {
     diff_calls: AtomicUsize,
     rollback_calls: AtomicUsize,
     rollback_error: Mutex<Option<String>>,
+    diff_error: Mutex<Option<anyhow::Error>>,
     current_diff: Mutex<Vec<DiffEntry>>,
     diff_after_first: Mutex<Option<Vec<DiffEntry>>>,
 }
@@ -55,6 +58,7 @@ impl TestBackend {
             diff_calls: AtomicUsize::new(0),
             rollback_calls: AtomicUsize::new(0),
             rollback_error: Mutex::new(None),
+            diff_error: Mutex::new(None),
             current_diff: Mutex::new(vec![DiffEntry {
                 path: "1.txt".to_string(),
                 change_type: ChangeType::Deleted,
@@ -100,7 +104,7 @@ impl StorageBackend for TestBackend {
         anyhow::bail!("unused test backend operation")
     }
 
-    async fn recover_workspace(&self, _: &str, _: &str) -> anyhow::Result<()> {
+    async fn recover_workspace(&self, _: &str, _: &str) -> anyhow::Result<Vec<String>> {
         anyhow::bail!("unused test backend operation")
     }
 
@@ -111,6 +115,9 @@ impl StorageBackend for TestBackend {
         _: Option<&str>,
     ) -> anyhow::Result<Vec<ws_ckpt_common::DiffEntry>> {
         let call = self.diff_calls.fetch_add(1, Ordering::SeqCst);
+        if let Some(error) = self.diff_error.lock().unwrap().take() {
+            return Err(error.context("test backend diff"));
+        }
         if call > 0 {
             if let Some(changes) = self.diff_after_first.lock().unwrap().clone() {
                 return Ok(changes);
@@ -181,11 +188,13 @@ impl Fixture {
             backend.clone(),
             temp.path().join("state"),
         ));
-        state.register_workspace(
-            WS_ID.to_string(),
-            workspace_path.clone(),
-            SnapshotIndex::new(workspace_path.clone()),
-        );
+        state
+            .register_workspace(
+                WS_ID.to_string(),
+                workspace_path.clone(),
+                SnapshotIndex::new(workspace_path.clone()),
+            )
+            .unwrap();
         Self {
             _temp: temp,
             state,
@@ -308,11 +317,14 @@ async fn identity_uses_exact_absolute_registration_without_bootstrap() {
 
     let invalid_path = fixture._temp.path().join("invalid-workspace-id");
     std::fs::create_dir(&invalid_path).expect("invalid-id workspace directory");
-    fixture.state.register_workspace(
-        "legacy-invalid".to_string(),
-        invalid_path.clone(),
-        SnapshotIndex::new(invalid_path.clone()),
-    );
+    fixture
+        .state
+        .register_workspace(
+            "legacy-invalid".to_string(),
+            invalid_path.clone(),
+            SnapshotIndex::new(invalid_path.clone()),
+        )
+        .unwrap();
     assert_rejected(
         workspace_identity(
             &fixture.state,
@@ -680,7 +692,9 @@ async fn evidence_survives_a_legacy_save_and_fresh_state_load() {
         fixture.backend.clone(),
         fixture._temp.path().join("restarted-state"),
     ));
-    restarted.register_workspace(WS_ID.to_string(), fixture.workspace_path.clone(), loaded);
+    restarted
+        .register_workspace(WS_ID.to_string(), fixture.workspace_path.clone(), loaded)
+        .unwrap();
     assert!(matches!(
         checkpoint_evidence(
             &restarted,
@@ -901,6 +915,123 @@ async fn mutation_after_preview_rejects_guarded_rollback_before_backend() {
 }
 
 #[tokio::test]
+async fn guarded_rollback_classifies_diff_errors_before_backend() {
+    for unsupported_path in [true, false] {
+        for execute in [false, true] {
+            let fixture = Fixture::new(true);
+            fixture.add_target_snapshot().await;
+            let digest = if execute {
+                preview_digest(&fixture, 1000).await
+            } else {
+                [0; 32]
+            };
+            let (error, expected) = if unsupported_path {
+                (
+                    anyhow::Error::new(DiffError::UnsupportedWorkspacePath {
+                        operation: "rename",
+                        field: "destination",
+                        token: r"./snap/bad\377".to_string(),
+                    }),
+                    GuardedRollbackRejectionCodeV2::UnsupportedWorkspacePath,
+                )
+            } else {
+                (
+                    anyhow::anyhow!("btrfs receive --dump failed"),
+                    GuardedRollbackRejectionCodeV2::DaemonNotReady,
+                )
+            };
+            *fixture.backend.diff_error.lock().unwrap() = Some(error);
+            let response = if execute {
+                switch(&fixture, 1000, digest).await
+            } else {
+                rollback_preview(
+                    &fixture.state,
+                    Some(1000),
+                    fixture.workspace_path.to_str().unwrap(),
+                    WS_ID,
+                    fixture.backend.generation,
+                    TARGET_ID,
+                )
+                .await
+            };
+            let Response::GuardedRollbackV2Rejected { code, message } = response else {
+                panic!("expected typed rejection: {response:?}");
+            };
+            assert_eq!(code, expected);
+            if unsupported_path {
+                assert!(message.contains("rename destination"), "{message}");
+                assert!(message.contains(r"./snap/bad\\377"), "{message}");
+            }
+            assert_eq!(fixture.backend.rollback_calls.load(Ordering::SeqCst), 0);
+            let workspace = fixture.state.get_by_wsid(WS_ID).unwrap();
+            assert!(workspace.read().await.index.guarded_rollbacks.is_empty());
+            if execute {
+                let persisted = crate::index_store::load(&fixture.state.index_dir(WS_ID))
+                    .await
+                    .unwrap();
+                assert!(persisted.guarded_rollbacks.is_empty());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn legacy_diff_requests_preserve_path_error_classification() {
+    // CLI clients must receive the same deterministic classification as guarded callers.
+    for unsupported_path in [true, false] {
+        for request in [
+            Request::Diff {
+                workspace: WS_ID.to_string(),
+                from: TARGET_ID.to_string(),
+                to: None,
+            },
+            Request::Diff {
+                workspace: WS_ID.to_string(),
+                from: TARGET_ID.to_string(),
+                to: Some(TARGET_ID.to_string()),
+            },
+            Request::RollbackPreview {
+                workspace: WS_ID.to_string(),
+                to: Some(TARGET_ID.to_string()),
+                num_ancestors: None,
+            },
+        ] {
+            let fixture = Fixture::new(true);
+            fixture.add_target_snapshot().await;
+            let path_error = DiffError::UnsupportedWorkspacePath {
+                operation: "mkfile",
+                field: "path",
+                token: r"./snap/bad\377".to_string(),
+            };
+            let (error, expected) = if unsupported_path {
+                (
+                    anyhow::Error::new(path_error),
+                    ws_ckpt_common::ErrorCode::UnsupportedWorkspacePath,
+                )
+            } else {
+                // Matching diagnostic text alone must not classify an internal error.
+                (
+                    anyhow::anyhow!(path_error.to_string()),
+                    ws_ckpt_common::ErrorCode::InternalError,
+                )
+            };
+            *fixture.backend.diff_error.lock().unwrap() = Some(error);
+            let response = dispatcher::dispatch(&fixture.state, request).await;
+            let frame = encode_frame(&response).unwrap();
+            let response: Response = decode_payload(&frame[4..]).unwrap();
+            let Response::Error { code, message } = response else {
+                panic!("expected a legacy error response: {response:?}");
+            };
+            assert_eq!(code, expected);
+            assert!(message.contains("mkfile path cannot be represented as UTF-8"));
+            assert!(message.contains(r"./snap/bad\\377"));
+            assert_eq!(fixture.backend.diff_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(fixture.backend.rollback_calls.load(Ordering::SeqCst), 0);
+        }
+    }
+}
+
+#[tokio::test]
 async fn guarded_rollback_rejects_wrong_generation_digest_and_full_id() {
     let fixture = Fixture::new(true);
     fixture.add_target_snapshot().await;
@@ -1037,7 +1168,9 @@ async fn uncertain_guarded_rollback_is_durable_and_never_replayed() {
         fixture.backend.clone(),
         fixture._temp.path().join("rollback-restarted-state"),
     ));
-    restarted.register_workspace(WS_ID.to_string(), fixture.workspace_path.clone(), loaded);
+    restarted
+        .register_workspace(WS_ID.to_string(), fixture.workspace_path.clone(), loaded)
+        .unwrap();
     assert!(matches!(
         rollback(
             &restarted,

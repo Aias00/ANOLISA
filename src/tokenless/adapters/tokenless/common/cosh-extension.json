@@ -1,6 +1,6 @@
 {
   "name": "tokenless",
-  "version": "0.8.2",
+  "version": "0.8.7",
   "contextFileName": "COPILOT.md",
   "hooks": {
     "PreToolUse": [

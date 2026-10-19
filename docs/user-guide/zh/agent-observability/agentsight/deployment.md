@@ -9,13 +9,15 @@ AgentSight 由两个工作进程组成：`agentsight trace`（eBPF 采集，需�
 
 | 条件 | 要求 |
 |---|---|
-| 操作系统 | Linux x86_64 |
+| 操作系统 | Linux x86_64 或 ARM64（raw 包） |
 | 内核 | >= 5.8 且开启 BTF（`/sys/kernel/btf/vmlinux` 必须存在） |
 | 权限 | root，或 `CAP_BPF` + `CAP_PERFMON` |
 | 构建工具链（仅源码构建） | Rust >= 1.80、clang/llvm >= 15、libbpf >= 0.8，前端需要 Node.js |
 
 clang 14 及更早版本会把 eBPF verifier 需要的长度钳制优化掉，导致 `sslsniff`、`tcpsniff` 无法加载。
 源码构建请使用 clang 15+。
+
+ARM64 包及 CLI 验证不代表已完成特定内核上的 eBPF 兼容性验证。
 
 ## 安装包 + systemd（推荐）
 

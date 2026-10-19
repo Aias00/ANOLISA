@@ -11,7 +11,7 @@ The boundary is kept consistent in the following locations:
 - `openclaw.compat.pluginApi` in `openclaw-plugin/package.json`
 - `peerDependencies.openclaw` in `openclaw-plugin/package.json`
 
-The current e2e pipeline has validated the following OpenClaw host matrix:
+The following matrix records the earlier CI validation:
 
 | OpenClaw host | Result |
 |---------------|--------|
@@ -25,6 +25,17 @@ The current e2e pipeline has validated the following OpenClaw host matrix:
 | `latest` | Pass |
 
 Validation evidence: GitHub Actions `OpenClaw Plugin E2E` run `28774739252`.
+
+Local E2E validation also passed on `2026.8.1` and the legacy `2026.4.23` host
+with Node `22.22.3` and installed `agent-sec-cli 0.13.0`: installation, runtime
+loading, Gateway traffic, all four policy cases, and 14 direct hook probes.
+The suite uses a mock model and deterministic deny fixtures; on `2026.8.1`,
+the approval case verified blocking when no approval route was available.
+
+OpenClaw 2.0 is release `2026.8.1`. It requires Node `>=22.22.3 <23`,
+`>=24.15.0 <25`, or `>=25.9.0`. Its plugin install records live in host-managed
+SQLite state; use `plugins inspect` to verify installation rather than reading
+the retired `plugins.installs` config key.
 
 ## Prerequisites
 
@@ -93,8 +104,9 @@ OPENCLAW_STATE_DIR=~/.openclaw-dev ./scripts/deploy.sh "$(pwd)"
 
 - Reads `openclaw --version` and requires OpenClaw `>=2026.4.14`
 - Reads `openclaw plugins install --help` to confirm `--force` support
-- Passes `--dangerously-force-unsafe-install` when the current OpenClaw installer help exposes it
-- Omits that flag when the current OpenClaw installer help does not expose it
+- Passes `--accept-capabilities` when supported, accepting the declared capabilities of agent-sec (required by OpenClaw 2.0)
+- On older hosts without capability consent, passes `--dangerously-force-unsafe-install` only when advertised; on modern hosts that legacy flag is a no-op
+- Preserves operator `security.installPolicy` decisions; capability acceptance does not bypass a policy block
 - Writes `plugins.entries.agent-sec.hooks.allowConversationAccess=true` on OpenClaw `>=2026.4.24`
 - Skips `allowConversationAccess` on OpenClaw `2026.4.14` through `2026.4.23`
 - Validates the install record via `openclaw plugins inspect agent-sec --json`
@@ -151,7 +163,7 @@ The default configuration is observation-first:
 
 - `promptScanBlock=false`: the prompt scanner logs an alert on `deny` findings but does not block the model call
 - `codeScanRequireApproval=false`: the code scanner logs an alert on risks but does not prompt for approval
-- `piiScanUserInput=true`: scans user input for PII and credentials
+- `piiScanUserInput=true`: enables PII checks; model-entry scanning on stable OpenClaw `>=2026.5.12`, inbound scanning on older hosts
 - `piiIncludeLowConfidence=false`: excludes low-confidence PII findings
 - `pii-scan-user-input.enableBlock=false`: PII deny does not block by default
 - `skill-ledger.policy=ask`: prefers user confirmation when there is a user-visible message
@@ -192,6 +204,18 @@ Enable PII deny blocking:
 openclaw config set 'plugins.entries.agent-sec.config.capabilities.pii-scan-user-input.enableBlock' true
 ```
 
+PII input scanning selects `before_agent_run` on stable OpenClaw `>=2026.5.12`;
+older supported hosts, prereleases, and unrecognized versions retain `before_dispatch`.
+The minimum supported host remains `2026.4.14`. Startup logs report the selected hook.
+The existing `allowConversationAccess=true` setting is required for the new gate;
+re-run deployment when upgrading an installation that lacks it.
+
+The new gate scans the model-bound text supplied at run entry and can block a `deny`
+result. It does not recover credentials already masked by the host or rewrite input.
+`after_tool_call` still cannot redact or withhold tool results, and `llm_output` does
+not block delivery. See [PII Checker](pii-checker.md#openclaw-input-protection) for the
+protection scope, policy behavior, and legacy limitations.
+
 Configure Skill Ledger to block directly:
 
 ```bash
@@ -206,7 +230,7 @@ AgentSecCore's policy is:
 
 - `before_dispatch`, `before_tool_call`, and `after_tool_call` are the core security hooks within the support matrix
 - `model_call_started` and `model_call_ended` are optional model-call observability hooks
-- `llm_input`, `llm_output`, and `agent_end` require `allowConversationAccess`
+- `before_agent_run`, `llm_input`, `llm_output`, and `agent_end` require `allowConversationAccess`
 - When an older OpenClaw lacks the optional observability hooks, the plugin degrades observability gracefully
 - After upgrading OpenClaw, re-run `deploy.sh` and restart the gateway to gain the hook behavior supported by the new version
 

@@ -5,6 +5,7 @@ set -euo pipefail
 
 AGENT="${ANOLISA_TARGET:-qwencode}"
 COMPONENT="${ANOLISA_COMPONENT:-tokenless}"
+DRY_RUN="${ANOLISA_DRY_RUN:-0}"
 
 EXTENSION_NAME="tokenless"
 
@@ -17,8 +18,28 @@ if [ -z "$QWEN_BIN" ]; then
     QWEN_BIN="$(command -v qwen 2>/dev/null || true)"
 fi
 
+# Preview before any removal: the CLI path uninstalls the active
+# extension and the manual fallback deletes the extension directory —
+# a dry run must leave both in place.
+if [ "$DRY_RUN" = "1" ]; then
+    if [ -n "$QWEN_BIN" ] && [ -x "$QWEN_BIN" ]; then
+        echo "DRY-RUN: $QWEN_BIN extensions uninstall $EXTENSION_NAME"
+    fi
+    echo "DRY-RUN: rm -rf ${HOME}/.qwen/extensions/${EXTENSION_NAME} (manual fallback)"
+    echo "DRY-RUN: clean ${HOME}/.qwen/extension-enablement.json (manual fallback)"
+    exit 0
+fi
+
 if [ -n "$QWEN_BIN" ] && [ -x "$QWEN_BIN" ]; then
     "$QWEN_BIN" extensions uninstall "$EXTENSION_NAME" 2>&1 || true
+    # Verify rather than trust: the status above is swallowed because "was not
+    # installed" and "refused" are indistinguishable by exit code alone, and the
+    # caller deletes the adapter resources as soon as this script returns 0.
+    if [ -e "${HOME}/.qwen/extensions/${EXTENSION_NAME}" ]; then
+        echo "[${COMPONENT}] ERROR: ${HOME}/.qwen/extensions/${EXTENSION_NAME} is still there after 'extensions uninstall'." >&2
+        echo "[${COMPONENT}] ${AGENT} plugin removal is incomplete; re-run this script once the CLI succeeds." >&2
+        exit 1
+    fi
     echo "[${COMPONENT}] ${AGENT} plugin removed via qwen CLI."
     exit 0
 fi

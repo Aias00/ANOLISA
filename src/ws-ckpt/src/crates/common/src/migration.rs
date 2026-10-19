@@ -205,7 +205,7 @@ mod tests {
         async fn delete_snapshot(&self, _: &str, _: &str) -> anyhow::Result<()> {
             unimplemented!()
         }
-        async fn recover_workspace(&self, _: &str, _: &str) -> anyhow::Result<()> {
+        async fn recover_workspace(&self, _: &str, _: &str) -> anyhow::Result<Vec<String>> {
             unimplemented!()
         }
         async fn diff(&self, _: &str, _: &str, _: Option<&str>) -> anyhow::Result<Vec<DiffEntry>> {
@@ -239,6 +239,7 @@ mod tests {
             head: None,
             governed_evidence: HashMap::new(),
             guarded_rollbacks: HashMap::new(),
+            recovered_orphans: Default::default(),
         }
     }
 

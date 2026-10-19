@@ -1,5 +1,82 @@
 # 更新日志
 
+## 0.14.1
+
+### 新功能
+- 查询类命令支持 `--db` 参数。(#7478)
+- 对未知可执行文件做内容探测以识别静态 BoringSSL，并缓存未命中结果。
+- 支持显式指定预编译目标，CI 构建 agentsight 预编译产物。
+
+### 修复
+- 将 OpenAI、Claude、Qwen3、InternLM、Baichuan、phi-3-small、yi-9b-chat 等模型名映射到真实可加载的 tokenizer。
+- 解析 Gemini 流式响应、采用 Anthropic 最终用量、合并整条消息形式的 chat SSE 快照，并支持以 CR 结尾的 SSE 行。(#7329, #7193, #7398)
+- 聚合先于请求结束的 HTTP/2 响应，仅在行边界截断 chunked 结束符，并使此前未生效的 HTTP 配置项生效。(#6562)
+- 无索引与无名称的工具调用分开记录，按工具调用匹配迟到的结果，保留混合工具结果。(#7385)
+- 按地址豁免可信 sink，exec 通配 basename 可匹配任意命令，所有旧版规则动作均映射到对应的管控模式。
+- 保留 JSON 数字键、payload 中的 null 成员、证据中的数值及完整成本签名；报告保留全部 skill，CSV 导出容忍空 agent 名称。(#7451, #7032, #7403, #7413)
+- 将 CJK 标点与管道符视为字面分隔符，系统时钟早于 epoch 时健康检查仍可正常上报。(#7488, #7479, #7239)
+- 在过滤器、token 拆分与模型序列中合并仅大小写不同的 agent 与模型。(#7456, #7184)
+- SQLite 维护任务相互隔离，opt-store 迁移串行化，清理在容量上限内停滞时给出告警。
+- 限制 payload 内存生命周期与防护扫描目录范围。(#6781)
+- 加强审计时间窗、ATIF token 总量与会话 ID、containment 快照及 grounding 证据匹配的校验。(#7326, #7467)
+- 修复 Dashboard 翻页、排名刷新、仅缓存步骤指标、空闲间隔与时间戳精度问题。(#7183, #7093, #7091, #7089, #7095)
+- 允许仅含回顾的会话生成记录，保留已采集的子会话，拆分 analyzer 调用类型。
+- 仅服务端使用的模块改由 server feature 控制编译。
+
+## 0.14.0
+
+### 新功能
+- 统一 SQLite 存储总容量上限（默认 2200 MB），优先裁剪最大的数据库；维护任务会重读该上限，无需重启。
+
+### 修复
+- 修正 Anthropic、Gemini、Codex 与 Responses provider 的流式内容、推理、工具调用、响应 ID、结束原因和 token 用量解析及统计。
+- 提升 Agent 发现、轨迹过滤、复用标签、语义搜索、Dashboard 指标、节省率和中断聚合的准确性与稳定性。
+- 加强 enforcement、凭证发现、IMDSv2、BPF 轮询、进程重启、OOM 检测与审计/事件校验。
+- 使 SQLite 维护、存储预算、UTF-8、SSE/HPACK 解析及时间处理能够应对异常和边界输入。
+- 支持旧内核 enforcement、inode guard 包装标签、旧 function_call 工具请求及更多进程/文件引用格式。
+
+### 测试
+- 扩展 provider、SLS、轨迹、Dashboard 过滤、存储预算和 enforcement 的回归覆盖。
+
+## 0.13.1
+
+### 新功能
+- 新增 JSON 输出与优雅的 CLI 错误提示。
+
+### 修复
+- 命名空间 PID 解析为宿主 PID，并做 init namespace 自检。(#3041)
+- 主日志器遵循 RUST_LOG 正则。(#3186)
+- 为 5.10/6.6 内核的 file-delete-guard 增加 inode guard 支持。
+- traces 列表中移除 trace_id 别名。(#3261)
+- 修复 enforcer ringbuf 消费者在 mmap 推进后的陈旧文件描述符。
+- 加强凭证发现逻辑。
+- 将 drain 触发条件固定为 membarrier。
+- 新增 token-plan provider 预设。
+- 从请求工具定义中补全空的 tool_call 名称。
+- 记录语义搜索降级原因。(#3443)
+- 加强 SQLite 生命周期管理。
+- 将 qwen3.8-max 映射到对应 tokenizer。(#3409)
+- `agentsight-enforcer` 升级后自动恢复旧版遗留的 enforcement 布局，文件删除防护与健康检查不再需要人工清理才能恢复。(#3445)
+- 删除并重建 binding 时保留应用的进程树覆盖。(#3370)
+- 拒绝不受支持的 audit case 事件过滤条件，避免静默忽略。
+
+## 0.13.0
+
+### 新功能
+- 新增 `GET /api/preferences` 与 `GET /api/preferences/export`，从近期会话中识别用户的工作习惯（语言偏好、先出方案再动手、要求补测试、纠正模式、常用工具倾向），并通过 `/api/preferences/turns` 返回本次分析所依据的用户输入。分析在请求时实时计算，Linux 读取 `genai_events`，其他平台读取已采集的轨迹，因此不产生需要迁移或会过期的派生数据。
+- 新增 `GET /api/trajectories/steps`，按派生类别（`user_input`、`system`、`agent_message`、`thinking`、`tool_call`、`tool_result`）检索 ATIF 步骤，并随每个命中返回其上下文步骤。类别是多标签的：同一个 agent 步骤可能同时包含消息、推理、工具调用与观测结果。
+- 新增可复用轨迹标注体系：为轨迹打上可复用分诊标签、支持人工裁定标签、新增复用标签评审页，并将搜索限定为提供已标注的轨迹历史。
+- 为 5.10/6.6 内核的 file-delete-guard 新增 inode guard，含域隔离、违规事件与启动清理。
+
+### 修复
+- macOS `trace` 路径初始化日志，使轨迹采集失败能够暴露而非被静默丢弃。
+- 新增 token-plan provider 预设。
+- 修复 enforcer ringbuf 消费者在 mmap 推进后的 fd 失效问题。
+- traces 列表中移除 trace_id 别名。(#3261)
+- 主日志器遵循 RUST_LOG 正则。(#3186)
+- 命名空间 PID 解析为宿主 PID，并做 init-ns 自检。(#3041)
+- 先创建 conversation_id 列再建其索引。(#3378)
+
 ## 0.12.1
 
 ### 破坏性变更

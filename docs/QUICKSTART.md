@@ -6,6 +6,8 @@ ANOLISA is a server-side operating layer for AI Agent workloads. Install the
 CLI once, then enable only the capability that delivers the first result you
 want.
 
+For the experimental AW + sec-core bundle, see the [AW Preview guide](user-guide/en/user-entrypoint/aw-preview.md).
+
 ## Install the CLI
 
 ```bash
@@ -41,7 +43,7 @@ export PATH="$HOME/.local/bin:$PATH"
 ```
 
 `--cosh-ng` remains available as shorthand for `--component cosh-ng`. On
-macOS arm64, use `--backend raw --install-mode user` instead.
+macOS 11+ (arm64 / x86_64), use `--backend raw --install-mode user` instead.
 
 ### Add observability, security, or runtime controls
 
@@ -49,6 +51,7 @@ macOS arm64, use `--backend raw --install-mode user` instead.
 |------|------------|
 | Observe Agent activity and Token usage | [AgentSight](user-guide/en/agent-observability/agentsight/README.md) |
 | Add security enforcement | [Agent Sec Core](user-guide/en/agent-security/agent-sec-core/QUICKSTART.md) |
+| Evaluate the Rust SkillSec core | [SkillSec V2](user-guide/en/agent-security/agent-sec-core/skillsec-v2.md) |
 | Create workspace recovery points | [ws-ckpt](user-guide/en/runtime/ws-ckpt.md) |
 | Mount Skills on demand | [SkillFS](user-guide/en/runtime/skillfs.md) |
 | Reuse context across sessions | [Agent Memory](user-guide/en/token-saving/agent-memory.md) |

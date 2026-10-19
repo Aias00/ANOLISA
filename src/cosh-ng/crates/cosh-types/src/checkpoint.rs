@@ -125,6 +125,11 @@ pub enum WsCkptRequest {
         operation_id: String,
         operation_digest: [u8; 32],
     },
+    /// Removes a registration only when its live subvolume is missing.
+    Unregister {
+        /// Registered workspace path or ID.
+        workspace: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -247,6 +252,20 @@ pub enum WsCkptResponse {
         code: GuardedRollbackRejectionCodeV2,
         message: String,
     },
+    /// Recovery succeeded while additional user data remains for inspection.
+    RecoverWithWarning {
+        /// Restored workspace path.
+        workspace: String,
+        /// Locations and reason for retaining additional data.
+        warning: String,
+    },
+    /// Registration removed without restoring data or deleting snapshots.
+    UnregisterOk {
+        /// Original workspace path.
+        workspace: String,
+        /// Locations intentionally retained for manual recovery.
+        retained_paths: Vec<String>,
+    },
 }
 
 /// Error codes from ws-ckpt daemon.
@@ -266,6 +285,8 @@ pub enum WsCkptErrorCode {
     DiskSpaceInsufficient,
     CwdOccupied,
     CwdScanFailed,
+    /// A diff path cannot be represented as UTF-8; fix the filename before retrying.
+    UnsupportedWorkspacePath,
 }
 
 /// Opaque identity of one live writable-subvolume generation.
@@ -379,6 +400,8 @@ pub enum GuardedRollbackRejectionCodeV2 {
     EvidenceCapacityReached,
     CwdOccupied,
     CwdScanFailed,
+    /// A diff path cannot be represented as UTF-8; unchanged input must not be retried.
+    UnsupportedWorkspacePath,
 }
 
 /// Stable registered-workspace identity used to bind guarded requests.
@@ -708,6 +731,9 @@ pub struct CkptInitResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CkptRecoverResult {
     pub workspace: String,
+    /// Additional data retained for inspection after successful recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 // ===========================================================================
@@ -1128,6 +1154,7 @@ mod tests {
             WsCkptErrorCode::DiskSpaceInsufficient,
             WsCkptErrorCode::CwdOccupied,
             WsCkptErrorCode::CwdScanFailed,
+            WsCkptErrorCode::UnsupportedWorkspacePath,
         ];
 
         for (idx, code) in codes.iter().enumerate() {

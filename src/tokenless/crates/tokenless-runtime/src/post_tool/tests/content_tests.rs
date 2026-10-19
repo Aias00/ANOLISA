@@ -104,6 +104,100 @@ fn detects_html_documents_but_not_fragments() {
 }
 
 #[test]
+fn a_leading_mark_does_not_hide_the_other_domains() {
+    // The mark is format, not content, for every domain's reader — the
+    // HTML tokenizer just already had it fixed. Each of these is the
+    // twin of the same document without the mark.
+    assert_eq!(detect("\u{feff}diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-x\n+y\n"), ContentType::Diff);
+    assert_eq!(detect("\u{feff}Traceback (most recent call last):\n  File \"t.py\", line 1\nValueError: boom\n"), ContentType::StackTrace);
+    assert_eq!(
+        detect("\u{feff}{\"items\": [{\"name\": \"a\", \"description\": \"ddd\"}]}\n"),
+        ContentType::Json
+    );
+    assert_eq!(
+        detect("\u{feff}| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n"),
+        ContentType::Tabular
+    );
+    // A second mark is content: still nothing detectable.
+    assert_eq!(detect("\u{feff}\u{feff}plain words"), ContentType::PlainText);
+}
+
+#[test]
+fn detects_a_page_opened_by_a_byte_order_mark() {
+    // The tokenizer ignores one leading BOM, so the page behind it is the same
+    // document the renderer reads. U+FEFF is not whitespace, so trimming alone
+    // leaves the mark in front of the doctype and the page is never routed to
+    // the HTML domain.
+    for page in [
+        "\u{feff}<!DOCTYPE html>\n<html><body>hi</body></html>",
+        "\u{feff}<!doctype HTML>\n<html><body>hi</body></html>",
+        "\u{feff}<html><body>hi</body></html>",
+        "\u{feff}\n<!DOCTYPE html>\n<html><body>hi</body></html>",
+    ] {
+        assert_eq!(detect(page), ContentType::Html, "{page:?}");
+    }
+    // Only the first mark is a BOM: behind a second one, or behind any other
+    // content, the doctype no longer opens the document.
+    assert_ne!(
+        detect("\u{feff}\u{feff}<!DOCTYPE html>\n<html><body>hi</body></html>"),
+        ContentType::Html
+    );
+    assert_ne!(
+        detect("\n\u{feff}<!DOCTYPE html>\n<html><body>hi</body></html>"),
+        ContentType::Html
+    );
+    // The mark does not turn a fragment or prose into a page.
+    assert_ne!(detect("\u{feff}<div>partial</div>"), ContentType::Html);
+    assert_ne!(detect("\u{feff}plain words"), ContentType::Html);
+}
+
+#[test]
+fn html_fragments_inside_other_domains_do_not_make_them_html() {
+    let page = "<!DOCTYPE html>\n<html lang=\"en\">\n<body><main><p>Widget reference</p></main></body>\n</html>";
+    let prefixed_grep = page
+        .lines()
+        .enumerate()
+        .map(|(index, line)| format!("site/index.html:{}:{line}\n", index + 1))
+        .collect::<String>();
+    assert_eq!(detect(&prefixed_grep), ContentType::SearchResults);
+    let numbered_grep = page
+        .lines()
+        .enumerate()
+        .map(|(index, line)| format!("{}:{line}\n", index + 1))
+        .collect::<String>();
+    assert_ne!(detect(&numbered_grep), ContentType::Html);
+    assert_eq!(
+        detect(&format!("{{\"status\": 200, \"body\": {}}}", serde_json::to_string(page).unwrap())),
+        ContentType::Json
+    );
+    let jest = format!(
+        "$ npm test\n\n> widget@1.4.0 test\n> jest --ci\n\nFAIL src/render.test.js\n  ● render › markup\n\n    - Snapshot  - 1\n    + Received  + 1\n\n    - {page}\n    + <div class=\"widget\"></div>\n\nTests:       1 failed, 7 passed, 8 total\nTime:        2.41 s\n"
+    );
+    assert_eq!(detect(&jest), ContentType::BuildLog);
+    let diff = format!(
+        "diff --git a/site/index.html b/site/index.html\nindex 1111111..2222222 100644\n--- a/site/index.html\n+++ b/site/index.html\n@@ -1,3 +1,3 @@\n {}\n",
+        page.replace('\n', "\n ")
+    );
+    assert_eq!(detect(&diff), ContentType::Diff);
+    let traceback = format!(
+        "Traceback (most recent call last):\n  File \"fetch.py\", line 8, in main\n    raise RuntimeError(body)\nRuntimeError: {}\n",
+        page.replace('\n', "")
+    );
+    assert_eq!(detect(&traceback), ContentType::StackTrace);
+    let csv = format!(
+        "id,title,snippet\n{}",
+        (0..40)
+            .map(|index| format!("{index},Row {index},<p>Widget <b>{index}</b> summary</p>\n"))
+            .collect::<String>()
+    );
+    assert_eq!(detect(&csv), ContentType::Tabular);
+    let sfc = "<template>\n  <div class=\"widget\">{{ title }}</div>\n</template>\n<script setup>\nconst title = 'Widget'\n</script>\n";
+    assert_ne!(detect(sfc), ContentType::Html);
+    let svg = "<?xml version=\"1.0\"?>\n<svg xmlns=\"http://www.w3.org/2000/svg\"><rect width=\"1\" height=\"1\"/></svg>\n";
+    assert_ne!(detect(svg), ContentType::Html);
+}
+
+#[test]
 fn detects_tabular_content() {
     for input in [
         "name,value\nalice,1\nbob,2",

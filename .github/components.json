@@ -14,7 +14,7 @@
       ],
       "issue_option": "anolisa",
       "path_prefixes": [
-        "src/anolisa/"
+        "distribution/anolisa/"
       ],
       "label": "component:anolisa",
       "commit_scope": "anolisa",
@@ -35,7 +35,7 @@
       ],
       "issue_option": "cosh",
       "path_prefixes": [
-        "src/copilot-shell/"
+        "deprecated/copilot-shell/"
       ],
       "label": "component:cosh",
       "commit_scope": "cosh",
@@ -48,7 +48,7 @@
         "kongche-jbw",
         "samchu-zsl"
       ],
-      "status": "active"
+      "status": "deprecated"
     },
     {
       "id": "cosh-ng",
@@ -237,19 +237,21 @@
       "status": "incubating"
     },
     {
-      "id": "blaze",
-      "display_name": "Blaze",
+      "id": "aw",
+      "display_name": "AW",
       "aliases": [],
       "issue_option": null,
       "path_prefixes": [
-        "src/blaze/"
+        "src/aw/"
       ],
-      "label": "component:blaze",
-      "commit_scope": "blaze",
+      "label": "component:aw",
+      "commit_scope": "aw",
       "commit_scope_aliases": [],
       "release_tag_prefix": null,
-      "ci_key": "blaze",
-      "issue_triagers": [],
+      "ci_key": null,
+      "issue_triagers": [
+        "kongche-jbw"
+      ],
       "status": "incubating"
     },
     {

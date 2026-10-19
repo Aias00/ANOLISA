@@ -22,6 +22,7 @@
 - **install-claude-code** — 安装和配置 Claude Code IDE
 - **install-qwenpaw** — 部署 QwenPaw AI 助手（支持钉钉集成）
 - **install-openclaw** — 安装和配置 OpenClaw
+- **install-tokenless** — 安装和配置 Tokenless（LLM token 优化）
 - **qwenpaw-usage** — QwenPaw 使用指南
 - **setup-mcp** — 在 Copilot Shell 中配置 MCP 服务器
 
@@ -77,7 +78,18 @@ Markdown 内容，包含使用说明、前置条件和示例。
 
 ## 安装
 
-### 扩展安装（推荐）
+### ANOLISA
+
+```bash
+anolisa install os-skills --backend raw
+```
+
+GitHub Release 和 Preview 工作流从同一个源码提交生成 Linux x86_64 与 ARM64
+raw 压缩包。每个平台提供 `.tar.gz`、SHA256 校验和、CycloneDX SBOM 及其校验和。
+压缩包将已跟踪的技能目录安装到 `{datadir}/skills`，无需编译可执行程序。
+正式发布时 CI 校验 tag 与源码版本；本地发布流水线继续使用现有配置。
+
+### 扩展安装
 
 一键安装全部技能：
 

@@ -12,6 +12,10 @@ on:
       - ".github/ISSUE_TEMPLATE/**"
       - ".github/scripts/validate-repository-metadata.py"
       - ".github/scripts/test_validate_repository_metadata.py"
+      - ".github/scripts/test_package_source_paths.py"
+      - ".github/scripts/test_release_notes.py"
+      - ".github/scripts/generate_release_notes.py"
+      - ".github/actions/package-source/action.yaml"
       - ".github/scripts/issue-claim.js"
       - ".github/scripts/issue-claim.test.js"
       - ".github/scripts/issue-triage.js"
@@ -35,6 +39,10 @@ on:
       - ".github/ISSUE_TEMPLATE/**"
       - ".github/scripts/validate-repository-metadata.py"
       - ".github/scripts/test_validate_repository_metadata.py"
+      - ".github/scripts/test_package_source_paths.py"
+      - ".github/scripts/test_release_notes.py"
+      - ".github/scripts/generate_release_notes.py"
+      - ".github/actions/package-source/action.yaml"
       - ".github/scripts/issue-claim.js"
       - ".github/scripts/issue-claim.test.js"
       - ".github/scripts/issue-triage.js"
@@ -69,6 +77,12 @@ jobs:
             -s .github/scripts \
             -p 'test_validate_repository_metadata.py'
           python3 .github/scripts/validate-repository-metadata.py
+
+      - name: Test source archive paths and identity
+        run: python3 .github/scripts/test_package_source_paths.py
+
+      - name: Test automatic release notes
+        run: python3 -B .github/scripts/test_release_notes.py
 
   community-automation:
     name: Test community automation

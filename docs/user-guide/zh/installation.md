@@ -104,7 +104,7 @@ anolisa install <component>
 | 组件 | 说明 | 支持的模式 |
 |------|------|------------|
 | `cosh` | Copilot Shell AI 终端助手 | user、system |
-| `cosh-ng` | AI 原生终端与 Agent 运行时（实验阶段） | system（Linux）、user 或 system（macOS arm64） |
+| `cosh-ng` | AI 原生终端与 Agent 运行时（实验阶段） | system（Linux）、user 或 system（macOS 11+ (arm64 / x86_64)） |
 | `os-skills` | 系统管理与 DevOps 技能 | user、system |
 | `tokenless` | Token 优化（压缩） | user、system |
 | `ws-ckpt` | 工作区快照/回滚 | **system** |
@@ -112,6 +112,7 @@ anolisa install <component>
 | `agent-memory` | 基于 MCP 的持久化记忆 | user、system |
 | `agentsight` | eBPF 追踪与 Dashboard | **system** |
 | `sec-core` | 本地安全运行时、scanner 和 adapter | **system** |
+| `ktuner` | 面向 Agent 的确定性内核调优引擎 | **system**（RPM，Linux x86_64） |
 
 > **注意** 仅支持 system 模式的组件需要 `sudo`，并且必须显式选择 system 范围。
 > ```bash
@@ -133,7 +134,7 @@ curl -fsSL https://get.agentic-os.sh | bash -s -- --component cosh-ng --backend 
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-在 macOS arm64 上，cosh-ng raw 包使用独立的 user scope 契约。
+在 macOS 11+ (arm64 / x86_64) 上，cosh-ng raw 包使用独立的 user scope 契约。
 
 ```bash
 curl -fsSL https://get.agentic-os.sh | bash -s -- --component cosh-ng --backend raw --install-mode user

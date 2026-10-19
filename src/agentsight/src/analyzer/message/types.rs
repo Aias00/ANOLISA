@@ -31,6 +31,12 @@ pub enum MessageRole {
     Assistant,
     /// Tool/Function message
     Tool,
+    /// A role this build does not model, such as the `function` role of the
+    /// legacy OpenAI function-calling protocol. One unrecognised role must
+    /// not fail the whole request deserialization — the same degradation
+    /// [`AnthropicContentBlock`] takes for unmodeled blocks.
+    #[serde(other)]
+    Unknown,
 }
 
 // ============================================================================
@@ -228,6 +234,12 @@ pub enum OpenAIContentPart {
         /// Image URL object
         image_url: OpenAIImageUrl,
     },
+    /// A content part this build does not model, such as `input_audio` or
+    /// `file`. Kept as a variant so one unrecognised part cannot fail the
+    /// whole request; text extraction skips it, exactly as it skips image
+    /// parts.
+    #[serde(other)]
+    Unknown,
 }
 
 /// OpenAI image URL structure
@@ -405,6 +417,7 @@ pub struct AnthropicResponse {
     pub stop_sequence: Option<String>,
 
     /// Token usage statistics
+    #[serde(default)]
     pub usage: AnthropicUsage,
 }
 
@@ -496,6 +509,14 @@ pub enum AnthropicContentBlock {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         is_error: Option<bool>,
     },
+    /// A block type this build does not model, such as `redacted_thinking`
+    /// (extended thinking with redacted content) or the server-tool blocks.
+    ///
+    /// Kept as a variant so one unrecognised block cannot fail the whole
+    /// response — the streaming path degrades the same way for unknown
+    /// `content_block_start` types.
+    #[serde(other)]
+    Unknown,
 }
 
 /// Anthropic image source
@@ -519,12 +540,14 @@ pub struct AnthropicImageSource {
 }
 
 /// Anthropic token usage statistics
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AnthropicUsage {
     /// Number of input tokens
+    #[serde(default)]
     pub input_tokens: u64,
 
     /// Number of output tokens
+    #[serde(default)]
     pub output_tokens: u64,
 
     /// Input tokens used to create cache entries
@@ -574,7 +597,15 @@ pub struct OpenAiSseChoice {
     /// Index of the choice
     pub index: u32,
     /// Delta content (incremental update)
+    ///
+    /// A cumulative frame carries a whole `message` instead, so the delta
+    /// defaults rather than rejecting that frame.
+    #[serde(default)]
     pub delta: OpenAiSseDelta,
+    /// Cumulative whole-message frame: repeats the answer so far instead of
+    /// an increment. Kept untyped because its shape is the terminal message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<serde_json::Value>,
     /// Reason for finishing (stop, length, tool_calls, etc.)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
@@ -584,7 +615,7 @@ pub struct OpenAiSseChoice {
 }
 
 /// OpenAI SSE delta content
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct OpenAiSseDelta {
     /// Role (usually only in first chunk)
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -643,18 +674,28 @@ pub enum AnthropicSseEvent {
 }
 
 /// Anthropic SSE message start data
+///
+/// The identity fields are optional because compatible gateways slim the
+/// event down to what they have: DashScope-compatible streams send only
+/// `model` plus `usage`, with no `id`, `type` or `role`. A required field
+/// failed the whole event's deserialization, so the aggregation skipped it
+/// and lost the model and the preliminary usage snapshot it carried.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnthropicSseMessageStart {
     /// Message ID
+    #[serde(default)]
     pub id: String,
     /// Message type (always "message")
-    #[serde(rename = "type")]
+    #[serde(default, rename = "type")]
     pub type_: String,
     /// Role (always "assistant")
+    #[serde(default = "assistant_role")]
     pub role: MessageRole,
     /// Model used
+    #[serde(default)]
     pub model: String,
     /// Initial usage statistics
+    #[serde(default)]
     pub usage: AnthropicUsage,
     /// Content blocks (empty at start)
     #[serde(default)]
@@ -665,6 +706,12 @@ pub struct AnthropicSseMessageStart {
     /// Stop sequence
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_sequence: Option<String>,
+}
+
+/// Default role for a `message_start` that omits it: the event only ever
+/// describes the assistant's reply.
+fn assistant_role() -> MessageRole {
+    MessageRole::Assistant
 }
 
 /// Anthropic SSE content delta
@@ -705,7 +752,11 @@ pub struct AnthropicSseMessageDelta {
 /// delta with `message_start` rather than trusting either alone.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnthropicSseUsageDelta {
-    /// Output tokens
+    /// Output tokens. Optional like every other counter: a proxy that splits the
+    /// terminal usage between `message_start` and this delta may omit it, and a
+    /// required field would fail the whole event, losing the `stop_reason` and
+    /// the counters the delta did carry.
+    #[serde(default)]
     pub output_tokens: u64,
     /// Input tokens, when the provider reports them in the delta
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1300,5 +1351,47 @@ mod tests {
             response: None,
         };
         assert_eq!(msg.request_metadata_session_id(), None);
+    }
+    #[test]
+    fn test_openai_request_tolerates_unmodeled_variants() {
+        // The legacy function-calling protocol addresses tool results with
+        // role:"function"; multimodal requests carry content parts this
+        // build does not model (input_audio, file). One unmodeled variant
+        // used to fail the whole OpenAIRequest deserialization, so the
+        // call lost every input message.
+        let json = serde_json::json!({
+            "model": "gpt-4",
+            "messages": [
+                {"role": "user", "content": "What is the weather?"},
+                {"role": "function", "name": "get_weather", "content": "{\"temp\": 20}"},
+                {"role": "user", "content": [
+                    {"type": "text", "text": "transcribe this"},
+                    {"type": "input_audio", "input_audio": {"data": "b64", "format": "wav"}}
+                ]}
+            ]
+        });
+        let req: OpenAIRequest = serde_json::from_value(json)
+            .expect("one unmodeled variant must not fail the whole request");
+        assert_eq!(req.messages.len(), 3);
+        assert_eq!(
+            req.messages[1].role,
+            MessageRole::Unknown,
+            "the legacy function role must degrade to Unknown, not fail the request"
+        );
+        let parts = req.messages[2].content.as_ref().unwrap();
+        assert!(
+            parts.as_text().contains("transcribe this"),
+            "the text part must survive the unmodeled audio part"
+        );
+        assert!(
+            !parts.as_text().contains("b64"),
+            "the unmodeled audio part must not leak into text extraction"
+        );
+    }
+
+    #[test]
+    fn test_message_role_unknown_for_unmodeled_role() {
+        let parsed: MessageRole = serde_json::from_str("\"function\"").unwrap();
+        assert_eq!(parsed, MessageRole::Unknown);
     }
 }

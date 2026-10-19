@@ -1,5 +1,6 @@
 //! Token query subcommand
 
+use agentsight::database::{DatabaseCoverage, DatabaseId, DatabaseManager};
 use agentsight::{
     SqliteConfig, TimePeriod, TokenQueryResult, TokenStore, Trend, format_tokens_with_commas,
 };
@@ -12,8 +13,8 @@ pub struct TokenCommand {
     #[structopt(long, possible_values = &["today", "yesterday", "week", "last_week", "month", "last_month"])]
     pub period: Option<String>,
 
-    /// Query last N hours
-    #[structopt(long)]
+    /// Query last N hours (cannot be combined with --period)
+    #[structopt(long, conflicts_with = "period")]
     pub hours: Option<u64>,
 
     /// Compare with previous period
@@ -44,8 +45,25 @@ impl TokenCommand {
     }
 
     fn execute_summary(&self, data_path: &std::path::Path) {
-        // Open token store
-        let store = TokenStore::new(data_path);
+        if self.data_file.is_some()
+            && let Err(error) = agentsight::check_data_file(data_path)
+        {
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+
+        let store = match DatabaseManager::open_query(
+            DatabaseId::Primary,
+            data_path,
+            DatabaseCoverage::Full,
+            |path| TokenStore::open_read_only_existing(path, "token_records"),
+        ) {
+            Ok(store) => store,
+            Err(error) => {
+                eprintln!("Failed to open token database: {error}");
+                std::process::exit(1);
+            }
+        };
         let query = agentsight::TokenQuery::new(&store);
 
         // Execute query
@@ -70,7 +88,7 @@ impl TokenCommand {
 
         // Output result
         if self.json {
-            println!("{}", serde_json::to_string_pretty(&result).unwrap());
+            super::print_json(&result);
         } else {
             print_human_readable(&result, self.compare);
         }
@@ -114,5 +132,40 @@ fn print_human_readable(result: &TokenQueryResult, show_compare: bool) {
             format_tokens_with_commas(result.input_tokens),
             format_tokens_with_commas(result.output_tokens)
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--hours` used to win unconditionally and `--period` was then never
+    /// read: `token --period week --hours 24` answered the 24-hour window while
+    /// the caller believed it asked for the calendar week — with exit 0 and a
+    /// header naming the window actually used, so the mismatch was invisible.
+    /// The sibling `interruption list --unresolved/--resolved` flags are
+    /// declared mutually exclusive for the same reason.
+    #[test]
+    fn hours_and_period_are_rejected_together() {
+        let both = TokenCommand::from_iter_safe(["token", "--period", "week", "--hours", "24"]);
+        let err = both.expect_err("two window selectors must not be silently reduced to one");
+        let message = err.to_string();
+        assert!(
+            message.contains("--hours") && message.contains("--period"),
+            "the error must name both flags: {message}"
+        );
+
+        // Either selector alone keeps working, in both flag orders.
+        let hours =
+            TokenCommand::from_iter_safe(["token", "--hours", "24"]).expect("--hours alone");
+        assert_eq!(hours.hours, Some(24));
+        let period =
+            TokenCommand::from_iter_safe(["token", "--period", "week"]).expect("--period alone");
+        assert_eq!(period.period.as_deref(), Some("week"));
+        let compared = TokenCommand::from_iter_safe(["token", "--hours", "24", "--compare"])
+            .expect("--hours with --compare");
+        assert!(compared.compare);
+        let reversed = TokenCommand::from_iter_safe(["token", "--hours", "24", "--period", "week"]);
+        assert!(reversed.is_err(), "the order of the flags must not matter");
     }
 }

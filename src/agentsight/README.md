@@ -36,7 +36,7 @@ AgentSight operates a unified data pipeline:
 | **Aggregator** | Correlates request-response pairs; tracks process lifecycle via LRU cache |
 | **Analyzer** | Produces audit records, token usage stats, and LLM API messages |
 | **GenAI** | Transforms results into semantic events (LLM calls, tool use, agent interactions) |
-| **Storage** | Persists to local SQLite database and optionally uploads to Alibaba Cloud SLS |
+| **Storage** | Opens typed SQLite Stores through `DatabaseManager`, applies schema-aware lifecycle policies, and optionally exports to Alibaba Cloud SLS |
 
 ### eBPF Probes
 
@@ -63,8 +63,11 @@ agentsight/
 │   ├── local/          # macOS-only: trajectory viewer server + collector dispatch
 │   ├── bin/            # CLI entry points (agentsight, cli subcommands)
 │   ├── unified.rs      # Main pipeline orchestrator
+│   ├── database.rs     # Typed Store registry and maintenance ownership
 │   ├── config.rs       # Unified configuration management
 │   └── event.rs        # Unified event type definitions
+├── crates/
+│   └── agentsight-sqlite-lifecycle/ # Business-model-free SQLite lifecycle primitives
 ├── Cargo.toml
 ├── build.rs            # eBPF skeleton generation for three probes
 └── agentsight.spec     # RPM packaging spec
@@ -133,6 +136,9 @@ agentsight audit --pid 12345 --type llm
 
 # Summary statistics
 agentsight audit --summary
+
+# Read a database copied from another host
+agentsight audit --db /backup/agentsight/agentsight.db
 ```
 
 ### `agentsight serve`
@@ -244,6 +250,19 @@ npm run dev          # starts webpack-dev-server on http://localhost:3004
 
 When finished, run `make build-frontend && cargo build --release` to embed the updated UI.
 
+### Resource Benchmarking (Linux)
+
+[`scripts/benchmark/single_run/resource_run.sh`](scripts/benchmark/single_run/resource_run.sh)
+measures AgentSight RSS and CPU with configurable Agent count and output tok/s,
+defaulting to 32 Agents, 100 tok/s each, and 60 seconds. It prints average/peak RSS,
+host RAM shares, average/P95/peak CPU (100% = one logical CPU), and load/capture
+checks. Cooperative CPU pacing defaults to 25% of one logical CPU with delayed delivery;
+`--cpu-budget-percent N` overrides the configured target (`0` disables pacing). Load-window and response-drain statistics are separate. It supports Git A/B comparisons with
+`--ab --baseline REF --candidate REF`. `--ring-buffer-mb N` sets the ring buffer
+size; reported probe drops invalidate the comparison. Tracing requires root or eBPF capabilities;
+the script requests sudo by default. See the [benchmark usage guide](scripts/docs/BENCHMARK_USAGE.md)
+for one-command examples, working-tree snapshots and reports.
+
 ## Quick Start
 
 ### Prerequisites
@@ -350,10 +369,34 @@ make build-all
 
 The binary is output to `target/release/agentsight`. On supported Linux systems,
 `make build-all` also invokes `scripts/build-enforcer.sh` to build the attested
-ActPlane `target/release/agentsight-enforcer` binary. `make build-mac` does not
-build the enforcer.
+ActPlane enforcer in a new private directory. The script prints its absolute
+path; keep the adjacent `.sha256` receipt and pass that exact path as
+`ENFORCER_BIN` to the raw packager. A shared `target/release/agentsight-enforcer`
+is not a verified build result. `make build-mac` does not build the enforcer.
+
+For Linux cross builds, `scripts/build-enforcer.sh --target
+<aarch64-unknown-linux-gnu|x86_64-unknown-linux-gnu>` selects the target explicitly;
+without arguments it builds for the host. `CARGO` may select a prepared Cross
+wrapper, but must honor the requested target. Both Linux architectures use the
+same raw payload layout and source-owned `.anolisa/component.toml`. macOS ARM64
+uses `.anolisa/component.macos.toml` and ships only the main executable. Cross
+compiling macOS from Linux requires `--no-default-features --features server` to
+skip the optional `bpf-build` host dependencies. Remove
+the private enforcer directory only after packaging has consumed its receipt.
 
 > `cargo build --release` only compiles Rust. It does not rebuild the embedded Dashboard UI, so use `make build-all` for user-facing builds.
+
+### GitHub prebuilt artifacts
+
+Release Preview builds Linux x86_64, Linux ARM64 and macOS ARM64 from the selected
+source commit; formal releases additionally require `sight/v<version>` to point
+at that commit. Each target produces `agentsight-<version>-<os>-<arch>.tar.gz`,
+its `.sha256`, a CycloneDX `.cdx.json` SBOM and the SBOM's `.sha256` (12 files in
+all). Linux targets require glibc 2.28; macOS ARM64 retains the 11.0 baseline.
+The action builds the embedded viewer and invokes this component's packager and
+contract from the same revision. Linux SBOMs include the attested enforcer's
+actual dependency graph. Download verification covers all three targets before
+Release publication. It does not attest ARM64 real-kernel eBPF behavior.
 
 ### Build on macOS
 
@@ -406,17 +449,18 @@ sudo agentsight trace
 
 AgentSight is configured via `agentsight.json` (default path `/etc/agentsight/config.json`; falls back to embedded defaults if absent).
 
-### Basic Options
+### SQLite Storage (`storage`)
 
-| Category | Option | Description |
-|----------|--------|-------------|
-| Storage | `db_path` | SQLite database file path |
-| Storage | `data_retention_days` | Data retention period |
-| Probes | `target_uid` | Filter events by UID |
-| Probes | `poll_timeout_ms` | Ring buffer poll timeout |
-| HTTP | `connection_cache_capacity` | LRU cache size for connection tracking |
-| SLS | `sls_endpoint` / `sls_project` / `sls_logstore` | Alibaba Cloud SLS export settings |
-| Tokenizer | `tokenizer_file` | Path or URL to HuggingFace tokenizer |
+`agentsight.json` schema v5 gives every AgentSight-owned SQLite store the same three policy keys:
+`retention_days`, `max_db_size_mb`, and `check_interval_secs`. A zero value disables the
+corresponding age, capacity, or scheduled-maintenance rule. Primary and GenAI maintenance default
+to 60 seconds; reuse, causal, and enforcement stores also have explicit policies. One lightweight
+maintenance thread per long-running process schedules all of that process's databases, while
+per-database locks coordinate `trace` and `serve`. Cleanup removes expired records first, checkpoints
+before size pruning, and targets 90% logical usage after physical allocation crosses the limit;
+automatic maintenance never runs `VACUUM` and leaves freed pages reusable. The Dashboard Settings
+page shows policy, capacity, coverage, and worker health without exposing database paths. See the
+[configuration guide](../../docs/user-guide/en/agent-observability/agentsight/configuration.md#sqlite-storage-policies).
 
 ### Feature Flags (`features`)
 
@@ -442,14 +486,39 @@ Configure buffer caps to prevent unbounded memory growth:
 | Option | Default | Description |
 |--------|---------|-------------|
 | `event_channel_capacity` | 10,000 | Bounded channel capacity for probe events |
-| `event_channel_policy` | `"backpressure"` | Full-channel policy: `backpressure` / `drop_newest` / `sample` |
+| `event_channel_policy` | `"backpressure"` | Wait for a queue slot after byte admission; `drop_newest` and `sample:N` remain available |
 | `event_channel_max_bytes_mb` | 64 | Byte budget for queued probe events (one SSL record reaches 4 MiB, so the slot count alone cannot bound memory) |
 | `pending_genai_max_count` | 1,000 | Max pending events awaiting session_id |
-| `pending_genai_max_bytes_mb` | 64 | Max bytes for pending events |
+| `pending_genai_max_bytes_mb` | 16 | Max bytes for pending events |
 | `pid_cache_size` | 1,024 | PID → agent_name LRU cache size |
+| `connection_capacity` | 32 | HTTP connection cache entries; use at least the expected concurrency and restart tracing |
 | `max_connection_body_mb` | 8 | Per-connection HTTP body buffer cap |
-| `connection_idle_timeout_secs` | 60 | HTTP connection idle timeout (seconds) |
-| `ring_buffer_mb` | 32 | eBPF Ring Buffer size (must be power of 2) |
+| `connection_idle_timeout_secs` | 60 | Soft inactivity timeout for pending SQLite snapshots |
+| `connection_hard_timeout_secs` | 300 | Finalize inactive calls as incomplete and release them; 0 disables the timeout |
+| `connection_max_bytes_mb` | 64 | Shared HTTP/1 + HTTP/2 retained payload budget |
+| `ffi_channel_max_bytes_mb` | 64 | FFI payload budget, including active callbacks |
+| `max_sse_retained_mb` | 2 | Per-stream SSE payload limit |
+| `retain_raw_sse` | `false` | Preserve original SSE sequences for raw export or debugging |
+| `ring_buffer_mb` | 64 | eBPF Ring Buffer size (must be power of 2) |
+
+Semantic-only delivery reduces SSE deltas and releases raw TLS buffers during the stream.
+Forced connection removal reports an incomplete call with an abandonment reason.
+Probe and FFI queues enforce byte limits alongside their slot limits and count rejected events.
+These budgets cover retained payloads; process RSS also includes the ring buffer, decoder working
+memory and allocator overhead. See the [configuration reference](../../docs/user-guide/en/agent-observability/agentsight/configuration.md#runtime-limits)
+for timeout, raw capture and overload behavior.
+
+Configuration schema v5 ships these defaults. Startup upgrades back up and replace older config
+files; reapply custom rules and settings from the backup. The implementation is described in
+[HTTP payload ownership and memory limits](docs/design/payload-memory.md).
+
+### Runtime Metrics Export
+
+Set `AGENTSIGHT_METRICS_FILE` to write Prometheus runtime metrics to a file.
+`AGENTSIGHT_METRICS_INTERVAL_SECS` sets the minimum time between updates in
+positive whole seconds (default: `1`). A final snapshot is written on shutdown
+regardless of this interval. The interval setting has no effect when the metrics
+file is not enabled.
 
 ### Minimal Memory Configuration
 
@@ -494,3 +563,5 @@ This project is derived from [https://github.com/eunomia-bpf/agentsight.git](htt
 ## License
 
 Apache License 2.0 — see [LICENSE](../../LICENSE) for details.
+
+Remote Tokenless statistics can be recorded through the optional `tokenless_api` configuration; see [configuration](../../docs/user-guide/en/agent-observability/agentsight/configuration.md#tokenless-statistics-api).

@@ -68,8 +68,13 @@ def cargo_sbom_version(tool: str) -> str:
     return match.group(1)
 
 
-def cargo_metadata(project_dir: Path, target: str) -> dict[str, Any]:
-    """Return Cargo's default-feature dependency graph for one target."""
+def cargo_metadata(
+    project_dir: Path, target: str, features: str = "", no_defaults: bool = False
+) -> dict[str, Any]:
+    """Return Cargo's dependency graph for the shipped feature selection."""
+    feature_args = ["--features", features] if features else []
+    if no_defaults:
+        feature_args.append("--no-default-features")
     try:
         result = subprocess.run(
             [
@@ -82,7 +87,9 @@ def cargo_metadata(project_dir: Path, target: str) -> dict[str, Any]:
                 target,
                 "--manifest-path",
                 str(project_dir / "Cargo.toml"),
+                *feature_args,
             ],
+            cwd=project_dir,
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -314,7 +321,7 @@ def deduplicate_component_tree(component: dict[str, Any], seen: set[str]) -> Non
 
 
 def merge_sboms(documents: list[dict[str, Any]]) -> dict[str, Any]:
-    """Merge filtered cargo-sbom documents for every shipped Rust project."""
+    """Merge dependency documents for every shipped project."""
     if not documents:
         die("at least one cargo-sbom document is required")
     merged = documents[0]
@@ -473,6 +480,9 @@ def main() -> int:
     parser.add_argument(
         "--project-dir", required=True, action="append", type=Path
     )
+    parser.add_argument("--extra-sbom", action="append", type=Path, default=[])
+    parser.add_argument("--features", default="")
+    parser.add_argument("--no-default-features", action="store_true")
     parser.add_argument("--source-date-epoch", required=True, type=int)
     parser.add_argument("--tool", default="cargo-sbom")
     args = parser.parse_args()
@@ -491,6 +501,7 @@ def main() -> int:
         ("linux", "x86_64"): "x86_64-unknown-linux-gnu",
         ("linux", "aarch64"): "aarch64-unknown-linux-gnu",
         ("macos", "aarch64"): "aarch64-apple-darwin",
+        ("macos", "x86_64"): "x86_64-apple-darwin",
     }.get((args.target_os, args.target_arch))
     if expected_target is None or args.target != expected_target:
         die("target triple does not match the requested OS and architecture")
@@ -503,6 +514,9 @@ def main() -> int:
 
     documents: list[dict[str, Any]] = []
     for project_dir in project_dirs:
+        allowed = resolved_package_identities(
+            cargo_metadata(project_dir, args.target, args.features, args.no_default_features)
+        )
         try:
             result = subprocess.run(
                 [
@@ -512,6 +526,7 @@ def main() -> int:
                     "--project-directory",
                     str(project_dir),
                 ],
+                cwd=project_dir,
                 check=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -531,9 +546,11 @@ def main() -> int:
         documents.append(
             filter_sbom_for_target(
                 raw,
-                resolved_package_identities(cargo_metadata(project_dir, args.target)),
+                allowed,
             )
         )
+    for extra in args.extra_sbom:
+        documents.append(json.loads(extra.read_text()))
     raw = merge_sboms(documents)
     normalized = normalize_sbom(
         raw,

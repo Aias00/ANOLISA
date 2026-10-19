@@ -62,6 +62,16 @@ def cargo_sbom_tool_present(metadata: dict[str, Any]) -> bool:
     )
 
 
+def skills_packager_present(metadata: dict[str, Any]) -> bool:
+    """Recognize the static OS Skills SBOM generator."""
+    return any(
+        isinstance(tool, dict)
+        and tool.get("name") == "os-skills-packager"
+        and tool.get("version") == "1"
+        for tool in metadata.get("tools", [])
+    )
+
+
 def component_refs(component: dict[str, Any]) -> list[str]:
     """Collect non-empty bom-ref values from one nested component tree."""
     references: list[str] = []
@@ -166,7 +176,10 @@ def validate_directory(
         or property_map.get("anolisa:target:arch") != target_arch
     ):
         die(f"SBOM target properties mismatch: {sbom}")
-    if not cargo_sbom_tool_present(metadata):
+    if component_name == "os-skills":
+        if not skills_packager_present(metadata):
+            die(f"SBOM does not identify os-skills-packager 1: {sbom}")
+    elif not cargo_sbom_tool_present(metadata):
         die(f"SBOM does not identify cargo-sbom 0.10.0: {sbom}")
 
     components = data.get("components")
@@ -258,7 +271,7 @@ def main() -> int:
         validate_directory(
             directory, args.component, args.version, target_os, target_arch
         )
-    print(f"Verified 12 {args.component} prebuilt release assets under {root}")
+    print(f"Verified {4 * len(component_targets)} {args.component} prebuilt release assets under {root}")
     return 0
 
 

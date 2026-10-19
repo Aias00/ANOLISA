@@ -5,6 +5,8 @@
 ANOLISA 是面向 AI Agent 工作负载的服务端操作系统层。只需安装一次 CLI，再按需
 启用能带来第一个目标结果的能力。
 
+实验性 AW + sec-core 完整包见 [AW Preview 指南](user-guide/zh/user-entrypoint/aw-preview.md)。
+
 ## 安装 CLI
 
 ```bash
@@ -39,7 +41,7 @@ curl -fsSL https://get.agentic-os.sh | bash -s -- --component cosh-ng --backend 
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-`--cosh-ng` 仍可作为 `--component cosh-ng` 的简写。在 macOS arm64 上改用
+`--cosh-ng` 仍可作为 `--component cosh-ng` 的简写。在 macOS 11+ (arm64 / x86_64) 上改用
 `--backend raw --install-mode user`。
 
 ### 增加可观测性、安全或运行时控制
@@ -48,6 +50,7 @@ export PATH="$HOME/.local/bin:$PATH"
 |------|----------|
 | 观察 Agent 活动与 Token 使用 | [AgentSight](user-guide/zh/agent-observability/agentsight/README.md) |
 | 增加安全策略 | [Agent Sec Core](user-guide/zh/agent-security/agent-sec-core/QUICKSTART.md) |
+| 评估 Rust SkillSec 核心 | [SkillSec V2](user-guide/zh/agent-security/agent-sec-core/skillsec-v2.md) |
 | 创建工作区恢复点 | [ws-ckpt](user-guide/zh/runtime/ws-ckpt.md) |
 | 按需挂载 Skills | [SkillFS](user-guide/zh/runtime/skillfs.md) |
 | 跨 Session 复用上下文 | [Agent Memory](user-guide/zh/token-saving/agent-memory.md) |

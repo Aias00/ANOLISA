@@ -12,10 +12,9 @@ use agentsight_opt_store::{Dimension, OptimizationStore};
 use agentsight_trajectory_collector::TrajectoryStore;
 use serde::{Deserialize, Serialize};
 
-use crate::server::semantic_search;
+use crate::semantic_search;
 
 const CONFIG_FILE_NAME: &str = "optimization_config.json";
-const DB_FILE_NAME: &str = "optimization.db";
 
 /// Runtime LLM configuration for optimization analysis.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -26,6 +25,11 @@ pub struct OptLlmConfig {
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// LLM ranking budget for semantic session search, in seconds. Separate
+    /// from the analysis path (which has no budget): a slow reasoning model
+    /// should raise this without affecting long-running optimization jobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_timeout_secs: Option<u64>,
 }
 
 impl OptLlmConfig {
@@ -37,6 +41,7 @@ impl OptLlmConfig {
     }
 
     fn save(&self, path: &Path) -> std::io::Result<()> {
+        preserve_unparseable_config(path)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -74,6 +79,13 @@ impl OptLlmConfig {
             .unwrap_or_else(|| "gpt-4o".to_string())
     }
 
+    fn search_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.search_timeout_secs
+                .unwrap_or(semantic_search::DEFAULT_SEARCH_TIMEOUT_SECS),
+        )
+    }
+
     fn masked_api_key(&self) -> Option<String> {
         self.effective_api_key().map(|k| {
             if k.chars().count() <= 12 {
@@ -89,23 +101,50 @@ impl OptLlmConfig {
     }
 }
 
+/// Back up a config file this process could not parse before `save` replaces it.
+///
+/// [`OptLlmConfig::load`] treats a file that does not deserialize into the
+/// typed config — truncated JSON *or* valid JSON with a wrong field type — as
+/// an empty configuration, so its settings — including the stored API key —
+/// never enter memory: the next save would overwrite them without a trace.
+/// Keep a copy first, mirroring the Linux server's settings path
+/// (`server::optimize::preserve_unparseable_config`, which follows the same
+/// backup discipline as `config.rs::ensure_default_agents_config`, issue
+/// #1502).
+fn preserve_unparseable_config(path: &Path) -> std::io::Result<()> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        // Absent or unreadable: there is nothing this process is about to lose.
+        return Ok(());
+    };
+    // Validating against the typed struct, not just `serde_json::Value`, is
+    // what makes a file like `{"search_timeout_secs": "60"}` unparseable here
+    // too: `load` drops it to the default config, so its contents are just as
+    // lost as truncated JSON if `save` overwrites it unpreserved.
+    if serde_json::from_str::<OptLlmConfig>(&content).is_ok() {
+        return Ok(());
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let backup = path.with_extension(format!("json.bak.{ts}"));
+    std::fs::copy(path, &backup)?;
+    log::warn!(
+        "Kept the unparseable optimization config at {backup:?} before overwriting {path:?}"
+    );
+    Ok(())
+}
+
 pub struct OptimizeState {
     config_path: PathBuf,
     config: RwLock<OptLlmConfig>,
-    store: Option<OptimizationStore>,
+    store: Option<Arc<OptimizationStore>>,
 }
 
 impl OptimizeState {
-    pub fn init(base_dir: &Path) -> Arc<Self> {
+    pub fn init(base_dir: &Path, store: Option<Arc<OptimizationStore>>) -> Arc<Self> {
         let config_path = base_dir.join(CONFIG_FILE_NAME);
         let config = OptLlmConfig::load(&config_path);
-        let store = match OptimizationStore::new_with_path(&base_dir.join(DB_FILE_NAME)) {
-            Ok(store) => Some(store),
-            Err(e) => {
-                log::warn!("Failed to open local optimization store: {e}");
-                None
-            }
-        };
         Arc::new(Self {
             config_path,
             config: RwLock::new(config),
@@ -113,11 +152,13 @@ impl OptimizeState {
         })
     }
 
-    fn snapshot(&self) -> OptLlmConfig {
+    pub(super) fn snapshot(&self) -> OptLlmConfig {
         self.config.read().map(|c| c.clone()).unwrap_or_default()
     }
 
-    fn build_client(&self) -> Result<LlmClient, HttpResponse> {
+    // `pub(super)` so the sibling preferences module can reuse the same
+    // configured client for its optional LLM layer.
+    pub(super) fn build_client(&self) -> Result<LlmClient, HttpResponse> {
         let config = self.snapshot();
         let Some(api_key) = config.effective_api_key() else {
             return Err(HttpResponse::BadRequest().json(serde_json::json!({
@@ -335,12 +376,33 @@ fn now_ns() -> i64 {
 const HISTORY_MAX_LIMIT: usize = 200;
 const HISTORY_DEFAULT_WINDOW_NS: i64 = 30 * 86_400_000_000_000;
 
+/// Reject an explicitly inverted time window (`start_ns > end_ns`).
+///
+/// Mirrors the Linux server's `reject_inverted_window` family: the store's
+/// `updated_at_ns >= start AND <= end` predicate matches nothing for an
+/// inverted window, so the endpoint used to answer an empty 200 that a
+/// caller cannot tell apart from "no results in this range". The guard runs
+/// before the store is consulted, so an unconfigured instance answers the
+/// family's 400 too, like its Linux sibling.
+fn reject_inverted_window(start_ns: Option<i64>, end_ns: Option<i64>) -> Option<HttpResponse> {
+    if matches!((start_ns, end_ns), (Some(start), Some(end)) if start > end) {
+        return Some(
+            HttpResponse::BadRequest()
+                .json(serde_json::json!({"error": "start_ns must not exceed end_ns"})),
+        );
+    }
+    None
+}
+
 /// GET /api/optimize/results
 #[get("/api/optimize/results")]
 pub async fn list_optimization_history(
     data: web::Data<OptimizeAppState>,
     query: web::Query<HistoryQuery>,
 ) -> impl Responder {
+    if let Some(response) = reject_inverted_window(query.start_ns, query.end_ns) {
+        return response;
+    }
     let Some(ref store) = data.optimize.store else {
         return HttpResponse::Ok().json(Vec::<serde_json::Value>::new());
     };
@@ -388,12 +450,7 @@ pub async fn list_optimization_history(
 #[get("/api/optimize/config")]
 pub async fn get_optimize_config(data: web::Data<OptimizeAppState>) -> impl Responder {
     let config = data.optimize.snapshot();
-    HttpResponse::Ok().json(serde_json::json!({
-        "api_key": config.masked_api_key(),
-        "base_url": config.effective_base_url(),
-        "model": config.effective_model(),
-        "configured": config.effective_api_key().is_some(),
-    }))
+    HttpResponse::Ok().json(config_response(&config))
 }
 
 #[derive(Debug, Deserialize)]
@@ -401,6 +458,43 @@ pub struct UpdateOptConfig {
     pub api_key: Option<String>,
     pub base_url: Option<String>,
     pub model: Option<String>,
+    pub search_timeout_secs: Option<u64>,
+}
+
+fn apply_config_update(config: &mut OptLlmConfig, update: &UpdateOptConfig) {
+    if let Some(ref key) = update.api_key
+        && !key.is_empty()
+        && !key.contains('•')
+    {
+        config.api_key = Some(key.clone());
+    }
+    if let Some(ref url) = update.base_url
+        && !url.is_empty()
+    {
+        config.base_url = Some(url.clone());
+    }
+    if let Some(ref model) = update.model
+        && !model.is_empty()
+    {
+        config.model = Some(model.clone());
+    }
+    if let Some(timeout_secs) = update.search_timeout_secs
+        && timeout_secs > 0
+    {
+        config.search_timeout_secs = Some(timeout_secs);
+    }
+}
+
+fn config_response(config: &OptLlmConfig) -> serde_json::Value {
+    serde_json::json!({
+        "api_key": config.masked_api_key(),
+        "base_url": config.effective_base_url(),
+        "model": config.effective_model(),
+        "search_timeout_secs": config
+            .search_timeout_secs
+            .unwrap_or(semantic_search::DEFAULT_SEARCH_TIMEOUT_SECS),
+        "configured": config.effective_api_key().is_some(),
+    })
 }
 
 /// POST /api/optimize/config
@@ -409,45 +503,33 @@ pub async fn update_optimize_config(
     data: web::Data<OptimizeAppState>,
     body: web::Json<UpdateOptConfig>,
 ) -> impl Responder {
-    let updated = {
-        let mut config = match data.optimize.config.write() {
-            Ok(config) => config,
-            Err(_) => {
-                return HttpResponse::InternalServerError()
-                    .json(serde_json::json!({"error": "config lock poisoned"}));
-            }
-        };
-        if let Some(ref key) = body.api_key
-            && !key.is_empty()
-            && !key.contains('•')
-        {
-            config.api_key = Some(key.clone());
+    let updated = match persist_config_update(&data.optimize, &body) {
+        Ok(updated) => updated,
+        Err(e) => {
+            return HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": format!("failed to persist config: {e}")
+            }));
         }
-        if let Some(ref url) = body.base_url
-            && !url.is_empty()
-        {
-            config.base_url = Some(url.clone());
-        }
-        if let Some(ref model) = body.model
-            && !model.is_empty()
-        {
-            config.model = Some(model.clone());
-        }
-        config.clone()
     };
 
-    if let Err(e) = updated.save(&data.optimize.config_path) {
-        return HttpResponse::InternalServerError().json(serde_json::json!({
-            "error": format!("failed to persist config: {e}")
-        }));
-    }
+    HttpResponse::Ok().json(config_response(&updated))
+}
 
-    HttpResponse::Ok().json(serde_json::json!({
-        "api_key": updated.masked_api_key(),
-        "base_url": updated.effective_base_url(),
-        "model": updated.effective_model(),
-        "configured": updated.effective_api_key().is_some(),
-    }))
+fn persist_config_update(
+    state: &OptimizeState,
+    update: &UpdateOptConfig,
+) -> std::io::Result<OptLlmConfig> {
+    let mut config = state
+        .config
+        .write()
+        .map_err(|_| std::io::Error::other("config lock poisoned"))?;
+    // Publish memory only after persistence succeeds, keeping the lock
+    // through both so another update cannot save an older snapshot last.
+    let mut updated = config.clone();
+    apply_config_update(&mut updated, update);
+    updated.save(&state.config_path)?;
+    *config = updated.clone();
+    Ok(updated)
 }
 
 // ─── Semantic session search ────────────────────────────────────────────────
@@ -464,17 +546,112 @@ pub async fn semantic_search_sessions(
     let client = match data.optimize.build_client() {
         Ok(c) => c,
         Err(_) => {
+            // Same contract as the Linux endpoint: degrade to empty, but make
+            // the most common cause (unconfigured LLM) attributable.
+            log::warn!(
+                "semantic_search: LLM not configured (missing API key), returning empty results"
+            );
             return HttpResponse::Ok()
                 .json(semantic_search::SemanticSearchResponse { results: vec![] });
         }
     };
+    let timeout = data.optimize.snapshot().search_timeout();
     let request = body.into_inner();
-    semantic_search::handle_semantic_search(&client, &request).await
+
+    // Sessions labelled `useless` are out of retrieval scope; same filter as
+    // the Linux endpoint, applied here for the same reason — one policy, every
+    // caller. A store failure degrades to unfiltered rather than failing search.
+    let request = match data.local_state.reuse_store.as_deref() {
+        Some(store) => match store.excluded_sessions() {
+            Ok(excluded) => semantic_search::filter_excluded(
+                request,
+                &excluded
+                    .into_iter()
+                    .collect::<std::collections::HashSet<_>>(),
+            ),
+            Err(error) => {
+                log::warn!("reuse: reading excluded sessions failed, ranking unfiltered: {error}");
+                request
+            }
+        },
+        None => request,
+    };
+    semantic_search::handle_semantic_search(&client, &request, timeout).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_config_update_keeps_memory_and_allows_retry() {
+        let tmp = std::env::temp_dir().join(format!(
+            "agentsight_local_failed_update_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(tmp.join(CONFIG_FILE_NAME)).unwrap();
+        let state = OptimizeState::init(&tmp, None);
+        let update = UpdateOptConfig {
+            model: Some("synthetic-model".into()),
+            search_timeout_secs: Some(17),
+            api_key: None,
+            base_url: None,
+        };
+        assert!(persist_config_update(&state, &update).is_err());
+        assert!(state.snapshot().model.is_none());
+        assert!(state.snapshot().search_timeout_secs.is_none());
+        std::fs::remove_dir(tmp.join(CONFIG_FILE_NAME)).unwrap();
+        persist_config_update(&state, &update).unwrap();
+        assert_eq!(state.snapshot().model.as_deref(), Some("synthetic-model"));
+        assert_eq!(
+            OptLlmConfig::load(&tmp.join(CONFIG_FILE_NAME)).search_timeout_secs,
+            Some(17)
+        );
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
+
+    #[test]
+    fn concurrent_config_updates_preserve_both_fields_on_restart() {
+        let tmp = std::env::temp_dir().join(format!(
+            "agentsight_local_concurrent_update_{}",
+            std::process::id()
+        ));
+        let state = OptimizeState::init(&tmp, None);
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let workers: Vec<_> = (0..2)
+            .map(|index| {
+                let state = Arc::clone(&state);
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    for _ in 0..50 {
+                        persist_config_update(
+                            &state,
+                            &UpdateOptConfig {
+                                model: (index == 0).then(|| "synthetic-model".into()),
+                                search_timeout_secs: (index == 1).then_some(17),
+                                api_key: None,
+                                base_url: None,
+                            },
+                        )
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        start.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        let restarted = OptimizeState::init(&tmp, None).snapshot();
+        assert_eq!(restarted.model.as_deref(), Some("synthetic-model"));
+        assert_eq!(restarted.search_timeout_secs, Some(17));
+        assert_eq!(
+            state.snapshot().search_timeout_secs,
+            restarted.search_timeout_secs
+        );
+        std::fs::remove_dir_all(tmp).unwrap();
+    }
 
     #[test]
     fn test_opt_llm_config_default() {
@@ -567,6 +744,7 @@ mod tests {
             api_key: Some("sk-testkey".to_string()),
             base_url: Some("https://test.api.com".to_string()),
             model: Some("test-model".to_string()),
+            search_timeout_secs: None,
         };
         config.save(&tmp).unwrap();
 
@@ -575,6 +753,123 @@ mod tests {
         assert_eq!(loaded.base_url.as_deref(), Some("https://test.api.com"));
         assert_eq!(loaded.model.as_deref(), Some("test-model"));
         let _ = std::fs::remove_file(&tmp);
+    }
+
+    fn config_backups(dir: &Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().contains(".bak."))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_opt_llm_config_save_keeps_a_typed_invalid_config() {
+        // Valid JSON that does not deserialize into `OptLlmConfig` (here
+        // `search_timeout_secs` is a string) is folded into the default config
+        // by `load` exactly like truncated JSON, dropping the stored API key
+        // and every other setting. `save` must keep a copy before overwriting
+        // it — the same guard the Linux server's settings path applies.
+        let dir = std::env::temp_dir().join(format!(
+            "agentsight_local_opt_typed_invalid_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(CONFIG_FILE_NAME);
+        let typed_invalid = r#"{"api_key":"sk-live","model":"qwen","search_timeout_secs":"60"}"#;
+        std::fs::write(&path, typed_invalid).unwrap();
+
+        let config = OptLlmConfig {
+            model: Some("gpt-4o".to_string()),
+            ..OptLlmConfig::default()
+        };
+        config.save(&path).unwrap();
+
+        let backups = config_backups(&dir);
+        assert_eq!(
+            backups.len(),
+            1,
+            "a config that fails OptLlmConfig deserialization must be kept"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&backups[0]).unwrap(),
+            typed_invalid,
+            "the backup must hold the file exactly as it was"
+        );
+        let stored = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            stored.contains("gpt-4o"),
+            "the new config is written: {stored}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_opt_llm_config_save_keeps_a_truncated_config() {
+        // Truncated JSON is the other shape `load` folds into the default:
+        // the file holds a sealed-looking key and no closing brace. Losing it
+        // to an overwrite would destroy the only copy of the key.
+        let dir = std::env::temp_dir().join(format!(
+            "agentsight_local_opt_truncated_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(CONFIG_FILE_NAME);
+        let truncated = r#"{"api_key":"sk-live","model":"qwen""#;
+        std::fs::write(&path, truncated).unwrap();
+
+        OptLlmConfig::default().save(&path).unwrap();
+
+        let backups = config_backups(&dir);
+        assert_eq!(backups.len(), 1, "a truncated config must be kept");
+        assert_eq!(std::fs::read_to_string(&backups[0]).unwrap(), truncated);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_opt_llm_config_save_keeps_no_backup_when_parseable() {
+        // Control: a config that parses round-trips through `load`, so its
+        // values are not about to be lost — `save` must not litter the
+        // settings directory with copies.
+        let dir = std::env::temp_dir().join(format!(
+            "agentsight_local_opt_parseable_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(CONFIG_FILE_NAME);
+
+        OptLlmConfig {
+            api_key: Some("sk-first".to_string()),
+            ..OptLlmConfig::default()
+        }
+        .save(&path)
+        .unwrap();
+        OptLlmConfig {
+            model: Some("gpt-4o".to_string()),
+            ..OptLlmConfig::default()
+        }
+        .save(&path)
+        .unwrap();
+
+        assert!(
+            config_backups(&dir).is_empty(),
+            "a parseable config needs no backup"
+        );
+        let stored = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            stored.contains("gpt-4o"),
+            "the latest config is written: {stored}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -603,11 +898,160 @@ mod tests {
     }
 
     #[test]
-    fn test_optimize_state_init() {
+    fn test_optimize_state_uses_opened_store() {
         let tmp = std::env::temp_dir().join("agentsight_opt_state_test");
         std::fs::create_dir_all(&tmp).unwrap();
-        let state = OptimizeState::init(&tmp);
+        let store = Arc::new(
+            OptimizationStore::new_with_path(&tmp.join(crate::config::OPTIMIZATION_DB_NAME))
+                .unwrap(),
+        );
+        let state = OptimizeState::init(&tmp, Some(Arc::clone(&store)));
         assert!(state.store.is_some());
+        assert!(Arc::ptr_eq(state.store.as_ref().unwrap(), &store));
+        drop(state);
+        drop(store);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn config_update_persists_and_returns_search_timeout() {
+        let tmp = std::env::temp_dir().join(format!(
+            "agentsight_local_opt_config_timeout_{}.json",
+            std::process::id()
+        ));
+        let mut config = OptLlmConfig::default();
+        let update = UpdateOptConfig {
+            api_key: None,
+            base_url: None,
+            model: None,
+            search_timeout_secs: Some(30),
+        };
+
+        apply_config_update(&mut config, &update);
+        config.save(&tmp).unwrap();
+        let loaded = OptLlmConfig::load(&tmp);
+        assert_eq!(loaded.search_timeout_secs, Some(30));
+        assert_eq!(config_response(&loaded)["search_timeout_secs"], 30);
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn config_response_uses_default_search_timeout() {
+        assert_eq!(
+            config_response(&OptLlmConfig::default())["search_timeout_secs"],
+            semantic_search::DEFAULT_SEARCH_TIMEOUT_SECS
+        );
+    }
+
+    #[test]
+    fn search_timeout_defaults_to_shared_default() {
+        assert_eq!(
+            OptLlmConfig::default().search_timeout(),
+            std::time::Duration::from_secs(semantic_search::DEFAULT_SEARCH_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn search_timeout_secs_round_trips_and_stays_absent_when_unset() {
+        let config: OptLlmConfig =
+            serde_json::from_str(r#"{"search_timeout_secs": 30}"#).expect("deserialize");
+        assert_eq!(config.search_timeout(), std::time::Duration::from_secs(30));
+        let serialized = serde_json::to_string(&OptLlmConfig::default()).expect("serialize");
+        assert!(!serialized.contains("search_timeout_secs"), "{serialized}");
+    }
+
+    #[actix_web::test]
+    async fn optimization_history_rejects_an_inverted_window() {
+        // The Linux sibling rejects `start_ns > end_ns` with the window-guard
+        // family's 400 before consulting the optimizer's state; this endpoint
+        // handed the inverted range to the store, whose
+        // `updated_at_ns >= start AND <= end` predicate matches nothing, and
+        // answered an empty 200 that reads as "no results in this range".
+        use crate::config::StorageConfig;
+        use crate::database::{
+            DatabaseAccess, DatabaseCoverage, DatabaseId, DatabaseManager, DatabaseRole,
+            DatabaseSpec,
+        };
+        use actix_web::{App, test as awtest};
+
+        let dir = std::env::temp_dir().join(format!(
+            "agentsight-local-opt-inverted-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+
+        let db_path = dir.join("trajectories.db");
+        let database_manager = Arc::new(
+            DatabaseManager::new(
+                DatabaseRole::LocalServer,
+                [DatabaseSpec::new(
+                    DatabaseId::Trajectories,
+                    &db_path,
+                    DatabaseAccess::ReadOnly,
+                    DatabaseCoverage::Partial,
+                )],
+            )
+            .expect("build the local database manager"),
+        );
+        let storage_config = StorageConfig::default();
+        let local_state = web::Data::new(super::super::LocalState {
+            trajectory_store: Arc::new(RwLock::new(None)),
+            db_path,
+            storage_budget: Arc::new(crate::storage_budget::StorageBudget::new(
+                None,
+                &storage_config,
+            )),
+            storage_config,
+            config_path: None,
+            database_manager,
+            reuse_store: None,
+            reuse_llm_judge_enabled: false,
+        });
+        // `store: None` is the unconfigured instance: the guard must answer
+        // before that state is consulted, like the Linux sibling.
+        let state = web::Data::new(OptimizeAppState {
+            optimize: OptimizeState::init(&dir, None),
+            local_state,
+        });
+
+        let app = awtest::init_service(
+            App::new()
+                .app_data(state)
+                .service(list_optimization_history),
+        )
+        .await;
+
+        let request = awtest::TestRequest::get()
+            .uri("/api/optimize/results?start_ns=2000&end_ns=1000")
+            .to_request();
+        let response = awtest::call_service(&app, request).await;
+        assert_eq!(
+            response.status(),
+            actix_web::http::StatusCode::BAD_REQUEST,
+            "an inverted window must be rejected, not answered with an empty 200"
+        );
+        let body: serde_json::Value = awtest::read_body_json(response).await;
+        assert_eq!(body["error"], "start_ns must not exceed end_ns");
+
+        // Controls: an ascending window and one-sided windows stay 200.
+        for uri in [
+            "/api/optimize/results?start_ns=1000&end_ns=2000",
+            "/api/optimize/results?start_ns=2000",
+            "/api/optimize/results?end_ns=1000",
+            "/api/optimize/results",
+        ] {
+            let request = awtest::TestRequest::get().uri(uri).to_request();
+            let response = awtest::call_service(&app, request).await;
+            assert_eq!(
+                response.status(),
+                actix_web::http::StatusCode::OK,
+                "a well-formed window must pass: {uri}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -25,8 +25,11 @@ Token authentication is on by default.
 
 | Access path | What is required |
 |---|---|
-| `http://127.0.0.1:7396` from the same host | Nothing; loopback requests skip authentication |
+| `http://127.0.0.1:7396` from the same host | Read-only page requests normally skip authentication; API exceptions apply |
 | `http://<host>:7396` from elsewhere | The Dashboard token, as `?token=<TOKEN>` in the URL, as `Authorization: Bearer <TOKEN>`, or typed into the login form |
+
+Saved Tokenless record lists require the Dashboard credential even on loopback. This changes
+metadata access control; the existing page, login flow and statistics calculation remain unchanged.
 
 ![Dashboard login screen](../../../../images/agentsight/en/dashboard-login.png)
 
@@ -40,6 +43,10 @@ sudo agentsight dashboard --no-open
 
 A successful login exchanges the token for an httpOnly session cookie, so you do not have to keep
 the token in the URL.
+
+An invalid-token message means the server rejected the token; check it with the command above.
+A connection-error message can also mean the server or a reverse proxy returned an HTTP error.
+Check that AgentSight is running and reachable, then retry the login.
 
 To turn authentication off — only sensible on a trusted internal network:
 
@@ -61,13 +68,18 @@ components on every page load and reports the result through `GET /api/auth/stat
 
 | Page | Appears when |
 |---|---|
-| Agent Dashboard, Agent Observability, Sessions, Optimization, Skill Metrics, Trajectory Viewer, Settings | Always |
-| Token Savings | `tokenless` is installed, or its statistics database exists |
+| Agent Dashboard, Agent Observability, Sessions, Reuse Labels, Optimization, Skill Metrics, Trajectory Viewer, Settings | Always |
+| Token Savings | `tokenless` is installed, its statistics database exists, or a Tokenless API is configured |
 | Security Observability, System Audit | `agent-sec-core` is installed (daemon or CLI) |
 | Risk Enforcement | `agentsight-enforcer` is installed or its socket exists |
 
 So a Dashboard that shows fewer entries than this guide is not broken — the matching component is
 simply not installed.
+
+A fresh visit to `http://<host>:7396/` lands on the Agent Dashboard (`#/health`). The bare root
+renders no page of its own: it redirects to the first entry in navigation order whose capability is
+advertised, so a host that does not report `agent_health` lands on Agent Observability instead.
+Agent Observability is reachable at `#/observability`, whether or not it is the landing page.
 
 Most pages share the same header: a start/end time range with `Last 1h / 6h / 24h / 7d` shortcuts,
 an Agent filter, and a **Query** button. Pages that show cost or savings figures wait for you to
@@ -114,6 +126,17 @@ optimization LLM to rank candidates by intent, e.g. "fix build error".
 
 **Analyze** sends the session to the Optimization page.
 
+Opening a session captured by both sources retains its captured steps and Token metrics,
+and includes its collected subagent trajectories in the ATIF viewer. A captured Codex UUID
+can resolve children under one matching collected rollout parent; ambiguous rollout parents
+are not combined. If collected children are unavailable, the captured session remains readable.
+
+## Reuse Labels
+
+Reviews collected trajectories for later Agent reuse. Run deterministic triage first, then confirm or override `good`, `bad`, `useless`, or `unknown` labels individually or in batch. The rules never assign `bad`; that verdict requires a human decision or an LLM judgement with a cited trajectory step.
+
+The optional model judge is available only after enabling `features.reuse_llm_judge` and configuring an optimization LLM. It runs billed requests and reports batch progress while it works. The page is advertised through the always-present `reuse_labels` capability; if `reuse.db` is unavailable, it remains visible and explains that labels cannot be read.
+
 ## Token Savings
 
 Compares actual Token consumption against the baseline Tokenless would have consumed, broken down by
@@ -123,6 +146,27 @@ optimization type, plus a savings ranking and concrete tips.
 
 Press **Query** after choosing a range; the page starts empty on purpose. Setup:
 [Integrations](integrations.md#tokenless-token-savings).
+
+With `tokenless_api` configured, **Query** refreshes statistics for captured tool-call IDs
+before computing savings. The existing page and controls stay unchanged. Only uniquely associated
+`active` records returned by the source query contribute; source failures display an error instead
+of stale totals. The existing AgentSight login is required, including on loopback. Saved metadata
+and explicitly requested content remain available through the [recording API](integrations.md#record-statistics-through-the-api).
+
+**Export CSV** downloads the displayed sessions from the last successful query as
+`token-savings.csv`, in their displayed order. It includes session IDs, Agent names,
+request counts and Token metrics; rates use fractions (for example, `0.4` means 40%).
+The export omits tool content and uses UTF-8 with a BOM for spreadsheet compatibility.
+Text beginning with a spreadsheet formula prefix is prefixed with an apostrophe.
+Export is disabled while querying, after a query error, or when there are no sessions.
+
+To compare a subset, check the box on each session row (or the box in the table header
+to select or clear every session) and press **Export Selected (N)**. The download uses
+the same columns, escaping, units and file lifecycle as the full export, keeps the
+displayed row order, and reads only the already loaded results — it never issues another
+request. Checking a box does not expand or collapse the row; the selection is keyed by
+session ID, and it is cleared whenever a new successful query replaces the snapshot.
+The button stays disabled while querying, after a query error, or while nothing is selected.
 
 ## Optimization
 
@@ -159,13 +203,33 @@ elsewhere.
 
 This is the page to open when you need to know exactly what the Agent sent and received.
 
+**Filter round content** searches the currently selected trajectory locally. It matches a
+case-insensitive literal substring in messages, reasoning, tool names, arguments, and result content,
+and shows the matching/total round count. **Clear filter** restores the full list. The selected round
+detail stays visible while filtering; selecting another trajectory or importing/loading a new
+document clears the filter. Searching sends no model request and leaves **Download JSON** unchanged.
+
 ## Settings
 
-Configures the LLM used by the optimization and semantic-search features (provider, base URL, model,
-API key). The key is masked when read back and stored in `optimization_config.json` next to the
-databases.
+The SQLite storage card consumes schema v2 from authenticated `GET /api/storage/status`. On Linux,
+it includes every AgentSight-owned store plus the external Tokenless target, including the new reuse
+and causal entries. Each card shows the effective retention and size policy, physical and logical usage,
+cleanup state, and coverage (`full`, `partial`, or external). Trajectories, security audit, reuse,
+causal, and enforcement are partial because maintenance intentionally protects bookkeeping,
+active graphs, the newest cache entry, human decisions, or live control state.
 
-![Settings page](../../../../images/agentsight/en/dashboard-settings.png)
+The same card now shows `scheduled`, `worker_running`, the worker heartbeat, last attempt, last
+successful attempt, `last_result`, consecutive failures, and the next run. These runtime fields describe
+only the process serving the endpoint; an unscheduled trace-owned store does not prove that a separate
+trace process is stopped. A `lock_busy` result means another process held that database's maintenance lock. Do not infer worker health from
+`within_policy`: logical usage can be within the limit while a job is unscheduled, the worker is
+stopped, or recent attempts failed. Logical usage excludes reusable freelist pages, so a large
+physical file can also be healthy. The API never exposes filesystem paths.
+
+This page also configures the LLM used by optimization and semantic search (provider, base URL,
+model, API key, and the semantic-search ranking timeout). A timed-out ranking returns no results and
+is recorded as a server warning. The key is masked when read back and stored in
+`optimization_config.json` next to the databases.
 
 ## Language
 

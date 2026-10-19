@@ -19,11 +19,10 @@ use agentsight_trajectory_collector::{TrajectoryRecord, TrajectoryStore};
 
 use super::AppState;
 use super::secret;
-use super::semantic_search;
+use crate::semantic_search;
 use crate::storage::sqlite::GenAISqliteStore;
 
 const CONFIG_FILE_NAME: &str = "optimization_config.json";
-const DB_FILE_NAME: &str = "optimization.db";
 const TRAJECTORIES_DIR_NAME: &str = "opt-trajectories";
 
 /// Directory holding the config file — where the sealing salt lives too.
@@ -45,6 +44,11 @@ pub struct OptLlmConfig {
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// LLM ranking budget for semantic session search, in seconds. Separate
+    /// from the analysis path (which has no budget): a slow reasoning model
+    /// should raise this without affecting long-running optimization jobs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub search_timeout_secs: Option<u64>,
 }
 
 impl OptLlmConfig {
@@ -54,7 +58,16 @@ impl OptLlmConfig {
     /// that must be resealed so the plaintext leaves the disk.
     fn load(path: &Path) -> (Self, bool) {
         let mut config: Self = match std::fs::read_to_string(path) {
-            Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
+            // A Windows editor saving as "UTF-8 with BOM" prefixes the file
+            // with U+FEFF, which `serde_json` rejects at offset 0. Without
+            // stripping it the whole file degrades to an empty configuration:
+            // the stored key, endpoint and model silently disappear from the
+            // settings page, and the next save overwrites them. Every other
+            // JSON boundary in this crate already ignores one leading mark
+            // (`config.rs::strip_leading_bom`); this one did not.
+            Ok(content) => {
+                serde_json::from_str(crate::config::strip_leading_bom(&content)).unwrap_or_default()
+            }
             Err(_) => return (Self::default(), false),
         };
         let mut needs_reseal = false;
@@ -80,6 +93,7 @@ impl OptLlmConfig {
     }
 
     fn save(&self, path: &Path) -> std::io::Result<()> {
+        preserve_unparseable_config(path)?;
         // Never persist the API key as plaintext — 0o600 does not survive
         // backups, snapshots, or root compromise (see super::secret).
         let mut on_disk = self.clone();
@@ -121,6 +135,13 @@ impl OptLlmConfig {
             .unwrap_or_else(|| "gpt-4o".into())
     }
 
+    fn search_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.search_timeout_secs
+                .unwrap_or(semantic_search::DEFAULT_SEARCH_TIMEOUT_SECS),
+        )
+    }
+
     /// Mask the API key for display: first 6 and last 4 chars.
     fn masked_api_key(&self) -> Option<String> {
         self.effective_api_key().map(|k| {
@@ -137,6 +158,38 @@ impl OptLlmConfig {
     }
 }
 
+/// Back up a config file this process could not parse before `save` replaces it.
+///
+/// [`OptLlmConfig::load`] treats a file that does not deserialize into the
+/// typed config — truncated JSON *or* valid JSON with a wrong field type — as
+/// an empty configuration, so its settings — including the sealed API key —
+/// never enter memory: the next save would overwrite them without a trace.
+/// Keep a copy first, the same way `config.rs::ensure_default_agents_config`
+/// refuses to replace invalid JSON outright (issue #1502).
+fn preserve_unparseable_config(path: &Path) -> std::io::Result<()> {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        // Absent or unreadable: there is nothing this process is about to lose.
+        return Ok(());
+    };
+    // Validating against the typed struct, not just `serde_json::Value`, is
+    // what makes a file like `{"search_timeout_secs": "60"}` unparseable here
+    // too: `load` drops it to the default config, so its contents are just as
+    // lost as truncated JSON if `save` overwrites it unpreserved.
+    if serde_json::from_str::<OptLlmConfig>(crate::config::strip_leading_bom(&content)).is_ok() {
+        return Ok(());
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let backup = path.with_extension(format!("json.bak.{ts}"));
+    std::fs::copy(path, &backup)?;
+    log::warn!(
+        "Kept the unparseable optimization config at {backup:?} before overwriting {path:?}"
+    );
+    Ok(())
+}
+
 // ─── Shared state ────────────────────────────────────────────────────────────
 
 /// Optimization feature state shared across handlers.
@@ -150,8 +203,8 @@ pub struct OptimizeState {
 }
 
 impl OptimizeState {
-    /// Initialize from the storage base directory (where the .db files live).
-    pub fn init(base_dir: &Path) -> Arc<Self> {
+    /// Initializes optimization state with its centrally opened result store.
+    pub fn init(base_dir: &Path, store: Option<OptimizationStore>) -> Arc<Self> {
         let config_path = base_dir.join(CONFIG_FILE_NAME);
         let (config, needs_reseal) = OptLlmConfig::load(&config_path);
         if needs_reseal {
@@ -162,13 +215,6 @@ impl OptimizeState {
                 Err(e) => log::warn!("Failed to encrypt stored optimization API key: {e}"),
             }
         }
-        let store = match OptimizationStore::new_with_path(&base_dir.join(DB_FILE_NAME)) {
-            Ok(s) => Some(s),
-            Err(e) => {
-                log::warn!("Failed to open optimization store: {e}");
-                None
-            }
-        };
         Arc::new(Self {
             config_path,
             config: RwLock::new(config),
@@ -177,8 +223,38 @@ impl OptimizeState {
         })
     }
 
-    fn snapshot(&self) -> OptLlmConfig {
-        self.config.read().map(|c| c.clone()).unwrap_or_default()
+    pub(super) fn has_storage(&self) -> bool {
+        self.store.is_some()
+    }
+
+    /// Applies the configured retention and capacity policy to optimization results.
+    pub(super) fn maintain_storage(
+        &self,
+        policy: crate::config::PeriodicStoragePolicy,
+    ) -> Result<Option<agentsight_opt_store::OptimizationMaintenanceReport>, String> {
+        self.store
+            .as_ref()
+            .map(|store| {
+                store
+                    .maintain(agentsight_opt_store::OptimizationMaintenancePolicy {
+                        retention_days: policy.retention_days,
+                        max_db_size_mb: policy.max_db_size_mb,
+                    })
+                    .map_err(|error| error.to_string())
+            })
+            .transpose()
+    }
+
+    pub(crate) fn snapshot(&self) -> OptLlmConfig {
+        // Recover a poisoned guard instead of answering with an empty
+        // config: the writer (update_optimize_config) reports the poisoned
+        // state explicitly, so a reader that silently downgraded to
+        // defaults would show "not configured" while the sealed config on
+        // disk is fine, and the dashboard could not repair itself.
+        self.config
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub(super) fn build_client(&self) -> Result<LlmClient, HttpResponse> {
@@ -226,12 +302,42 @@ pub async fn semantic_search_sessions(
     let client = match state.build_client() {
         Ok(c) => c,
         Err(_) => {
+            // Search degrades to empty instead of failing, but an unconfigured
+            // LLM is the most common cause of an empty page — make it
+            // attributable rather than indistinguishable from "no matches".
+            log::warn!(
+                "semantic_search: LLM not configured (missing API key), returning empty results"
+            );
             return HttpResponse::Ok()
                 .json(semantic_search::SemanticSearchResponse { results: vec![] });
         }
     };
+    let timeout = state.snapshot().search_timeout();
     let request = body.into_inner();
-    semantic_search::handle_semantic_search(&client, &request).await
+
+    // Sessions labelled `useless` are out of retrieval scope by design — the
+    // whole trajectory was judged to have nothing worth putting in front of a
+    // future search. Filtering here covers every caller of the endpoint, and
+    // before the minimum-count check so a fully-excluded request reads as
+    // empty rather than shrinking past the LLM threshold.
+    let request = match data.reuse_store.as_deref() {
+        Some(store) => match store.excluded_sessions() {
+            Ok(excluded) => semantic_search::filter_excluded(
+                request,
+                &excluded
+                    .into_iter()
+                    .collect::<std::collections::HashSet<_>>(),
+            ),
+            Err(error) => {
+                // A store failure must not take search down: the labels are a
+                // filter, not a dependency. Search everything rather than nothing.
+                log::warn!("reuse: reading excluded sessions failed, ranking unfiltered: {error}");
+                request
+            }
+        },
+        None => request,
+    };
+    semantic_search::handle_semantic_search(&client, &request, timeout).await
 }
 
 /// Load a session's captured events and build the ATIF trajectory that the
@@ -242,12 +348,13 @@ pub async fn semantic_search_sessions(
 /// log-collected trajectory store (trajectories.db), whose rows already hold
 /// ready-made ATIF v1.7 JSON.
 fn load_trajectory(
-    db_path: &Path,
+    genai_store: Option<&GenAISqliteStore>,
     trajectory_store: Option<Arc<TrajectoryStore>>,
     session_id: &str,
 ) -> Result<AtifTrajectory, HttpResponse> {
-    let store = GenAISqliteStore::new_with_path(db_path).map_err(|e| {
-        HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
+    let store = genai_store.ok_or_else(|| {
+        HttpResponse::InternalServerError()
+            .json(serde_json::json!({"error": "GenAI store unavailable"}))
     })?;
     let events = store.get_events_by_session(session_id).map_err(|e| {
         HttpResponse::InternalServerError().json(serde_json::json!({"error": e.to_string()}))
@@ -592,14 +699,20 @@ pub async fn run_optimization(
         Err(resp) => return resp,
     };
     let Some(dimension) = parse_dimension(&dimension_raw) else {
+        // Derived from ALL_DIMENSIONS so the message cannot fall behind
+        // `parse_dimension` again: it is the only place this API names the
+        // accepted values, and it had dropped `summary`.
         return HttpResponse::BadRequest().json(serde_json::json!({
             "error": "unknown dimension",
-            "message": "expected one of: perf, perf-issues, cost, cost-waste, accuracy",
+            "message": format!("expected one of: {}", ALL_DIMENSIONS.join(", ")),
         }));
     };
 
-    let trajectory = match load_trajectory(&data.storage_path, data.trajectory_store(), &session_id)
-    {
+    let trajectory = match load_trajectory(
+        data.genai_store.as_deref(),
+        data.trajectory_store(),
+        &session_id,
+    ) {
         Ok(t) => t,
         Err(resp) => return resp,
     };
@@ -823,6 +936,26 @@ pub async fn list_optimization_history(
     data: web::Data<AppState>,
     query: web::Query<HistoryQuery>,
 ) -> impl Responder {
+    // Validated before anything else: an inverted window is a malformed
+    // request whatever the optimizer's state, exactly as on the sibling
+    // endpoints.
+    if let Some(response) = super::handlers::reject_inverted_window(query.start_ns, query.end_ns) {
+        return response;
+    }
+    // Resolve the window before consulting the optimizer's state: an
+    // explicit future start (end defaults to now) is as inverted as a
+    // supplied pair, and a default start that is not representable must be
+    // rejected instead of `saturating_sub` clamping it to `i64::MIN`, which
+    // silently answered an empty 200.
+    let end_ns = query.end_ns.unwrap_or_else(now_ns);
+    let start_ns = match super::handlers::start_or_default(
+        query.start_ns,
+        end_ns,
+        HISTORY_DEFAULT_WINDOW_NS,
+    ) {
+        Ok(start_ns) => start_ns,
+        Err(response) => return response,
+    };
     let state = match optimize_state(&data) {
         Ok(s) => s,
         Err(resp) => return resp,
@@ -833,10 +966,6 @@ pub async fn list_optimization_history(
         return HttpResponse::Ok().json(Vec::<serde_json::Value>::new());
     };
 
-    let end_ns = query.end_ns.unwrap_or_else(now_ns);
-    let start_ns = query
-        .start_ns
-        .unwrap_or_else(|| end_ns.saturating_sub(HISTORY_DEFAULT_WINDOW_NS));
     let limit = query.limit.unwrap_or(100).clamp(1, HISTORY_MAX_LIMIT);
 
     match store.list(start_ns, end_ns, limit) {
@@ -881,12 +1010,7 @@ pub async fn get_optimize_config(data: web::Data<AppState>) -> impl Responder {
         Err(resp) => return resp,
     };
     let config = state.snapshot();
-    HttpResponse::Ok().json(serde_json::json!({
-        "api_key": config.masked_api_key(),
-        "base_url": config.effective_base_url(),
-        "model": config.effective_model(),
-        "configured": config.effective_api_key().is_some(),
-    }))
+    HttpResponse::Ok().json(config_response(&config))
 }
 
 /// Body for POST /api/optimize/config. Omitted fields keep their prior value.
@@ -895,6 +1019,42 @@ pub struct UpdateOptConfig {
     pub api_key: Option<String>,
     pub base_url: Option<String>,
     pub model: Option<String>,
+    pub search_timeout_secs: Option<u64>,
+}
+
+fn apply_config_update(config: &mut OptLlmConfig, update: &UpdateOptConfig) {
+    if let Some(ref key) = update.api_key {
+        if !key.is_empty() && !key.contains('•') {
+            config.api_key = Some(key.clone());
+        }
+    }
+    if let Some(ref url) = update.base_url {
+        if !url.is_empty() {
+            config.base_url = Some(url.clone());
+        }
+    }
+    if let Some(ref model) = update.model {
+        if !model.is_empty() {
+            config.model = Some(model.clone());
+        }
+    }
+    if let Some(timeout_secs) = update.search_timeout_secs {
+        if timeout_secs > 0 {
+            config.search_timeout_secs = Some(timeout_secs);
+        }
+    }
+}
+
+fn config_response(config: &OptLlmConfig) -> serde_json::Value {
+    serde_json::json!({
+        "api_key": config.masked_api_key(),
+        "base_url": config.effective_base_url(),
+        "model": config.effective_model(),
+        "search_timeout_secs": config
+            .search_timeout_secs
+            .unwrap_or(semantic_search::DEFAULT_SEARCH_TIMEOUT_SECS),
+        "configured": config.effective_api_key().is_some(),
+    })
 }
 
 /// POST /api/optimize/config — update LLM config (persisted to disk).
@@ -916,21 +1076,7 @@ pub async fn update_optimize_config(
                     .json(serde_json::json!({"error": "config lock poisoned"}));
             }
         };
-        if let Some(ref key) = body.api_key {
-            if !key.is_empty() && !key.contains('•') {
-                config.api_key = Some(key.clone());
-            }
-        }
-        if let Some(ref url) = body.base_url {
-            if !url.is_empty() {
-                config.base_url = Some(url.clone());
-            }
-        }
-        if let Some(ref model) = body.model {
-            if !model.is_empty() {
-                config.model = Some(model.clone());
-            }
-        }
+        apply_config_update(&mut config, &body);
         config.clone()
     };
 
@@ -940,17 +1086,252 @@ pub async fn update_optimize_config(
         }));
     }
 
-    HttpResponse::Ok().json(serde_json::json!({
-        "api_key": updated.masked_api_key(),
-        "base_url": updated.effective_base_url(),
-        "model": updated.effective_model(),
-        "configured": updated.effective_api_key().is_some(),
-    }))
+    HttpResponse::Ok().json(config_response(&updated))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn config_test_state(base_dir: &Path) -> actix_web::web::Data<AppState> {
+        use std::sync::{Arc, RwLock};
+        use std::time::Instant;
+
+        let auth_config = crate::config::ServerAuthConfig { enabled: false };
+        let auth = Arc::new(crate::server::auth::DashboardAuth::init(
+            &auth_config,
+            base_dir,
+        ));
+        actix_web::web::Data::new(AppState {
+            config_path: None,
+            storage_budget: std::sync::Arc::new(crate::storage_budget::StorageBudget::new(
+                None,
+                &crate::config::StorageConfig::default(),
+            )),
+            storage_path: base_dir.join("agentsight.db"),
+            genai_store: None,
+            start_time: Instant::now(),
+            health_store: Arc::new(RwLock::new(crate::health::HealthStore::new())),
+            interruption_store: None,
+            evaluation_store: Arc::new(
+                crate::grader::EvaluationStore::new_with_path(&base_dir.join("evaluation.db"))
+                    .unwrap(),
+            ),
+            enforcement: None,
+            containment: None,
+            audit_service: Arc::new(agentsight_audit::AuditService::new(
+                crate::security::SecurityStore::open_in_memory()
+                    .unwrap()
+                    .audit_store(),
+            )),
+            security_observability: crate::server::SecurityObservabilityConfig::default(),
+            auth,
+            optimize: Some(OptimizeState::init(base_dir, None)),
+            reuse_store: None,
+            trajectory_store: Arc::new(RwLock::new(None)),
+            reuse_llm_judge_enabled: false,
+            causal_store: None,
+        })
+    }
+
+    /// The rejection message is the only place this API names the accepted
+    /// dimensions (`/api/docs` lists the route without its values), and it
+    /// named five of the six `parse_dimension` accepts: a client reading the
+    /// error cannot discover `summary`, a dimension the endpoint serves.
+    #[actix_web::test]
+    async fn unknown_dimension_lists_every_accepted_dimension() {
+        use actix_web::{App, test as awtest};
+
+        let dir = tmp_dir("unknown-dimension");
+        let app = awtest::init_service(
+            App::new()
+                .app_data(config_test_state(&dir))
+                .service(run_optimization),
+        )
+        .await;
+        let request = awtest::TestRequest::post()
+            .uri("/optimize/sessions/s1/not-a-dimension")
+            .to_request();
+        let response = awtest::call_service(&app, request).await;
+        assert_eq!(
+            response.status(),
+            actix_web::http::StatusCode::BAD_REQUEST,
+            "an unknown dimension must be rejected before the session is read"
+        );
+        let body: serde_json::Value = awtest::read_body_json(response).await;
+        let message = body["message"]
+            .as_str()
+            .expect("the rejection names the accepted dimensions");
+        for dimension in ALL_DIMENSIONS {
+            assert!(
+                message.contains(dimension),
+                "the rejection must name every accepted dimension, {dimension} is missing: {message}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[actix_web::test]
+    async fn history_rejects_an_inverted_window() {
+        use actix_web::{App, test as awtest};
+
+        // Validated before the optimizer's state is consulted, so an
+        // unconfigured instance answers 400 like every sibling endpoint
+        // instead of its own "not configured" error.
+        let dir = tmp_dir("inverted-window");
+        let app = awtest::init_service(
+            App::new()
+                .app_data(config_test_state(&dir))
+                .service(list_optimization_history),
+        )
+        .await;
+        let request = awtest::TestRequest::get()
+            .uri("/optimize/results?start_ns=2000&end_ns=1000")
+            .to_request();
+        let response = awtest::call_service(&app, request).await;
+        assert_eq!(
+            response.status(),
+            actix_web::http::StatusCode::BAD_REQUEST,
+            "an inverted window must be rejected"
+        );
+        let body: serde_json::Value = awtest::read_body_json(response).await;
+        assert_eq!(body["error"], "start_ns must not exceed end_ns");
+
+        // One-sided form: `end_ns` is absent, so it defaults to now and a
+        // future start is just as inverted.
+        let request = awtest::TestRequest::get()
+            .uri("/optimize/results?start_ns=9223372036854775807")
+            .to_request();
+        let response = awtest::call_service(&app, request).await;
+        assert_eq!(
+            response.status(),
+            actix_web::http::StatusCode::BAD_REQUEST,
+            "a start beyond the defaulted end must be rejected"
+        );
+        let body: serde_json::Value = awtest::read_body_json(response).await;
+        assert_eq!(body["error"], "start_ns must not exceed end_ns");
+    }
+
+    #[actix_web::test]
+    async fn history_rejects_an_unrepresentable_default_window() {
+        use actix_web::{App, test as awtest};
+
+        // `end_ns` near `i64::MIN` used to make `saturating_sub` clamp the
+        // default start to `i64::MIN` and answer 200 `[]` — indistinguishable
+        // from "no history in range". It is rejected like every sibling
+        // endpoint rejects an unrepresentable default window.
+        let dir = tmp_dir("unrepresentable-window");
+        let app = awtest::init_service(
+            App::new()
+                .app_data(config_test_state(&dir))
+                .service(list_optimization_history),
+        )
+        .await;
+        let request = awtest::TestRequest::get()
+            .uri("/optimize/results?end_ns=-9223372036854775808")
+            .to_request();
+        let response = awtest::call_service(&app, request).await;
+        assert_eq!(
+            response.status(),
+            actix_web::http::StatusCode::BAD_REQUEST,
+            "an unrepresentable default window must be rejected, not clamped"
+        );
+        let body: serde_json::Value = awtest::read_body_json(response).await;
+        assert_eq!(body["error"], "default time range is out of bounds");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[actix_web::test]
+    async fn config_endpoint_persists_and_returns_search_timeout() {
+        use actix_web::{App, test as awtest};
+
+        let dir = tmp_dir("search-timeout-api");
+        let app = awtest::init_service(
+            App::new()
+                .app_data(config_test_state(&dir))
+                .service(get_optimize_config)
+                .service(update_optimize_config),
+        )
+        .await;
+        let request = awtest::TestRequest::post()
+            .uri("/optimize/config")
+            .set_json(serde_json::json!({"search_timeout_secs": 30}))
+            .to_request();
+        let response = awtest::call_service(&app, request).await;
+        assert!(response.status().is_success());
+        let body: serde_json::Value = awtest::read_body_json(response).await;
+        assert_eq!(body["search_timeout_secs"], 30);
+
+        let response = awtest::call_service(
+            &app,
+            awtest::TestRequest::get()
+                .uri("/optimize/config")
+                .to_request(),
+        )
+        .await;
+        let body: serde_json::Value = awtest::read_body_json(response).await;
+        assert_eq!(body["search_timeout_secs"], 30);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[actix_web::test]
+    async fn config_endpoint_survives_a_poisoned_config_lock() {
+        use actix_web::{App, test as awtest};
+
+        // A panic in a thread holding the config lock poisons it. `snapshot`
+        // used to answer with an empty default from then on — `configured:
+        // false` and the default model — while the writer refuses with
+        // "config lock poisoned": the dashboard showed no credentials and
+        // could not fix itself short of a restart, with the sealed config
+        // still intact on disk. Recover the guard instead, so the seeded
+        // config stays visible.
+        let dir = tmp_dir("config-poison");
+        let state = config_test_state(&dir);
+        {
+            let optimize = state.optimize.as_ref().expect("optimize state");
+            let mut config = optimize.config.write().unwrap();
+            config.model = Some("test-model".to_string());
+            config.api_key = Some("sk-test-poison-0001".to_string());
+        }
+        let optimize = Arc::clone(state.optimize.as_ref().expect("optimize state"));
+        let _ = std::thread::spawn(move || {
+            let _guard = optimize.config.write().unwrap();
+            panic!("poison the optimize config lock");
+        })
+        .join();
+
+        let app =
+            awtest::init_service(App::new().app_data(state).service(get_optimize_config)).await;
+        let response = awtest::call_service(
+            &app,
+            awtest::TestRequest::get()
+                .uri("/optimize/config")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+        let body: serde_json::Value = awtest::read_body_json(response).await;
+        assert_eq!(
+            body["model"], "test-model",
+            "a poisoned lock must not replace the configured model with the default"
+        );
+        assert_eq!(
+            body["configured"], true,
+            "the seeded key must stay visible through a poisoned lock"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_response_uses_default_search_timeout() {
+        assert_eq!(
+            config_response(&OptLlmConfig::default())["search_timeout_secs"],
+            semantic_search::DEFAULT_SEARCH_TIMEOUT_SECS
+        );
+    }
 
     /// The eBPF export feeds the optimizer through JSON, so the shared-schema
     /// document must survive the analyzer's parser with tokens and per-step
@@ -986,6 +1367,7 @@ mod tests {
             api_key: Some("sk-1234567890abcd".into()),
             base_url: Some("http://localhost/v1".into()),
             model: Some("test-model".into()),
+            search_timeout_secs: None,
         };
 
         assert_eq!(
@@ -1003,6 +1385,7 @@ mod tests {
             api_key: Some("short".into()),
             base_url: Some(String::new()),
             model: Some(String::new()),
+            search_timeout_secs: None,
         };
 
         assert_eq!(config.effective_api_key().as_deref(), Some("short"));
@@ -1019,6 +1402,7 @@ mod tests {
             api_key: Some("sk-super-secret-key".into()),
             base_url: Some("http://localhost/v1".into()),
             model: Some("test-model".into()),
+            search_timeout_secs: None,
         };
         config.save(&path).unwrap();
 
@@ -1078,6 +1462,130 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A Windows editor saving as "UTF-8 with BOM" prefixes the config with
+    /// U+FEFF, which `serde_json` rejects at offset 0. `load` folded the whole
+    /// file into the default config, so a marked file looked unconfigured in
+    /// the settings page and the next save replaced the key, endpoint and
+    /// model it still held. Every other JSON boundary in the crate ignores one
+    /// leading mark; this one did not.
+    #[test]
+    fn load_reads_a_bom_marked_config() {
+        let dir = tmp_dir("bom-config");
+        let path = dir.join(CONFIG_FILE_NAME);
+        std::fs::write(
+            &path,
+            "\u{feff}{\"api_key\":null,\"base_url\":\"https://synthetic.example/v1\",\"model\":\"synthetic-model\",\"search_timeout_secs\":17}",
+        )
+        .unwrap();
+
+        let (loaded, needs_reseal) = OptLlmConfig::load(&path);
+        assert_eq!(
+            loaded.base_url.as_deref(),
+            Some("https://synthetic.example/v1")
+        );
+        assert_eq!(loaded.model.as_deref(), Some("synthetic-model"));
+        assert_eq!(loaded.search_timeout_secs, Some(17));
+        assert!(!needs_reseal);
+
+        // The save-time guard reads the same boundary: a marked file parses, so
+        // saving over it must not leave a spurious backup behind.
+        assert!(preserve_unparseable_config(&path).is_ok());
+        assert!(
+            config_backups(&dir).is_empty(),
+            "a BOM-marked config is parseable and needs no backup"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Return the backups a config path left beside it, sorted.
+    fn config_backups(dir: &Path) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("optimization_config.json.bak."))
+            })
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    /// `load` treats a file that does not parse as an empty configuration, so
+    /// its settings never enter memory. Saving over it used to destroy those
+    /// settings — including the sealed API key — without a trace.
+    #[test]
+    fn save_keeps_a_config_it_could_not_parse() {
+        let dir = tmp_dir("unparseable-config");
+        let path = dir.join(CONFIG_FILE_NAME);
+        // An interrupted write leaves exactly this: truncated JSON that still
+        // holds the sealed key and the other settings.
+        let truncated = "{\n  \"api_key\": \"enc:v1:AAAA:BBBB\",\n  \"model\": \"qwen\"\n";
+        std::fs::write(&path, truncated).unwrap();
+
+        let config = OptLlmConfig {
+            api_key: Some("sk-fresh".into()),
+            model: Some("gpt-4o".into()),
+            base_url: None,
+            search_timeout_secs: None,
+        };
+        config.save(&path).unwrap();
+
+        let backups = config_backups(&dir);
+        assert_eq!(backups.len(), 1, "the unparseable file must be kept");
+        assert_eq!(std::fs::read_to_string(&backups[0]).unwrap(), truncated);
+        let stored = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            stored.contains("gpt-4o"),
+            "the new config is written: {stored}"
+        );
+
+        // Once the file parses again there is nothing left to preserve.
+        config.save(&path).unwrap();
+        assert_eq!(config_backups(&dir).len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Valid JSON that does not deserialize into `OptLlmConfig` (here
+    /// `search_timeout_secs` is a string) is folded into the default config by
+    /// `load` exactly like truncated JSON, dropping the sealed key and every
+    /// other setting. `save` must keep a copy before overwriting it.
+    #[test]
+    fn save_keeps_a_typed_invalid_config_it_could_not_parse() {
+        let dir = tmp_dir("typed-invalid-config");
+        let path = dir.join(CONFIG_FILE_NAME);
+        let typed_invalid =
+            r#"{"api_key":"enc:v1:AAAA:BBBB","model":"qwen","search_timeout_secs":"60"}"#;
+        std::fs::write(&path, typed_invalid).unwrap();
+
+        let config = OptLlmConfig {
+            api_key: Some("sk-fresh".into()),
+            model: Some("gpt-4o".into()),
+            base_url: None,
+            search_timeout_secs: None,
+        };
+        config.save(&path).unwrap();
+
+        let backups = config_backups(&dir);
+        assert_eq!(
+            backups.len(),
+            1,
+            "a config that fails OptLlmConfig deserialization must be kept"
+        );
+        assert_eq!(std::fs::read_to_string(&backups[0]).unwrap(), typed_invalid);
+        let stored = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            stored.contains("gpt-4o"),
+            "the new config is written: {stored}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn parses_known_optimization_dimensions() {
         assert_eq!(parse_dimension("perf"), Some(Dimension::Perf));
@@ -1128,7 +1636,13 @@ mod tests {
             .upsert_trajectory(&collected_record("log-1", atif))
             .unwrap();
 
-        let trajectory = load_trajectory(&db_path, Some(Arc::new(tstore)), "log-1").unwrap();
+        let genai_store = GenAISqliteStore::new_with_path(
+            &db_path,
+            crate::config::PeriodicStoragePolicy::default(),
+        )
+        .unwrap();
+        let trajectory =
+            load_trajectory(Some(&genai_store), Some(Arc::new(tstore)), "log-1").unwrap();
         assert_eq!(trajectory.session_id, "log-1");
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1138,14 +1652,19 @@ mod tests {
     fn load_trajectory_returns_not_found_when_both_sources_miss() {
         let dir = tmp_dir("miss");
         let db_path = dir.join("genai.db");
+        let genai_store = GenAISqliteStore::new_with_path(
+            &db_path,
+            crate::config::PeriodicStoragePolicy::default(),
+        )
+        .unwrap();
         let tstore = TrajectoryStore::new_with_path(&dir.join("trajectories.db")).unwrap();
 
         // Store present but session absent → 404.
-        let resp = load_trajectory(&db_path, Some(Arc::new(tstore)), "nope").unwrap_err();
+        let resp = load_trajectory(Some(&genai_store), Some(Arc::new(tstore)), "nope").unwrap_err();
         assert_eq!(resp.status(), actix_web::http::StatusCode::NOT_FOUND);
 
-        // No store at all → 404 as well.
-        let resp = load_trajectory(&db_path, None, "nope").unwrap_err();
+        // No collected store at all → 404 as well.
+        let resp = load_trajectory(Some(&genai_store), None, "nope").unwrap_err();
         assert_eq!(resp.status(), actix_web::http::StatusCode::NOT_FOUND);
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -1155,12 +1674,18 @@ mod tests {
     fn load_trajectory_rejects_corrupt_collected_atif() {
         let dir = tmp_dir("corrupt");
         let db_path = dir.join("genai.db");
+        let genai_store = GenAISqliteStore::new_with_path(
+            &db_path,
+            crate::config::PeriodicStoragePolicy::default(),
+        )
+        .unwrap();
         let tstore = TrajectoryStore::new_with_path(&dir.join("trajectories.db")).unwrap();
         tstore
             .upsert_trajectory(&collected_record("bad-1", "not json"))
             .unwrap();
 
-        let resp = load_trajectory(&db_path, Some(Arc::new(tstore)), "bad-1").unwrap_err();
+        let resp =
+            load_trajectory(Some(&genai_store), Some(Arc::new(tstore)), "bad-1").unwrap_err();
         assert_eq!(
             resp.status(),
             actix_web::http::StatusCode::UNPROCESSABLE_ENTITY
@@ -1384,5 +1909,23 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn search_timeout_defaults_to_shared_default() {
+        assert_eq!(
+            OptLlmConfig::default().search_timeout(),
+            std::time::Duration::from_secs(semantic_search::DEFAULT_SEARCH_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn search_timeout_secs_round_trips_and_stays_absent_when_unset() {
+        let config: OptLlmConfig =
+            serde_json::from_str(r#"{"search_timeout_secs": 30}"#).expect("deserialize");
+        assert_eq!(config.search_timeout(), std::time::Duration::from_secs(30));
+        // Dashboard-managed files must not grow keys the user never set.
+        let serialized = serde_json::to_string(&OptLlmConfig::default()).expect("serialize");
+        assert!(!serialized.contains("search_timeout_secs"), "{serialized}");
     }
 }

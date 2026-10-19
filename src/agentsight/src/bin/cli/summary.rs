@@ -13,6 +13,7 @@
 //! available" note) rather than aborting the whole report. `summary` always
 //! exits 0 with whatever is available, so it is safe to run on a fresh box.
 
+use agentsight::database::{DatabaseCoverage, DatabaseId, DatabaseManager};
 use agentsight::storage::sqlite::tokenless::default_stats_path;
 use agentsight::storage::sqlite::{
     GenAISqliteStore, InterruptionStore, TokenlessStatsStore, TokenlessWindowSummary, format_tokens,
@@ -30,6 +31,23 @@ pub struct SummaryCommand {
     /// Output as JSON
     #[structopt(long)]
     pub json: bool,
+
+    /// Override the sessions database path
+    ///
+    /// Reads a copy of the databases from another host or a non-default data
+    /// directory; the interruption database is read from the same directory,
+    /// matching the default on-disk layout.
+    #[structopt(long)]
+    pub db: Option<String>,
+
+    /// Override the tokenless stats database path
+    ///
+    /// The tokenless store lives outside the AgentSight databases, so `--db`
+    /// does not move it: a report over a copy still reads the running host's
+    /// own `stats.db`. Point this at a copy to keep the whole report free of
+    /// live data.
+    #[structopt(long)]
+    pub tokenless_db: Option<String>,
 }
 
 /// Sessions + token totals from genai_events.db.
@@ -57,13 +75,35 @@ struct InterruptionStats {
 }
 
 impl SummaryCommand {
+    /// Resolve the sessions database path: `--db` reads a copy of the
+    /// databases from another host or a non-default data directory; without
+    /// it the default location is used.
+    fn db_path(&self) -> std::path::PathBuf {
+        self.db
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(GenAISqliteStore::default_path)
+    }
+
+    /// Resolve the tokenless stats database path: `--tokenless-db` reads a
+    /// copy instead of the running host's own store; without it the default
+    /// location is used.
+    fn tokenless_db_path(&self) -> std::path::PathBuf {
+        self.tokenless_db
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(default_stats_path)
+    }
+
     pub fn execute(&self) {
         let (start_ns, end_ns) = time_range_ns(self.last);
 
-        let sessions = gather_sessions(&GenAISqliteStore::default_path(), start_ns, end_ns);
-        let interruptions = gather_interruptions(&interruption_db_path(), start_ns, end_ns);
+        let genai_db = self.db_path();
+        let sessions = gather_sessions(&genai_db, start_ns, end_ns);
+        let interruptions =
+            gather_interruptions(&interruption_db_path(&genai_db), start_ns, end_ns);
         let (tokenless, tokenless_available) =
-            gather_tokenless(&default_stats_path(), start_ns, end_ns);
+            gather_tokenless(&self.tokenless_db_path(), start_ns, end_ns);
 
         if self.json {
             self.print_json(&sessions, &interruptions, &tokenless, tokenless_available);
@@ -181,7 +221,12 @@ fn gather_sessions(path: &Path, start_ns: i64, end_ns: i64) -> SessionStats {
     if !path.exists() {
         return SessionStats::default();
     }
-    let store = match GenAISqliteStore::new_with_path(path) {
+    let store = match DatabaseManager::open_query(
+        DatabaseId::GenAi,
+        path,
+        DatabaseCoverage::Full,
+        GenAISqliteStore::open_read_only_existing,
+    ) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("warning: cannot open genai database: {e}");
@@ -215,7 +260,12 @@ fn gather_interruptions(path: &Path, start_ns: i64, end_ns: i64) -> Interruption
     if !path.exists() {
         return InterruptionStats::default();
     }
-    let store = match InterruptionStore::new_with_path(path) {
+    let store = match DatabaseManager::open_query(
+        DatabaseId::Interruptions,
+        path,
+        DatabaseCoverage::Full,
+        InterruptionStore::open_read_only_existing,
+    ) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("warning: cannot open interruption database: {e}");
@@ -255,9 +305,10 @@ fn gather_tokenless(path: &Path, start_ns: i64, end_ns: i64) -> (TokenlessWindow
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-/// interruption_events.db lives next to the genai database.
-fn interruption_db_path() -> std::path::PathBuf {
-    GenAISqliteStore::default_path()
+/// interruption_events.db lives next to the genai database, including when
+/// `--db` points at a copy of the databases in another directory.
+fn interruption_db_path(genai_db: &Path) -> std::path::PathBuf {
+    genai_db
         .parent()
         .unwrap_or(std::path::Path::new("/var/log/sysak/.agentsight"))
         .join("interruption_events.db")
@@ -265,11 +316,9 @@ fn interruption_db_path() -> std::path::PathBuf {
 
 /// Compute (start_ns, end_ns) for the last N hours from now.
 fn time_range_ns(hours: u64) -> (i64, i64) {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now_ns = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as i64;
+    // A pre-epoch realtime clock degrades to 0 (the `epoch_nanos` family
+    // contract) instead of unwrapping the elapsed-time error.
+    let now_ns = agentsight::utils::epoch_nanos(std::time::SystemTime::now()) as i64;
     // Saturate so an absurd --last (up to u64::MAX) degrades to "everything"
     // (start far in the past) instead of overflowing into an inverted/garbage
     // window. Guard the u64->i64 cast first so a value >= 2^63 cannot flip sign.
@@ -344,12 +393,66 @@ mod tests {
         assert!(s2 < e2);
     }
 
+    #[test]
+    fn db_path_honours_the_override_and_keeps_the_sibling_interruption_db() {
+        // `--db` must reach the gather calls: reverting the wiring (returning
+        // the default unconditionally) makes this fail. The interruption
+        // database must move with it — it lives next to the genai database.
+        let plain = SummaryCommand {
+            last: 24,
+            json: false,
+            db: None,
+            tokenless_db: None,
+        };
+        assert_eq!(plain.db_path(), GenAISqliteStore::default_path());
+
+        let copied = SummaryCommand {
+            last: 24,
+            json: false,
+            db: Some("/tmp/agentsight_summary_copy/genai_events.db".into()),
+            tokenless_db: None,
+        };
+        let genai = copied.db_path();
+        assert_eq!(
+            genai,
+            std::path::PathBuf::from("/tmp/agentsight_summary_copy/genai_events.db")
+        );
+        assert_eq!(
+            interruption_db_path(&genai),
+            std::path::PathBuf::from("/tmp/agentsight_summary_copy/interruption_events.db")
+        );
+    }
+
+    #[test]
+    fn tokenless_db_path_honours_the_override_and_falls_back_to_the_default() {
+        // `--tokenless-db` must reach the gather call: reverting the wiring
+        // (returning the default unconditionally) makes this fail. The
+        // tokenless store is the one source `--db` cannot move, so without
+        // this flag a report over a copy still reads the local host's stats.db.
+        let plain = SummaryCommand {
+            last: 24,
+            json: false,
+            db: None,
+            tokenless_db: None,
+        };
+        assert_eq!(plain.tokenless_db_path(), default_stats_path());
+
+        let copied = SummaryCommand {
+            last: 24,
+            json: false,
+            db: None,
+            tokenless_db: Some("/tmp/agentsight_summary_copy/stats.db".into()),
+        };
+        assert_eq!(
+            copied.tokenless_db_path(),
+            std::path::PathBuf::from("/tmp/agentsight_summary_copy/stats.db")
+        );
+    }
+
     // ── Independent degradation matrix ──────────────────────────────────────
     // Each source must contribute zeros (tokenless: unavailable) when its DB is
     // missing or has the wrong schema, without panicking — so one broken source
-    // never aborts the whole report. The genai/interruption DB paths are
-    // hardcoded in production, so these inject paths directly (the live ECS
-    // collector holds the real DBs open, so they cannot be moved to E2E this).
+    // never aborts the whole report.
 
     fn unique_tmp(tag: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -426,11 +529,15 @@ mod tests {
         SummaryCommand {
             last: 24,
             json: false,
+            db: None,
+            tokenless_db: None,
         }
         .execute();
         SummaryCommand {
             last: 1,
             json: true,
+            db: None,
+            tokenless_db: None,
         }
         .execute();
     }
@@ -464,6 +571,8 @@ mod tests {
         let text_cmd = SummaryCommand {
             last: 24,
             json: false,
+            db: None,
+            tokenless_db: None,
         };
         // Saved-activity + non-zero sessions/interruptions branches.
         text_cmd.print_text(&populated_sessions, &populated_ints, &populated_tl, true);
@@ -485,6 +594,8 @@ mod tests {
         SummaryCommand {
             last: 24,
             json: true,
+            db: None,
+            tokenless_db: None,
         }
         .print_json(&populated_sessions, &populated_ints, &populated_tl, true);
     }

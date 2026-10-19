@@ -14,8 +14,9 @@ pub mod qoder;
 pub mod store;
 
 pub use store::{
-    TrajectoryAgentActivitySummary, TrajectoryFilters, TrajectoryRecord, TrajectoryStore,
-    TrajectorySummary,
+    strip_system_context, StepContext, StepHit, StepScanFilter, StepScanOutcome, StepView,
+    TrajectoryAgentActivitySummary, TrajectoryFilters, TrajectoryMaintenancePolicy,
+    TrajectoryMaintenanceReport, TrajectoryRecord, TrajectoryStore, TrajectorySummary,
 };
 
 use std::path::PathBuf;
@@ -35,31 +36,23 @@ pub struct CollectorConfig {
     /// Optional override of the projects directories to scan; `None` probes
     /// `/root` + `/home/*` for the default Qoder/QoderWork layout.
     pub scan_dirs: Option<Vec<PathBuf>>,
-    /// Path of the `trajectories.db` SQLite file.
-    pub db_path: PathBuf,
+    /// Retention used to skip already-expired source files during scans.
+    pub maintenance: TrajectoryMaintenancePolicy,
 }
 
 /// Scan-convert-persist loop; returns when `stop` is cleared.
 ///
-/// Runs one scan immediately, then sleeps `scan_interval_secs` between
-/// rounds (checking `stop` every second). Store open failure is logged and
-/// aborts the loop — the feature is best-effort and must never take the
-/// tracer down.
-pub fn run_collector_loop(config: &CollectorConfig, stop: &AtomicBool) {
-    let store = match TrajectoryStore::new_with_path(&config.db_path) {
-        Ok(s) => s,
-        Err(e) => {
-            log::warn!(
-                "Trajectory collector disabled: failed to open {}: {e}",
-                config.db_path.display()
-            );
-            return;
-        }
-    };
+/// Runs one scan immediately, then sleeps `scan_interval_secs` between rounds
+/// (checking `stop` every second). Database lifecycle is owned by the caller's
+/// maintenance worker.
+pub fn run_collector_loop(
+    store: std::sync::Arc<TrajectoryStore>,
+    config: &CollectorConfig,
+    stop: &AtomicBool,
+) {
     log::info!(
-        "Trajectory collector started (interval={}s, db={})",
-        config.scan_interval_secs,
-        config.db_path.display()
+        "Trajectory collector started (interval={}s)",
+        config.scan_interval_secs
     );
 
     // Single exit point: the loop always exits via the `sleep_or_stop` check,
@@ -80,7 +73,7 @@ pub fn scan_once(store: &TrajectoryStore, config: &CollectorConfig) {
     let sessions = discovery::discover_sessions(config.scan_dirs.as_deref());
     let mut collected = 0usize;
     for session in &sessions {
-        match process_session(store, session) {
+        match process_session(store, session, config.maintenance.retention_days) {
             Ok(true) => collected += 1,
             Ok(false) => {}
             Err(e) => {
@@ -106,7 +99,11 @@ pub fn scan_once(store: &TrajectoryStore, config: &CollectorConfig) {
 
 /// Ingest a single session file. Returns `Ok(true)` when the row was
 /// (re)written, `Ok(false)` when the file is unchanged.
-fn process_session(store: &TrajectoryStore, session: &DiscoveredSession) -> Result<bool> {
+fn process_session(
+    store: &TrajectoryStore,
+    session: &DiscoveredSession,
+    retention_days: u64,
+) -> Result<bool> {
     let meta = std::fs::metadata(&session.path)
         .with_context(|| format!("stat {}", session.path.display()))?;
     let file_size = i64::try_from(meta.len()).unwrap_or(i64::MAX);
@@ -118,14 +115,35 @@ fn process_session(store: &TrajectoryStore, session: &DiscoveredSession) -> Resu
         .unwrap_or(0);
 
     let file_path = session.path.to_string_lossy().to_string();
+    if retention_days > 0 {
+        let now_ns = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
+            .unwrap_or(0);
+        let cutoff_ns = agentsight_sqlite_lifecycle::retention_cutoff_ns(now_ns, retention_days)?;
+        if file_mtime_ns < i64::try_from(cutoff_ns).unwrap_or(i64::MAX) {
+            // No `set_file_state` here: the retention decision is recomputed
+            // by stat on every scan, and persisting it as `skipped_files`
+            // bookkeeping would make the file indistinguishable from a failed
+            // conversion — a later widened window would then match the stale
+            // size/mtime and never re-admit the now-eligible file.
+            return Ok(false);
+        }
+    }
     if let Some((size, mtime)) = store.get_file_state(&file_path)? {
         if size == file_size && mtime == file_mtime_ns {
             return Ok(false);
         }
     }
 
-    let content = std::fs::read_to_string(&session.path)
-        .with_context(|| format!("read {}", session.path.display()))?;
+    // Read bytes: an agent killed mid-write can leave a partial record whose
+    // last bytes cut a multi-byte character, and `read_to_string` would then
+    // reject the whole file, losing every complete record before the tail.
+    // Lossy decoding turns that tail into a malformed line, which
+    // `load_jsonl_events` skips like any other malformed line.
+    let content =
+        std::fs::read(&session.path).with_context(|| format!("read {}", session.path.display()))?;
+    let content = String::from_utf8_lossy(&content);
     let events = qoder::load_jsonl_events(&content);
     if events.is_empty() {
         // Record file state so persistently corrupted files are not re-read
@@ -250,6 +268,97 @@ mod tests {
     }
 
     #[test]
+    fn test_process_session_settles_when_one_session_has_two_paths() {
+        // One session id discovered under two roots (e.g. a Codex rollout
+        // under `.codex/sessions` and `.codex/archived_sessions`): the
+        // session_id primary key keeps a single row whose file_path is
+        // rewritten by whichever path ingests last. Both paths must still
+        // settle — before the fix neither path's state matched on the next
+        // round, so both files were fully re-read and re-upserted (churning
+        // collected_at_ns) on every scan round.
+        let base = tmp_dir("dual-path");
+        let projects = base.join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        let first = write_session(&projects);
+
+        let archive = base.join("archived-sessions");
+        std::fs::create_dir_all(&archive).unwrap();
+        let second = archive.join(format!("{UUID_A}.jsonl"));
+        std::fs::copy(&first, &second).unwrap();
+
+        let discovered = |path: PathBuf| DiscoveredSession {
+            path,
+            project: "data-myapp".into(),
+            session_id: UUID_A.into(),
+            is_subagent: false,
+            source: "qoder".into(),
+        };
+        let s1 = discovered(first);
+        let s2 = discovered(second);
+
+        let store = TrajectoryStore::new_with_path(&base.join("t.db")).unwrap();
+        // Round 1: both paths are new and get ingested.
+        assert!(process_session(&store, &s1, 0).unwrap());
+        assert!(process_session(&store, &s2, 0).unwrap());
+        assert_eq!(store.count().unwrap(), 1, "one row per session id");
+
+        // Round 2: unchanged files on both paths are skipped.
+        assert!(
+            !process_session(&store, &s1, 0).unwrap(),
+            "unchanged first path must not re-ingest"
+        );
+        assert!(
+            !process_session(&store, &s2, 0).unwrap(),
+            "unchanged second path must not re-ingest"
+        );
+        assert_eq!(store.count().unwrap(), 1);
+    }
+
+    #[test]
+    fn test_process_session_re_admits_file_after_retention_widens() {
+        // The retention pre-check used to persist `skipped_files` state,
+        // indistinguishable from failed-conversion bookkeeping. When the
+        // window was later widened, the stale row still matched the
+        // unchanged size/mtime and the now-eligible file was never
+        // ingested. The retention decision is recomputed by stat every
+        // scan, so it must not leave state behind.
+        let base = tmp_dir("retention-widen");
+        let projects = base.join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        let path = write_session(&projects);
+
+        // Age the file beyond a one-day retention window.
+        let aged = std::time::SystemTime::now() - Duration::from_secs(10 * 24 * 60 * 60);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(aged)
+            .unwrap();
+
+        let session = DiscoveredSession {
+            path,
+            project: "data-myapp".into(),
+            session_id: UUID_A.into(),
+            is_subagent: false,
+            source: "qoder".into(),
+        };
+        let store = TrajectoryStore::new_with_path(&base.join("t.db")).unwrap();
+
+        // Expired: skipped by the pre-check before any conversion.
+        assert!(!process_session(&store, &session, 1).unwrap());
+        assert_eq!(store.count().unwrap(), 0);
+
+        // Widened window (0 disables the pre-check): the unchanged file must
+        // now be ingested instead of matching the retention skip's state.
+        assert!(
+            process_session(&store, &session, 0).unwrap(),
+            "a widened retention window must re-admit the previously skipped file"
+        );
+        assert_eq!(store.count().unwrap(), 1);
+    }
+
+    #[test]
     fn test_scan_once_ingests_and_skips_unchanged() {
         let base = tmp_dir("scan");
         let projects = base.join("projects");
@@ -260,7 +369,7 @@ mod tests {
         let config = CollectorConfig {
             scan_interval_secs: 1,
             scan_dirs: Some(vec![projects.clone()]),
-            db_path: base.join("t.db"),
+            maintenance: TrajectoryMaintenancePolicy::default(),
         };
 
         scan_once(&store, &config);
@@ -286,6 +395,41 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_once_ingests_a_session_with_a_torn_utf8_tail() {
+        let base = tmp_dir("torn-tail");
+        let projects = base.join("projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        let path = write_session(&projects);
+
+        // An agent killed mid-write can leave a partial record whose last
+        // bytes cut a multi-byte character in half, so the file is no longer
+        // valid UTF-8.
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.extend_from_slice(
+            b"{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"\xe4\xb8",
+        );
+        std::fs::write(&path, &bytes).unwrap();
+
+        let store = TrajectoryStore::new_with_path(&base.join("t.db")).unwrap();
+        let config = CollectorConfig {
+            scan_interval_secs: 1,
+            scan_dirs: Some(vec![projects]),
+            maintenance: TrajectoryMaintenancePolicy::default(),
+        };
+
+        scan_once(&store, &config);
+
+        // The truncated record is dropped, but the complete records before it
+        // still ingest: one bad tail must not discard the whole session.
+        assert_eq!(store.count().unwrap(), 1);
+        let rec = store.get(UUID_A).unwrap().unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&rec.atif_json).unwrap();
+        assert_eq!(doc["agent"]["model_name"], "qwen-max");
+        assert_eq!(rec.total_prompt_tokens, Some(10));
+        assert_eq!(rec.end_time.as_deref(), Some("2026-07-25T10:00:02Z"));
+    }
+
+    #[test]
     fn test_run_collector_loop_stops_on_flag() {
         let base = tmp_dir("loop");
         let projects = base.join("projects");
@@ -295,21 +439,32 @@ mod tests {
         let config = CollectorConfig {
             scan_interval_secs: 1,
             scan_dirs: Some(vec![projects]),
-            db_path: base.join("t.db"),
+            maintenance: TrajectoryMaintenancePolicy {
+                retention_days: 1,
+                max_db_size_mb: 1,
+            },
         };
+        let db_path = base.join("t.db");
+        let store = Arc::new(TrajectoryStore::new_with_path(&db_path).unwrap());
+        scan_once(&store, &config);
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute("UPDATE collected_trajectories SET collected_at_ns = 1", [])
+            .unwrap();
+        let loop_store = Arc::clone(&store);
         let stop = Arc::new(AtomicBool::new(true));
         let stop_clone = Arc::clone(&stop);
         let config_clone = config.clone();
         let handle = std::thread::spawn(move || {
-            run_collector_loop(&config_clone, &stop_clone);
+            run_collector_loop(loop_store, &config_clone, &stop_clone);
         });
 
         std::thread::sleep(Duration::from_millis(1500));
         stop.store(false, Ordering::SeqCst);
         handle.join().unwrap();
 
-        // The first immediate scan must have ingested the session.
-        let store = TrajectoryStore::new_with_path(&config.db_path).unwrap();
+        // The caller-owned row remains even though its collection timestamp is
+        // expired, proving the collector loop never runs lifecycle maintenance.
         assert_eq!(store.count().unwrap(), 1);
     }
 
@@ -330,7 +485,7 @@ mod tests {
         let config = CollectorConfig {
             scan_interval_secs: 1,
             scan_dirs: Some(vec![projects]),
-            db_path: base.join("t.db"),
+            maintenance: TrajectoryMaintenancePolicy::default(),
         };
 
         scan_once(&store, &config);
@@ -355,7 +510,7 @@ mod tests {
         let config = CollectorConfig {
             scan_interval_secs: 1,
             scan_dirs: Some(vec![sessions_root]),
-            db_path: base.join("t.db"),
+            maintenance: TrajectoryMaintenancePolicy::default(),
         };
 
         scan_once(&store, &config);
@@ -370,6 +525,46 @@ mod tests {
         assert_eq!(doc["agent"]["version"], "0.146.0");
         assert_eq!(doc["extra"]["cwd"], "/w/demo-app");
         assert_eq!(doc["steps"].as_array().unwrap().len(), 2);
+        assert_eq!(rec.first_user_message.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn test_scan_once_reads_a_bom_prefixed_rollout() {
+        let base = tmp_dir("codex-bom");
+        // The same rollout the routing test ingests, with the byte-order mark
+        // Windows tooling adds when a file is saved as "UTF-8 with BOM" or
+        // copied through PowerShell. The mark lands on the first line only,
+        // and for a Codex rollout that line is `session_meta` — the sole
+        // source of the session cwd (the project column), the CLI version and
+        // the session id.
+        let sessions_root = base.join(".codex").join("sessions");
+        let nested = sessions_root.join("2026").join("08");
+        std::fs::create_dir_all(&nested).unwrap();
+        let content = concat!(
+            "\u{feff}{\"timestamp\":\"2026-08-03T09:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"session_id\":\"s-1\",\"cwd\":\"/w/demo-app\",\"cli_version\":\"0.146.0\"}}\n",
+            "{\"timestamp\":\"2026-08-03T09:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"hi\"}}\n",
+            "{\"timestamp\":\"2026-08-03T09:00:02Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}}\n",
+        );
+        std::fs::write(nested.join("rollout-c0ffee.jsonl"), content).unwrap();
+
+        let store = TrajectoryStore::new_with_path(&base.join("t.db")).unwrap();
+        let config = CollectorConfig {
+            scan_interval_secs: 1,
+            scan_dirs: Some(vec![sessions_root]),
+            maintenance: TrajectoryMaintenancePolicy::default(),
+        };
+
+        scan_once(&store, &config);
+        assert_eq!(store.count().unwrap(), 1);
+
+        let rec = store.get("rollout-c0ffee").unwrap().unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&rec.atif_json).unwrap();
+        assert_eq!(
+            rec.project, "demo-app",
+            "the marked session_meta still carries the project"
+        );
+        assert_eq!(doc["agent"]["version"], "0.146.0");
+        assert_eq!(doc["extra"]["cwd"], "/w/demo-app");
         assert_eq!(rec.first_user_message.as_deref(), Some("hi"));
     }
 }

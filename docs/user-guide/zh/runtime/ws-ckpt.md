@@ -1,6 +1,6 @@
 # 工作区快照（ws-ckpt）
 
-ws-ckpt 为 AI Agent 提供毫秒级工作区快照和回滚能力。它利用文件系统 COW（Copy-on-Write）技术创建即时快照，支持安全实验和快速恢复。
+ws-ckpt 利用文件系统 COW（Copy-on-Write）快照为 AI Agent 提供工作区检查点和回滚能力，支持安全实验和恢复；实际耗时取决于文件系统、工作负载和运行环境。
 
 ---
 
@@ -8,8 +8,8 @@ ws-ckpt 为 AI Agent 提供毫秒级工作区快照和回滚能力。它利用�
 
 AI Agent 修改代码、配置或数据文件时，误操作代价高昂。ws-ckpt 允许 Agent（和用户）：
 
-- 在风险操作前创建即时快照
-- 毫秒内回滚到任意历史检查点
+- 在风险操作前创建 COW 快照
+- 按需回滚到历史检查点
 - 比较检查点之间的差异
 - 通过插件集成自动创建检查点
 
@@ -74,17 +74,50 @@ OpenClaw 插件要求 OpenClaw >= 2026.2.13；这是 config 写入路径首次�
 | `ws-ckpt checkpoint -w <workspace> -s <snapshot-id> -m <message> [--metadata <json>]` | 创建新检查点 |
 | `ws-ckpt rollback -w <workspace> -s <snapshot> [--preview]` | 回滚到指定检查点 |
 | `ws-ckpt rollback -w <workspace> -n <num-ancestors>` | 回滚 N 个祖先版本 |
-| `ws-ckpt list [-w <workspace>] [--format table\|json]` | 列出所有检查点 |
+| `ws-ckpt list [-w <workspace>] [--orphans] [--format table\|json] [--limit N] [--cursor TOKEN]` | 列出检查点；默认自动翻页 |
 | `ws-ckpt diff -w <workspace> -f <from> [-t <to>]` | 显示检查点间差异 |
-| `ws-ckpt delete [-w <workspace>] -s <snapshot> [--force]` | 删除指定检查点 |
+| `ws-ckpt delete [-w <workspace>] -s <complete-id> [--force]` | 删除指定检查点 |
 | `ws-ckpt status [-w <workspace>] [--format table\|json]` | 查看工作区状态 |
 | `ws-ckpt cleanup -w <workspace> [--keep 20]` | 清理旧检查点 |
 | `ws-ckpt config [-g \| -w <workspace>] [--enable-auto-cleanup] [--auto-cleanup-keep <N\|Nd>]` | 查看/编辑配置 |
 | `ws-ckpt plugin install --runtime openclaw\|hermes` | 安装运行时插件 |
 | `ws-ckpt plugin uninstall --runtime openclaw\|hermes` | 卸载运行时插件 |
-| `ws-ckpt recover [-w <workspace> \| --all] [--force]` | 从中断操作中恢复 |
+| `ws-ckpt recover [-w <workspace> \| --all] [--force]` | 将工作区恢复为普通目录，或还原中断初始化的备份 |
+| `ws-ckpt unregister -w <workspace> [--force]` | 仅在子卷丢失时解除注册；不恢复数据 |
 | `ws-ckpt reload` | 重载 daemon 配置 |
 | `ws-ckpt daemon [--mount-path ...] [--socket ...] [--log-level ...]` | 启动 daemon 进程 |
+
+### 查询大量快照
+
+`list` 内部使用按字节限制的游标分页。不指定 `--limit` 和 `--cursor` 时，CLI 会自动
+跟随所有游标，并保持原有输出契约：JSON 输出单个数组，表格输出完整列表。若后续页面
+失败，JSON 不会输出不完整数组，并以非零状态退出。
+
+指定 `--limit` 或 `--cursor` 时只读取一页：
+
+```bash
+ws-ckpt list -w /home/user/projects/my-project --limit 1000 --format json
+ws-ckpt list -w /home/user/projects/my-project --limit 1000 --cursor '<next_cursor>' --format json
+ws-ckpt status -w /home/user/projects/my-project --format json
+```
+
+`--orphans` 同样使用分页，只返回恢复的 orphan 快照。续翻时必须保持该过滤条件不变。
+
+显式分页的 JSON 是包含 `snapshots` 和 `next_cursor` 的对象。分页按
+`(created_at, workspace_id, snapshot_id)` 升序排列。游标是不透明且带版本的，并绑定
+原始工作区范围和第一页的上界（首次索引扫描观察到的最大键，而非当前时间）。上界之后
+的新快照不会混入，位于上界内的并发插入以及
+删除仍可能影响后续页。如需无变更的时点列表，应在遍历期间暂停 checkpoint 和 cleanup。
+
+Daemon 从内存中的快照索引读取每一页，不扫描快照文件内容。每页仍重新扫描查询范围：
+N 条快照、P 页需要 O(N * P) 次索引访问，另加候选维护和渲染。只有入选候选键会被复制，
+但重复扫描仍然存在；不承诺固定延迟。页面目标约为 1 MiB，且不会超过
+16 MiB IPC 帧上限。如果单条记录的可选 `message` 或 `metadata` 会导致超限，该记录会以
+`detail: "summary"` 和 `omitted_fields` 返回。保留的 `created_at`、`pinned`、`missing`
+仍位于 `meta` 下，与完整记录一致；省略字段缺席，不返回 null。快照仍可通过 ID 操作。
+查询数量或健康状态
+应使用 `status`。`cleanup --keep N` 可以缩减历史，但会删除旧的未固定快照。分页需要
+新版 daemon；旧的非分页请求保持兼容。
 
 ### 示例
 
@@ -113,6 +146,81 @@ ws-ckpt cleanup -w /home/user/projects/my-project --keep 20
 # 为工作区启用自动清理
 ws-ckpt config -w /home/user/projects/my-project --enable-auto-cleanup --auto-cleanup-keep 7d
 ```
+
+### cleanup 中断后的快照恢复
+
+重启后，daemon 会删除普通、未 pinned 快照的缺失记录，并修复父子链关系。
+Pinned 快照和 guarded evidence 保留 unavailable 状态；`list` 显示缺失标记，
+`diff` 返回 `SnapshotNotFound`。当目标 subvolume 已不存在时，`delete` 同样返回
+`SnapshotNotFound`，删除普通记录并保留 guarded evidence。Pinned 记录仍需要
+`--force`。
+
+磁盘上存在而索引中缺失的快照目录会登记为 **pinned 的恢复孤儿**。
+原来的保护状态、消息、metadata、创建时间和祖先关系均未知；显示的时间为恢复时间，
+并非原始创建时间。Count/Age 清理会跳过这些快照，创建新 checkpoint 和再次重启后
+保护仍然有效。若 ID 仍有 guarded receipt，则不会将身份未经验证的孤儿关联到该 ID。
+
+可以单独查询恢复孤儿，将其与普通 pinned 快照区分；确认不再需要后再显式删除：
+
+```bash
+ws-ckpt list -w "/path/to/workspace" --orphans --format json
+ws-ckpt delete -w "/path/to/workspace" -s "complete-snapshot-id" --force
+```
+
+省略 `-w` 可查询所有工作区的恢复孤儿。JSON 包含完整 `id`、`workspace` 和
+`meta.pinned`，表格同样显示保护状态。恢复孤儿在显式删除前会持续占用磁盘空间。
+
+**delete 只接受完整 ID**，带或不带 `-w` 都不会退回短前缀匹配，`--force` 也不例外。
+若多个工作区存在相同的完整 ID，必须指定 `-w`。其他命令保留原有前缀匹配能力。
+使用 `--orphans` 和精确删除语义时，请同步升级 CLI 和 daemon。
+
+恢复只对账已完成的删除，不会继续执行中断前尚未完成的清理计划；
+需要再次运行 `cleanup` 完成普通快照的保留清理。
+
+### 恢复中断的初始化与悬空注册
+
+恢复确认信息由 daemon 提供：别名、父目录软链接和 `..` 会解析到同一个已注册工作区。
+提示显示其注册路径和恢复时将删除的快照目录数量，包括尚未记录在索引中的快照。
+执行使用已解析的工作区 ID，并再次检查目标和删除集合；若发生变化，请重新运行命令
+并确认新的预览。`--force` 跳过交互提示，但仍执行预览与校验。请同步更新 CLI 和
+daemon；不支持恢复预览的旧 daemon 无法执行此 CLI 流程。
+
+正常情况下，`recover` 将已注册工作区复制回普通目录，再删除受管子卷和快照。
+如果初始化被中断，按以下状态处理：
+
+| 状态 | 处理方式 |
+|------|----------|
+| 只有 `<workspace>.pre-init-bak`，没有历史子卷 | 重新运行 `init`；它会先还原备份，再初始化。原路径必须不存在、为空目录或为 symlink。 |
+| 未注册，但备份和迁移中的子卷都存在 | 运行 `recover -w <workspace>`，还原完整备份，保留可能不完整或包含较新内容的子卷及快照，并输出位置供检查。随后可以重新 `init`。 |
+| 已注册，但 live 子卷已丢失 | `recover` 会明确报告缺失；运行 `unregister -w <workspace>` 解除悬空注册，保留仍存在的恢复资料。 |
+
+恢复备份不会覆盖非空目录或普通文件。若原路径已有其他数据，先检查并移走这些数据。
+已注册工作区恢复成功后若仍有 `.pre-init-bak`，会将其归档为
+`.pre-init-bak.recovered`（位置已占用时追加数字后缀），保留内容并输出位置，
+避免阻断下一次 `init`。若归档失败，提示会列出备份位置，需要先检查并移走备份再初始化。
+`recover --all` 只处理已注册工作区；未注册的中断初始化必须通过原工作区路径指定。
+
+```bash
+ws-ckpt recover -w /path/to/workspace --force
+```
+
+`unregister` 接受已注册的路径或 workspace ID；当 live 子卷仍存在时会拒绝操作。
+它不会恢复数据，也不会删除快照或 `.pre-init-bak`。原索引移至
+`<state-dir>/indexes/<ws_id>.unregistered`，避免下一次初始化继承旧元数据；若该位置
+已被占用，命令会拒绝覆盖。命令会列出实际存在的保留位置，供后续手工恢复或清理使用。
+若 daemon 在归档索引后、持久化注销前退出，启动时会先还原该索引及其策略，
+再加载仍在注册记录中的工作区。
+仅指向缺失子卷的受管 symlink 会被移除，原路径上的其他文件或目录会保留。
+若快照或索引归档仍占用旧 ID，下一次初始化会分配新的 ID。
+
+```bash
+ws-ckpt unregister -w /path/to/workspace --force
+mkdir -p /path/to/workspace
+ws-ckpt init -w /path/to/workspace
+```
+
+两条命令默认要求交互确认；`--force` 仅跳过确认，不允许覆盖冲突数据，也不会让
+`unregister` 接受仍有 live 子卷的工作区。
 
 ### diff 输出标记
 

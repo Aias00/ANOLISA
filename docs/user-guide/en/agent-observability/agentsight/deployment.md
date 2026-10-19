@@ -10,13 +10,15 @@ two.
 
 | Requirement | Value |
 |---|---|
-| OS | Linux x86_64 |
+| OS | Linux x86_64 or ARM64 (raw package) |
 | Kernel | >= 5.8 with BTF (`/sys/kernel/btf/vmlinux` must exist) |
 | Privileges | root, or `CAP_BPF` + `CAP_PERFMON` |
 | Build toolchain (source only) | Rust >= 1.80, clang/llvm >= 15, libbpf >= 0.8, Node.js for the Dashboard |
 
 clang 14 and older optimise away a length clamp the eBPF verifier requires, so `sslsniff` and
 `tcpsniff` fail to load. Use clang 15+ when building from source.
+
+ARM64 package and CLI validation does not establish eBPF compatibility with a particular kernel.
 
 ## Packaged install with systemd (recommended)
 

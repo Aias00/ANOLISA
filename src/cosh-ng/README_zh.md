@@ -8,6 +8,11 @@ Assisted 模式，保留隐式自然语言路由、Skills、审批卡片和可�
 在启动时选择 Native 集成。自动化或其他 Agent 集成仍可使用结构化 JSON 和
 JSONL 接口。
 
+默认情况下，登录 shell（例如 `cosh --login`）会在 Bash 4+ 上以真实 login 身份
+启动 Bash；设 `shell.login_identity = false` 可保留旧的非 login（`--rcfile`）启动。
+有界的真实 login 身份能力探测失败、使用 Bash 3.2（如 macOS 系统 bash），或父会话导出了 POSIX
+启动无法导入的函数名时，cosh 会自动回退。
+
 ## 为什么使用 cosh-ng
 
 | 传统终端 | cosh-ng |
@@ -50,7 +55,7 @@ curl -fsSL https://get.agentic-os.sh | bash -s -- --cosh-ng --install-mode syste
 curl -fsSL https://get.agentic-os.sh | bash -s -- --cosh-ng --install-mode system --uninstall
 ```
 
-在 macOS arm64 上改用 user 范围：
+在 macOS 11+ (arm64 / x86_64) 上改用 user 范围：
 
 ```bash
 curl -fsSL https://get.agentic-os.sh | bash -s -- --cosh-ng --backend raw --install-mode user
@@ -64,9 +69,13 @@ sudo yum install cosh-ng
 ```
 
 当前发布的 Linux raw 契约无法覆盖所有已路由的发行版，因此不作为推荐的
-Linux 安装路径。raw 包支持 macOS arm64，但依赖 Linux 的软件包和服务操作
+Linux 安装路径。raw 包支持 macOS 11+ (arm64 / x86_64)，但依赖 Linux 的软件包和服务操作
 不可用。源码构建仅供贡献者使用，请参阅
 [开发者入门指南](../../docs/developer-guide/zh/cosh-ng/getting-started.md)。
+
+发版构建矩阵也会生成 macOS x86_64（Intel）raw 包，与 arm64 一样要求 macOS 11.0
+或更新版本。包含此构建支持的版本发布后，Intel 产物可从 GitHub Releases 获取；
+上面的公共安装入口还需要发布 Intel ANOLISA CLI，并单独开放官网安装脚本。
 
 ## 30 秒开始使用
 
@@ -90,6 +99,11 @@ Shell，同时仍可获得命令执行后的洞察。再次按下即可返回 As
 （或单次会话使用 `COSH_SHELL_STATUS_SYMBOLS=1`）后，每个提示符上方会显示
 `◇`（Assisted）或 `◌`（Shell-only）状态行。默认关闭。
 
+登录时，`cosh-shell` 会在后台检查托管安装的 `cosh-ng` 是否有可用更新，并在
+下一个空闲提示符处显示提示。该检查默认开启；设置 `COSH_SHELL_UPGRADE_CHECK=off`
+可在下一次会话禁用检查。完整的关闭取值与缓存路径见
+[登录升级提示](../../docs/user-guide/zh/user-entrypoint/cosh-ng/configuration.md#登录升级提示)。
+
 如果会话要求完全不加载 Cosh Hook、不观察也不提供洞察，可显式启动 Native。
 
 ```bash
@@ -111,9 +125,13 @@ bash: hello: command not found
 会打开一次性 Composer，可在开头指定 `/skill:<name>`，并添加经过验证的工作空间内
 `@路径`引用。在 Composer 中输入 `/` 可浏览 slash 命令，用上/下键选择、Enter 执行。
 需要填写参数时先按 Tab 补全；带参数或多行的草稿由 Enter 按原文提交。
-普通 Shell prompt 保留原生路径补全。
+普通 Shell prompt 保留原生路径补全。运行 `/bug <description>` 可输出经过预填、
+可检查的 GitHub issue URL。命令不会读取日志或提交 issue；本地日志目录存在时，
+只会提醒你自行检查、脱敏并粘贴相关内容。
 
-`cosh-core` 中的配置 Hook 默认启用，无需设置 `hooks.enabled = true`。
+`cosh-core` 中的系统和用户配置 Hook 默认启用，无需设置 `hooks.enabled = true`。
+项目配置中的 Hook 定义被忽略；`.cosh/hooks` 中的项目 Shell Hook 另由
+`/hooks trust-project` 授权。
 显式设置 `hooks.enabled = false` 后，即使安装了 Extension，配置 Hook 也保持禁用。
 禁用范围和 `PreToolUse` 默认阻断行为详见
 [Hooks](../../docs/user-guide/zh/user-entrypoint/cosh-ng/core/hooks.md)。
@@ -243,6 +261,10 @@ Checkpoint policy 同时作用于 Runtime 启动前和获批的 Runtime-native e
 error 或 uncertain result 不能授权 effect。`On` 只有在存在准确 checkpoint evidence 时才
 放行，否则 fail closed；`Off` 既不创建 baseline，也不建立逐 effect barrier。
 
+当前 ws-ckpt 支持为空 workspace 创建 checkpoint。若旧 daemon 跳过初始快照，`On`
+会在 Runtime 启动前终止 Task。升级 ws-ckpt 或添加文件后提交新 Task；若无需 checkpoint
+保护，也可显式选择 `Off`。失败的 Task 已进入终态，`retry` 不会重建失败的 baseline。
+
 托管 Core 使用封闭的 `workspace-write-v1` profile，只提供 `ask_user_question` 与
 `write_file`。每次写入都是 Runtime-native permission decision；只有 Gateway approval
 以及所需 checkpoint barrier 完成后，Core 才会执行。现有 pinned workspace filesystem
@@ -304,6 +326,10 @@ catalog 的两个条目都声明拥有本地用户权限，即使 token 位于�
 
 仓库为 direct ACP path 提供 Fake Adapter conformance coverage。具体安装在投入生产前，仍需
 另行执行真实 Codex/Claude Adapter 检查与人工 Terminal 验收。
+
+`cosh-cli checkpoint recover --workspace <path>` 支持由 ws-ckpt daemon 恢复
+中断初始化；若还有数据保留供检查，成功 JSON 的 `meta.warning` 会说明位置。
+详见[工作区快照](../../docs/user-guide/zh/user-entrypoint/cosh-ng/cli/checkpoint.md)。
 
 ## 文档
 

@@ -96,6 +96,7 @@ fn request_case_name(value: &local::WsCkptRequest) -> &'static str {
         local::WsCkptRequest::GuardedRollbackEvidenceV2 { .. } => {
             "request/guarded_rollback_evidence_v2"
         }
+        local::WsCkptRequest::Unregister { .. } => "request/unregister",
     }
 }
 
@@ -114,6 +115,7 @@ fn error_case_name(value: &local::WsCkptErrorCode) -> &'static str {
         local::WsCkptErrorCode::DiskSpaceInsufficient => "error/disk_space_insufficient",
         local::WsCkptErrorCode::CwdOccupied => "error/cwd_occupied",
         local::WsCkptErrorCode::CwdScanFailed => "error/cwd_scan_failed",
+        local::WsCkptErrorCode::UnsupportedWorkspacePath => "error/unsupported_workspace_path",
     }
 }
 
@@ -157,6 +159,8 @@ fn response_case_name(value: &local::WsCkptResponse) -> &'static str {
         local::WsCkptResponse::GuardedRollbackV2Rejected { .. } => {
             "response/guarded_rollback_v2_rejected"
         }
+        local::WsCkptResponse::RecoverWithWarning { .. } => "response/recover_with_warning",
+        local::WsCkptResponse::UnregisterOk { .. } => "response/unregister_ok",
     }
 }
 
@@ -263,6 +267,9 @@ fn request_cases() -> Vec<(&'static str, local::WsCkptRequest)> {
             operation_id: "ckp_2".into(),
             operation_digest: [0x44; 32],
         },
+        local::WsCkptRequest::Unregister {
+            workspace: "/ws".into(),
+        },
     ];
     samples
         .into_iter()
@@ -285,6 +292,7 @@ fn error_cases() -> Vec<(&'static str, local::WsCkptErrorCode)> {
         local::WsCkptErrorCode::DiskSpaceInsufficient,
         local::WsCkptErrorCode::CwdOccupied,
         local::WsCkptErrorCode::CwdScanFailed,
+        local::WsCkptErrorCode::UnsupportedWorkspacePath,
     ];
     samples
         .into_iter()
@@ -491,6 +499,14 @@ fn response_cases() -> Vec<(&'static str, local::WsCkptResponse)> {
             code: local::GuardedRollbackRejectionCodeV2::DiffMismatch,
             message: "live diff changed".into(),
         },
+        local::WsCkptResponse::RecoverWithWarning {
+            workspace: "/ws".into(),
+            warning: "backup retained".into(),
+        },
+        local::WsCkptResponse::UnregisterOk {
+            workspace: "/ws".into(),
+            retained_paths: vec!["/snapshots/ws-id".into()],
+        },
     ];
     samples
         .into_iter()
@@ -577,6 +593,10 @@ fn rollback_rejection_cases() -> Vec<(&'static str, local::GuardedRollbackReject
         ),
         ("rollback_rejection/cwd_occupied", Code::CwdOccupied),
         ("rollback_rejection/cwd_scan_failed", Code::CwdScanFailed),
+        (
+            "rollback_rejection/unsupported_workspace_path",
+            Code::UnsupportedWorkspacePath,
+        ),
     ]
 }
 

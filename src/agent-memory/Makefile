@@ -8,6 +8,8 @@
 
 VERSION ?= $(shell grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
 NAME := agent-memory
+NPM_INSTALL ?= install
+PLUGIN_BUILD_ARGS ?=
 
 # Remote Linux dev host used by remote-* targets.
 REMOTE_HOST ?= aos2
@@ -118,7 +120,7 @@ build-openclaw-plugin: sync-versions generate-component-contract ## Build opencl
 	# constraint is intentionally permissive (the plugin uses only the
 	# stable plugin-sdk surface), so we keep --legacy-peer-deps until
 	# openclaw publishes a semver-compatible package range.
-	cd $(OPENCLAW_PLUGIN_SRC_DIR) && npm install --legacy-peer-deps --no-audit --no-fund
+	cd $(OPENCLAW_PLUGIN_SRC_DIR) && npm $(NPM_INSTALL) --legacy-peer-deps --no-audit --no-fund
 	# esbuild (what `npm run build` runs) strips types without checking them, so
 	# a type error in src/ or tests/ still produces a dist/index.js. Nothing else
 	# in the packaging pipeline would catch it either: agent-memory.spec.in's
@@ -132,9 +134,14 @@ build-openclaw-plugin: sync-versions generate-component-contract ## Build opencl
 	# (here and again in `test-openclaw-plugin`) is idempotent and costs ~4 s.
 	@echo "==> Type-checking $(NAME) OpenClaw plugin (tsc --noEmit)..."
 	cd $(OPENCLAW_PLUGIN_SRC_DIR) && npm run build:check
-	cd $(OPENCLAW_PLUGIN_SRC_DIR) && npm run build
+	cd $(OPENCLAW_PLUGIN_SRC_DIR) && npm run build -- $(PLUGIN_BUILD_ARGS)
 	@test -f $(OPENCLAW_PLUGIN_SRC_DIR)/dist/index.js \
 	    || { echo "ERROR: $(OPENCLAW_PLUGIN_SRC_DIR)/dist/index.js was not produced"; exit 1; }
+
+.PHONY: build-openclaw-plugin-ci
+build-openclaw-plugin-ci: ## Build the plugin from locked dependencies without version repair
+	python3 packaging/raw/verify-release.py .
+	$(MAKE) build-openclaw-plugin NPM_INSTALL=ci PLUGIN_BUILD_ARGS=--metafile=dist/build-meta.json
 
 build-debug: ## Build debug binary
 	cargo build --locked
@@ -188,6 +195,13 @@ test-tools: ## Run Tier A file-tool integration tests only
 # depends on `sync-versions`, which needs `jq`, and the PR job's system packages
 # are only libsystemd-dev + cmake. build:check needs nothing beyond the
 # devDependencies installed just above.
+#
+# This target also deliberately ignores the `NPM_INSTALL` knob that
+# `build-openclaw-plugin-ci` uses to drive `build-openclaw-plugin`. That knob
+# exists so the raw-prebuilt packaging path can swap `install` for `ci` on the
+# *build*; a gate has no such choice to make — it is `ci` unconditionally, and
+# neither caller (`package-source` and the per-PR `Test agent-memory` job)
+# overrides it.
 test-openclaw-plugin: ## Type-check + run openclaw adapter TS unit tests (needs npm registry)
 	@echo "==> Installing openclaw adapter dependencies (npm ci, lockfile-pinned)..."
 	cd $(OPENCLAW_PLUGIN_SRC_DIR) && npm ci --legacy-peer-deps --no-audit --no-fund

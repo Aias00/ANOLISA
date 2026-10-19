@@ -1,5 +1,95 @@
 # Changelog
 
+## 0.14.1
+
+### Features
+- Accept `--db` in the query commands. (#7478)
+- Content-probe unknown executables for static BoringSSL, with negative caching of misses.
+- Support explicit prebuilt targets and build prebuilt agentsight artifacts in CI.
+
+### Fixes
+- Map OpenAI, Claude, Qwen3, InternLM, Baichuan, phi-3-small and yi-9b-chat model names to real, loadable tokenizers.
+- Parse Gemini streaming responses, honor final Anthropic usage, fold whole-message chat SSE snapshots, and parse CR-ended SSE lines. (#7329, #7193, #7398)
+- Aggregate HTTP/2 responses that finish before the request, cut chunked terminators only at line boundaries, and honor previously inert HTTP config options. (#6562)
+- Keep unindexed and nameless tool calls apart, match late results by tool call, and retain mixed tool results. (#7385)
+- Exempt trusted sinks by address, let exec wildcard basenames match any command, and map every legacy rule verb to an enforcement mode.
+- Preserve numeric JSON keys, null payload members, evidence numbers, and full cost signatures; keep every skill in reports and tolerate null agent names in CSV export. (#7451, #7032, #7403, #7413)
+- Treat CJK punctuation and pipes as literal delimiters, and keep health reporting working with a pre-epoch clock. (#7488, #7479, #7239)
+- Merge case-variant agents and models across filters, token breakdowns and model series. (#7456, #7184)
+- Isolate SQLite maintenance, serialize opt-store migration, and warn when purge stalls within the size limit.
+- Bound payload memory lifetimes and the protection scan directory. (#6781)
+- Harden audit windows, ATIF token totals and session ids, containment snapshots, and grounding evidence matching. (#7326, #7467)
+- Fix dashboard pagination, ranking refresh, cached-only step metrics, idle gaps, and timestamp precision. (#7183, #7093, #7091, #7089, #7095)
+- Let recap-only sessions materialize, retain captured session children, and split analyzer call kinds.
+- Gate server-only modules behind the server feature.
+
+## 0.14.0
+
+### Features
+- Unify SQLite storage under one configurable total cap (default 2200 MB); the largest databases are trimmed first and the cap is re-read without a restart.
+
+### Fixes
+- Preserve and correctly count streamed content, reasoning, tool calls, response IDs, finish reasons, and token usage across Anthropic, Gemini, Codex, and Responses providers.
+- Make agent discovery, trajectory filtering, reuse labels, semantic search, dashboard metrics, savings, and interruption aggregates more accurate and robust.
+- Harden enforcement, credential discovery, IMDSv2 access, BPF polling, process restart, OOM detection, and audit/event validation paths.
+- Make SQLite maintenance, storage budgeting, UTF-8 handling, SSE/HPACK parsing, and time handling resilient to malformed or edge-case input.
+- Support legacy kernel enforcement, wrapped inode guard labels, legacy function-call tool requests, and additional process/file reference formats.
+
+### Tests
+- Expand provider, SLS, trajectory, dashboard filter, storage-budget, and enforcement regression coverage.
+
+## 0.13.1
+
+### Features
+- Add JSON output and graceful CLI errors.
+
+### Fixes
+- Resolve namespace PIDs to host PIDs with an init-namespace self-check. (#3041)
+- Honor the RUST_LOG regex in the main logger. (#3186)
+- Add inode guard support for file-delete-guard on 5.10/6.6 kernels.
+- Drop the trace_id alias in the traces list. (#3261)
+- Fix a stale file descriptor in the enforcer ringbuf consumer after mmap advance.
+- Harden credential discovery.
+- Pin the drain trigger to membarrier.
+- Add a token-plan provider preset.
+- Recover empty tool_call names from request tool definitions.
+- Log semantic-search degradation causes. (#3443)
+- Harden the SQLite lifecycle.
+- Map qwen3.8-max to its tokenizer. (#3409)
+- Restore `agentsight-enforcer` automatically when an upgrade leaves a stale enforcement layout, so file-delete guard and enforcement health do not require manual cleanup. (#3445)
+- Keep an application's process tree under policy when its binding is recreated. (#3370)
+- Reject unsupported event filters on audit cases instead of silently ignoring them.
+
+## 0.13.0
+
+### Features
+- Add `GET /api/preferences` and `GET /api/preferences/export` to surface the
+  working habits inferred from recent conversations (language, plan-first
+  workflow, test expectations, correction patterns, tool leanings), with
+  `/api/preferences/turns` exposing the user turns an analysis was based on.
+  Analysis runs per request over `genai_events` on Linux or collected
+  trajectories elsewhere, so there is no derived state to migrate or go stale.
+- Add `GET /api/trajectories/steps` to find ATIF steps by derived category
+  (`user_input`, `system`, `agent_message`, `thinking`, `tool_call`,
+  `tool_result`), returning each hit with its neighbouring steps. Categories are
+  multi-label because a single agent step can carry a message, reasoning, tool
+  calls and observations at once.
+- Label trajectories for reuse triage, let a person settle a trajectory's label,
+  add the reuse-label review page, and gate search to serve labelled trajectory
+  history.
+- Add an inode guard for file-delete-guard on 5.10/6.6 kernels, with domain
+  isolation, violation events, and startup cleanup.
+
+### Fixes
+- Initialize logging in the macOS `trace` path so trajectory collection failures
+  surface instead of being silently dropped.
+- Add a token-plan provider preset.
+- Fix a stale fd in the enforcer ringbuf consumer after an mmap advance.
+- Drop the trace_id alias in the traces list. (#3261)
+- Honor the RUST_LOG regex in the main logger. (#3186)
+- Resolve namespace PID to host PID with an init-ns self-check. (#3041)
+- Add the conversation_id column before its index. (#3378)
+
 ## 0.12.1
 
 ### Breaking

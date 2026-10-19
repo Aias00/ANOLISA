@@ -9,6 +9,106 @@ Releases from 0.7.2 onward follow
 
 ## [Unreleased]
 
+## [0.8.7] - 2026-10-15
+
+### Fixed
+
+- JSON responses containing numbers that cannot retain their exact value during parsing now pass through unchanged. TOON conversion is used only when decoding preserves the same values and types, preventing silent numeric precision loss ([#7069](https://github.com/agentic-os-org/ANOLISA/pull/7069)).
+- OpenCode schema compression now preserves executable parameter validators and modifies only the model-facing JSON schema. Older hosts exposing only a runtime codec skip schema compression ([#7048](https://github.com/agentic-os-org/ANOLISA/pull/7048)).
+- Qwen Code and OpenCode uninstall scripts now honor `ANOLISA_DRY_RUN=1`, previewing removals without deleting plugin registrations or changing enablement settings ([#7348](https://github.com/agentic-os-org/ANOLISA/pull/7348)).
+- Compression and retrieval now warn when the statistics database cannot be opened while continuing to return their normal output. Missed statistics are not retried or replayed ([#7395](https://github.com/agentic-os-org/ANOLISA/pull/7395)).
+- Selective-Claw now aligns archived summaries with the current conversation window's recall IDs. Partial or rewritten turns no longer overwrite unrelated archived summaries ([#7042](https://github.com/agentic-os-org/ANOLISA/pull/7042)).
+- Release validation now accepts normalized Python prerelease wheel filenames while checking the original release-tag spelling separately, and rejects filenames that pip cannot install ([#5271](https://github.com/agentic-os-org/ANOLISA/pull/5271)).
+
+## [0.8.6] - 2026-10-14
+
+### Added
+
+- Add a QwenWorkCN local-mode adapter with command rewriting, response compression, and explicit desktop plugin sideloading. The adapter ships in raw, npm, and RPM packages; security-workspace/VM sessions are not supported ([#7257](https://github.com/agentic-os-org/ANOLISA/pull/7257)).
+
+### Changed
+
+- **Breaking:** The OpenClaw adapter now requires OpenClaw 2026.6.6 or newer and applies lossless compression to supported live tool results before the same-turn model request. Results are no longer compressed a second time during persistence. Legacy hosts such as 2026.8.2 may truncate text before middleware runs; Tokenless cannot restore that missing content, and builds containing upstream fix `2f620b970a04` are recommended ([#7124](https://github.com/agentic-os-org/ANOLISA/pull/7124)).
+
+### Fixed
+
+- Quiet, print-only `sed` commands using long options, combined flags, or multiple expressions now preserve HTML source correctly. Commands that modify content or read scripts from files no longer qualify as plain file reads ([#4963](https://github.com/agentic-os-org/ANOLISA/pull/4963)).
+- HTML inline code containing consecutive backticks now receives a long enough Markdown delimiter to preserve the code span ([#6393](https://github.com/agentic-os-org/ANOLISA/pull/6393)).
+- On macOS, RTK command rewriting no longer rejects an otherwise successful result when cleanup encounters a process group containing only its exited leader ([#7257](https://github.com/agentic-os-org/ANOLISA/pull/7257)).
+- Shared and Codex stdin hooks now ignore JSON payloads that are not objects, and Codex response diagnostics ignore invalid payload shapes, avoiding tracebacks on unsupported input ([#6691](https://github.com/agentic-os-org/ANOLISA/pull/6691), [#6663](https://github.com/agentic-os-org/ANOLISA/pull/6663)).
+- AgentScope 2.x and QwenPaw now pass malformed tool arguments through to the host instead of aborting the whole Agent reply; response processing remains lossless for those calls ([#5288](https://github.com/agentic-os-org/ANOLISA/pull/5288), [#5299](https://github.com/agentic-os-org/ANOLISA/pull/5299)).
+- Stats and Stash library warnings no longer interrupt successful compression, statistics reads, or retrieval when stderr is unwritable ([#6911](https://github.com/agentic-os-org/ANOLISA/pull/6911)).
+- Selective-Claw returns each requested turn only once and preserves first-request order, avoiding duplicated recall output and token usage ([#4859](https://github.com/agentic-os-org/ANOLISA/pull/4859)).
+- Selective-Claw history reconciliation now distinguishes tool results by call ID, tool identity, and error state, retaining distinct results even when their text is identical ([#7040](https://github.com/agentic-os-org/ANOLISA/pull/7040)).
+
+## [0.8.5] - 2026-10-11
+
+### Added
+
+- Expired SQLite Stash payloads are now reclaimed during successful writes, so compression-only workloads no longer require retrieval to clean up old payloads. This does not immediately shrink the database file or securely erase deleted data ([#3565](https://github.com/agentic-os-org/ANOLISA/pull/3565)).
+
+### Changed
+
+- Complete HTML page rendering is now enabled by default in the CLI, Runtime, and Python SDK. Disable it with `TOKENLESS_HTML_EXTRACTION_ENABLED=0` or SDK `html_extraction_enabled=False`; an empty environment value keeps the default. Git diff cropping remains opt-in ([#3473](https://github.com/agentic-os-org/ANOLISA/pull/3473)).
+
+### Fixed
+
+- Plain shell file reads such as `cat page.html` now keep HTML source verbatim across adapters that supply the command, including OpenClaw, DSH, QwenPaw, and AgentScope. JSON, tables, and other supported file data can still compress ([#3481](https://github.com/agentic-os-org/ANOLISA/pull/3481)).
+- A single leading byte-order mark no longer prevents HTML, JSON, tables, or stack traces from reaching their matching content handlers; recoverable transformations retain the original bytes ([#3486](https://github.com/agentic-os-org/ANOLISA/pull/3486), [#4888](https://github.com/agentic-os-org/ANOLISA/pull/4888)).
+- Bracketed tool output that is not one valid JSON document, including concatenated documents and NDJSON, now passes through unchanged instead of failing the PostTool call ([#4159](https://github.com/agentic-os-org/ANOLISA/pull/4159)).
+- Build/test commands wrapped in `env -i` or `env -u`, or using a Cargo `+toolchain`, retain their native output for build-log compression instead of being handed to RTK ([#4270](https://github.com/agentic-os-org/ANOLISA/pull/4270)).
+- RTK rewriting now enforces its deadline even when descendants keep stdout open after the parent exits, and cleans up the owned process group ([#3552](https://github.com/agentic-os-org/ANOLISA/pull/3552)).
+- Concurrent hooks can initialize or migrate the stats database without racing to add the same columns; failed migrations roll back together ([#3607](https://github.com/agentic-os-org/ANOLISA/pull/3607)).
+- Stats history and session-diff reports now order records by their actual timestamp, including mixed UTC offsets and sub-millisecond differences, so newest-record limits and compression chains remain correct ([#3848](https://github.com/agentic-os-org/ANOLISA/pull/3848)).
+- Failed stats and retrieval-event writes now emit a `[tokenless-stats]` warning while compression and retrieval continue, including when stderr itself is unwritable ([#3587](https://github.com/agentic-os-org/ANOLISA/pull/3587)).
+- Clean AgentScope 1.x installations now include the `greenlet` dependency required by newer SQLAlchemy versions. Positional application postprocessors are also chained correctly before Tokenless processing ([#3496](https://github.com/agentic-os-org/ANOLISA/pull/3496), [#3706](https://github.com/agentic-os-org/ANOLISA/pull/3706)).
+- Hermes preserves the full error envelope for failed or stopped shell calls, retaining diagnostics that may exist outside the output field ([#3815](https://github.com/agentic-os-org/ANOLISA/pull/3815)).
+- OpenCode forwards nonzero Bash exit codes for diagnosis, cleans up timed-out hooks and their descendants, and enforces the 1 MiB hook-output limit in UTF-8 bytes. Oversized hook responses leave the original tool output intact ([#4398](https://github.com/agentic-os-org/ANOLISA/pull/4398), [#3818](https://github.com/agentic-os-org/ANOLISA/pull/3818), [#4757](https://github.com/agentic-os-org/ANOLISA/pull/4757)).
+- OpenCode host edits to a returned tool schema no longer affect the cached schema used by later calls ([#4731](https://github.com/agentic-os-org/ANOLISA/pull/4731)).
+- Qwen Code adapter installation with `--dry-run` no longer invokes the host CLI, stamps manifests, or changes the active extension link ([#4397](https://github.com/agentic-os-org/ANOLISA/pull/4397)).
+- `npm rebuild` can now replace dangling `tokenless` and `rtk` launcher symlinks and complete repeated runs ([#4711](https://github.com/agentic-os-org/ANOLISA/pull/4711)).
+- OpenClaw binary discovery now skips same-named directories in `PATH`, allowing a later executable or executable symlink to be found ([#4855](https://github.com/agentic-os-org/ANOLISA/pull/4855)).
+- Selective-Claw turn recall now combines live and archived turns in request order and stays bound to the host session, preventing interleaved conversations from redirecting `expand_turn` ([#4670](https://github.com/agentic-os-org/ANOLISA/pull/4670), [#4782](https://github.com/agentic-os-org/ANOLISA/pull/4782)).
+- Selective-Claw keeps leading system or implicit turns distinct from later user turns and migrates older archives to matching ordinal turn IDs ([#4673](https://github.com/agentic-os-org/ANOLISA/pull/4673), [#4693](https://github.com/agentic-os-org/ANOLISA/pull/4693)).
+- Selective-Claw makes existing archive messages searchable when first creating its full-text index ([#4689](https://github.com/agentic-os-org/ANOLISA/pull/4689)).
+- Repeated Selective-Claw lifecycle calls no longer duplicate replacement conversation history, including after an engine restart ([#4700](https://github.com/agentic-os-org/ANOLISA/pull/4700)).
+- Selective-Claw restores structured host messages from the archive, preserving tool identities, content blocks, role aliases, and metadata when assembling stored context ([#4699](https://github.com/agentic-os-org/ANOLISA/pull/4699)).
+- Selective-Claw persists summaries for turns without a user message and includes summaries and fallback previews in context token estimates ([#4698](https://github.com/agentic-os-org/ANOLISA/pull/4698), [#4662](https://github.com/agentic-os-org/ANOLISA/pull/4662)).
+- Selective-Claw now honors OpenClaw `pluginConfig` options and expands `~/` archive paths, including the disabled registration setting ([#4822](https://github.com/agentic-os-org/ANOLISA/pull/4822)).
+
+## [0.8.4] - 2026-09-22
+
+### Added
+
+- Add a standalone installer and an `install-tokenless` OS Skill entry point alongside npm installation. The installer chooses npm or a Linux-only source build before installation starts, records owned paths for uninstall, and restores the previous installation if replacement fails. Source builds install only the CLI; npm also provides RTK and adapters ([#2322](https://github.com/alibaba/anolisa/pull/2322)).
+
+### Changed
+
+- npm installation now requires Node.js 16.7 or newer and preserves shared adapter resources owned by another installation. Users can explicitly replace them with `ANOLISA_TOKENLESS_FORCE_ADAPTERS=1`; otherwise, the installer reports the bundled adapter location ([#2322](https://github.com/alibaba/anolisa/pull/2322)).
+- Standalone uninstall removes only resources still owned by its install receipt, preserves runtime data unless `--purge` is requested, and retains adapter resources when framework deregistration cannot be verified. Codex plugins listed as `not installed` are recognized as successfully removed, so repeated uninstall can complete ([#2322](https://github.com/alibaba/anolisa/pull/2322), [#3412](https://github.com/alibaba/anolisa/pull/3412)).
+
+### Fixed
+
+- HTML extraction now keeps command output after the page's `</html>` end tag, such as build logs and HTTP status codes, after the rendered page instead of losing it. Text that imitates the page wrapper is escaped, and original recovery remains available ([#3386](https://github.com/alibaba/anolisa/pull/3386)).
+- HTML extraction no longer rejects shallow pages containing many self-closing SVG elements as excessively nested. Depth limits now follow the parsed page, and malformed markup or wide tables no longer trigger repeated scans that can delay tool results ([#3396](https://github.com/alibaba/anolisa/pull/3396)).
+
+## [0.8.3] - 2026-09-20
+
+### Added
+
+- Git diff context cropping can now retain all changed lines and file metadata while reducing surrounding context, with the received original available through recovery. Enable it with `TOKENLESS_DIFF_COMPRESSION_ENABLED=1` or SDK `diff_compression_enabled=True`; it is disabled by default and requires text replacement and recovery support ([#3299](https://github.com/alibaba/anolisa/pull/3299)).
+- Complete HTML pages from command or API results can now be rendered as Markdown with original recovery and counts of removed page elements. Enable it with `TOKENLESS_HTML_EXTRACTION_ENABLED=1` or SDK `html_extraction_enabled=True`; it is disabled by default, requires text replacement and recovery support, and preserves file reads, including HTML printed by shell file-reading commands ([#3306](https://github.com/alibaba/anolisa/pull/3306)).
+
+### Changed
+
+- npm installation now automatically enables the Claude Code adapter when the Claude CLI is available, and prints retry instructions when registration cannot finish ([#2193](https://github.com/alibaba/anolisa/pull/2193)).
+- QwenPaw installation now checks the matching SDK wheel before handing over the plugin bundle and reports a confirmed missing asset with its version and URL. Offline or mirrored installations can skip the probe with `ANOLISA_SKIP_WHEEL_PREFLIGHT=1` ([#3289](https://github.com/alibaba/anolisa/pull/3289)).
+
+### Fixed
+
+- Claude Code detection now retries a staged plugin within a bounded settling window with backoff, reducing false “not installed” results while the host registry catches up ([#3272](https://github.com/alibaba/anolisa/pull/3272)).
+- Raw packages now declare and include the OpenCode adapter and adapter manifest, enabling ANOLISA to discover and manage the bundled plugin. Restart OpenCode after enabling or disabling it ([#3324](https://github.com/alibaba/anolisa/pull/3324), [#3346](https://github.com/alibaba/anolisa/pull/3346)).
+
 ## [0.8.2] - 2026-09-15
 
 ### Added

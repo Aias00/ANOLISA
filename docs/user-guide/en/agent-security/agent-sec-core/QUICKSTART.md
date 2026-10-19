@@ -4,6 +4,9 @@
 
 AgentSecCore is an all-local security kernel for AI Agents. It runs entirely on the local machine with zero Token consumption, providing defense-in-depth: prompt injection detection, code scanning, skill integrity verification, PII detection, system hardening, and sandbox isolation.
 
+For the Rust V2 SkillSec core migration, see the [V2 guide](skillsec-v2.md).
+The release installation and Agent integrations below describe V1.
+
 ## Overview
 
 | Module | Description |
@@ -353,13 +356,20 @@ agent-sec-cli observability report --session-id <id> --format json
 
 ### Security Events
 
-Query the local security event store.
+Query the security event store. In the V2 CLI the query goes through the system
+daemon, which scopes every read to the kernel-authenticated caller: each user
+sees only its own events, while root sees events from all UIDs. Both use the
+original session ID with `--session-id`; root receives every matching event across
+UIDs. When session IDs collide, root response labels use `UID_session_id` to
+distinguish owners. Query filters always match the stored session ID literally.
+Output shapes are unchanged from V1: `--output json` is the event array with details,
+`jsonl` one event per line, `--count` a bare number, `--count-by` a JSON object.
 
 ```bash
 # Recent events (table format, default)
 agent-sec-cli events --last-hours 24
 
-# JSON output
+# JSON output (a plain array of events, details included)
 agent-sec-cli events --last-hours 24 --output json
 
 # Filter by category
@@ -374,11 +384,15 @@ agent-sec-cli events --count --last-hours 24
 # Breakdown by category
 agent-sec-cli events --count-by category --last-hours 24
 
-# Pagination
+# Pagination (--offset skips the newest rows; a large --limit is fetched page
+# by page, so it is never rejected by the page-size cap)
 agent-sec-cli events --offset 50 --limit 20
 
-# Security posture summary
+# Security posture summary (last 24 hours by default)
 agent-sec-cli events --summary
+
+# Root: follow a qualified session ID returned by a query
+agent-sec-cli events --session-id 1000_shared-session
 ```
 
 ### Agent Capability View
@@ -386,6 +400,10 @@ agent-sec-cli events --summary
 `agent-sec-cli capabilities` shows the hook capability view for Qoder, Qwen Code, Codex, Cosh, OpenClaw, and Hermes derived from environment variables visible to the current CLI process. It is not a runtime health check and does not prove that hooks are loaded, registered, or currently effective in the target Agent process.
 
 Run the command from the same shell/container/service environment that starts the target Agent when you want the closest approximation. The command does not read OpenClaw, Hermes, or other Agent configuration files, and it does not resolve Agent home directories; Agent config values such as enabled flags, policies, and timeouts can still make runtime behavior differ from this view.
+
+OpenClaw PII metadata lists both version-dependent input hooks. The runtime selects
+`before_agent_run` on stable `>=2026.5.12`, otherwise `before_dispatch`; the CLI
+does not inspect the host version. Check the plugin startup log for its selection.
 
 ```bash
 # All agents and all capabilities

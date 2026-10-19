@@ -2,15 +2,16 @@ use std::fs;
 
 use agentsight_audit::{
     AuditError as SecurityStoreError, AuditEventFilter as SecurityEventFilter,
-    AuditStore as SecurityStore, ContainmentAction, ContainmentActivationResult,
-    ContainmentClaimResult, ContainmentFailureStage, ContainmentLifecycle, RiskCase,
-    RiskCaseStatus, RiskSeverity,
+    AuditMaintenancePolicy, AuditStore as SecurityStore, ContainmentAction,
+    ContainmentActivationResult, ContainmentClaimResult, ContainmentFailureStage,
+    ContainmentLifecycle, RiskCase, RiskCaseStatus, RiskSeverity,
 };
 use agentsight_enforcement_protocol::{
     DestinationClass, Effect, EventIdentity, FileAction, NetworkAction, NetworkDirection,
     PolicyDecision, PolicyMode, SecurityEvent, SecurityEventKind, TaintTransition,
     TaintTransitionKind,
 };
+use agentsight_sqlite_lifecycle::MaintenanceStatus;
 use uuid::Uuid;
 
 fn containment_action(lifecycle_state: ContainmentLifecycle) -> ContainmentAction {
@@ -342,6 +343,169 @@ fn retention_keeps_shared_evidence_until_its_last_case_is_purged() {
 }
 
 #[test]
+fn maintenance_honors_disabled_and_enabled_retention() {
+    let path = security_db_path("maintenance-retention");
+    let store = SecurityStore::open(&path).expect("fixture store should open");
+    let event = fixture_file_action("~/.ssh/id_rsa", 1);
+    store.insert_event(&event).expect("event should insert");
+
+    let disabled = store
+        .maintain(AuditMaintenancePolicy {
+            retention_days: 0,
+            max_db_size_mb: 0,
+        })
+        .expect("disabled maintenance should succeed");
+    assert_eq!(disabled.expired_rows, 0);
+    assert_eq!(disabled.size.status, MaintenanceStatus::Disabled);
+    assert!(store.event(event.event_id).unwrap().is_some());
+
+    let enabled = store
+        .maintain(AuditMaintenancePolicy {
+            retention_days: 1,
+            max_db_size_mb: 0,
+        })
+        .expect("retention maintenance should succeed");
+    assert_eq!(enabled.expired_rows, 1);
+    assert!(store.event(event.event_id).unwrap().is_none());
+
+    drop(store);
+    fs::remove_file(path).expect("fixture database should be removed");
+}
+
+#[test]
+fn maintenance_stops_size_pruning_when_retention_checkpoint_is_busy() {
+    let path = security_db_path("maintenance-checkpoint-busy");
+    let store = SecurityStore::open(&path).expect("fixture store should open");
+    for index in 0..100 {
+        let event = fixture_file_action(&format!("/tmp/{}-{index}", "x".repeat(20_000)), 1);
+        store.insert_event(&event).expect("event should insert");
+    }
+    let retained = fixture_file_action("/tmp/current", 1_800_000_000_000_000_000);
+    store
+        .insert_event(&retained)
+        .expect("current event should insert");
+
+    let reader = rusqlite::Connection::open(&path).expect("reader should open");
+    reader
+        .execute_batch("BEGIN; SELECT COUNT(*) FROM security_events;")
+        .expect("reader should hold a snapshot");
+
+    let report = store
+        .maintain(AuditMaintenancePolicy {
+            retention_days: 1,
+            max_db_size_mb: 1,
+        })
+        .expect("maintenance should stop safely");
+
+    assert_eq!(report.size.status, MaintenanceStatus::CheckpointBusy);
+    assert!(store.event(retained.event_id).unwrap().is_some());
+    drop(reader);
+    drop(store);
+    fs::remove_file(path).expect("fixture database should be removed");
+}
+
+#[test]
+fn maintenance_enforces_size_for_unreferenced_events() {
+    let path = security_db_path("maintenance-size");
+    let store = SecurityStore::open(&path).expect("fixture store should open");
+    let mut newest_id = None;
+    for index in 0..100 {
+        let mut event = fixture_file_action(&"x".repeat(20_000), index + 1);
+        event.identity.tool_call_id = Some(format!("tool-{index}"));
+        newest_id = Some(event.event_id);
+        store.insert_event(&event).expect("event should insert");
+    }
+
+    let report = store
+        .maintain(AuditMaintenancePolicy {
+            retention_days: 0,
+            max_db_size_mb: 1,
+        })
+        .expect("size maintenance should succeed");
+
+    assert!(report.size.deleted_rows > 0);
+    assert!(matches!(
+        report.size.status,
+        MaintenanceStatus::TargetReached | MaintenanceStatus::MaxRounds
+    ));
+    assert!(
+        store
+            .event(newest_id.expect("fixture inserts at least one event"))
+            .unwrap()
+            .is_some(),
+        "oldest-first maintenance should retain the newest event"
+    );
+
+    drop(store);
+    fs::remove_file(path).expect("fixture database should be removed");
+}
+
+#[test]
+fn maintenance_keeps_a_case_graph_with_recent_action_activity() {
+    // A failed attach/detach updates only `containment_actions`, never the case
+    // row. The size path must count that action activity as graph activity, or
+    // this graph sorts first on its stale case timestamp and its failure record
+    // is deleted in the first round.
+    let path = security_db_path("maintenance-action-activity");
+    let store = SecurityStore::open(&path).expect("fixture store should open");
+
+    let protected_case = Uuid::new_v4();
+    let mut protected = fixture_case(protected_case, RiskCaseStatus::Resolved);
+    protected.updated_at_ns = 1;
+    store
+        .upsert_case(&protected, &[])
+        .expect("protected case should persist");
+    let mut action = containment_action(ContainmentLifecycle::Failed);
+    action.case_id = protected_case;
+    action.created_at_ns = 2;
+    action.updated_at_ns = 1_800_000_000_000_000_000;
+    store
+        .insert_containment_action(&action)
+        .expect("failed action should persist");
+
+    // Older candidate graphs so the protected graph is the natural first
+    // victim of an oldest-first prune without the fix.
+    for index in 0..1_000_u64 {
+        let mut case = fixture_case(Uuid::new_v4(), RiskCaseStatus::Resolved);
+        case.updated_at_ns = index + 10;
+        store
+            .upsert_case(&case, &[])
+            .expect("filler case should persist");
+    }
+
+    // Bulk unreferenced events push the file past the 1 MiB limit so size
+    // maintenance runs and can converge from the events alone.
+    for index in 0..20 {
+        let event = fixture_file_action(&"x".repeat(256 * 1024), index + 1);
+        store
+            .insert_event(&event)
+            .expect("bulk event should insert");
+    }
+
+    let report = store
+        .maintain(AuditMaintenancePolicy {
+            retention_days: 0,
+            max_db_size_mb: 1,
+        })
+        .expect("size maintenance should succeed");
+
+    assert!(
+        report.size.deleted_rows > 0,
+        "size maintenance must prune something"
+    );
+    assert_eq!(
+        store
+            .containment_action(action.action_id)
+            .expect("action query should work"),
+        Some(action),
+        "the graph with the newest action activity must be pruned last"
+    );
+
+    drop(store);
+    fs::remove_file(path).expect("fixture database should be removed");
+}
+
+#[test]
 fn case_detail_rejects_a_dangling_evidence_link() {
     let path = security_db_path("dangling-evidence");
     let case_id = Uuid::new_v4();
@@ -634,6 +798,35 @@ fn count_by_rejects_unknown_columns() {
         .expect_err("unknown grouping must fail");
 
     assert!(matches!(error, SecurityStoreError::InvalidFilter(_)));
+}
+
+#[test]
+fn count_by_returns_one_row_per_key_when_null_and_unknown_coexist() {
+    // `AuditCountBy.key` documents that absent values are returned as
+    // `unknown`. Grouping by the raw column while projecting the coalesced
+    // value split a NULL destination (file events) and the literal `unknown`
+    // that `DestinationClass::Unknown` writes into two rows with the same key,
+    // so a caller keyed by `key` silently lost one of the two counts.
+    let store = SecurityStore::open_in_memory().expect("fixture store should open");
+    store
+        .insert_event(&fixture_file_action("~/.ssh/id_rsa", 100))
+        .expect("file event should insert");
+
+    let mut unknown_sink = fixture_network_action(200, true);
+    let SecurityEventKind::NetworkAction(action) = &mut unknown_sink.kind else {
+        panic!("fixture must be a network action");
+    };
+    action.destination_class = DestinationClass::Unknown;
+    store
+        .insert_event(&unknown_sink)
+        .expect("network event should insert");
+
+    let counts = store
+        .count_by("destination_class")
+        .expect("grouping should work");
+    let unknown: Vec<_> = counts.iter().filter(|item| item.key == "unknown").collect();
+    assert_eq!(unknown.len(), 1, "one key must appear once, got {counts:?}");
+    assert_eq!(unknown[0].count, 2);
 }
 
 #[test]

@@ -137,6 +137,103 @@ async function apiFetch<T>(url: string, init: RequestInit = {}): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+// ─── Trajectory reuse labels ────────────────────────────────────────────────
+
+/**
+ * Runs the deterministic labelling pass.
+ *
+ * Safe to call repeatedly: unchanged content under unchanged rules is skipped,
+ * so this is a refresh rather than a rebuild.
+ */
+export async function runReuseTriage(limit?: number): Promise<TriageReport> {
+  const qs = limit === undefined ? '' : `?limit=${limit}`;
+  return apiFetch<TriageReport>(`${API_BASE}/api/reuse/triage${qs}`, { method: 'POST' });
+}
+
+/** Lists labelled trajectories, newest decision first. */
+export async function fetchReuseSessions(filter: {
+  label?: TrajectoryLabel;
+  confirmState?: ConfirmState;
+  limit?: number;
+} = {}): Promise<SessionsResponse> {
+  const params = new URLSearchParams();
+  if (filter.label) params.set('label', filter.label);
+  if (filter.confirmState) params.set('confirm_state', filter.confirmState);
+  if (filter.limit !== undefined) params.set('limit', String(filter.limit));
+  const qs = params.toString() ? `?${params.toString()}` : '';
+  return apiFetch<SessionsResponse>(`${API_BASE}/api/reuse/sessions${qs}`);
+}
+
+/**
+ * Records a human decision on one label.
+ *
+ * `confirm` endorses the automatic verdict; `override` replaces it. Both count
+ * as a person having spoken.
+ */
+export async function decideReuseLabel(
+  sessionId: string,
+  decision: {
+    action: 'confirm' | 'override';
+    label?: TrajectoryLabel;
+    reason?: string;
+    decidedBy?: string;
+  },
+): Promise<SessionLabelView> {
+  return apiFetch<SessionLabelView>(
+    `${API_BASE}/api/reuse/sessions/${encodeURIComponent(sessionId)}/label`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: decision.action,
+        label: decision.label,
+        reason: decision.reason,
+        decided_by: decision.decidedBy,
+      }),
+    },
+  );
+}
+
+/** Endorses several automatic verdicts at once; ids that are not there are skipped. */
+export async function confirmReuseLabels(
+  sessionIds: string[],
+  decidedBy?: string,
+): Promise<{ confirmed: number; session_ids: string[] }> {
+  return apiFetch<{ confirmed: number; session_ids: string[] }>(
+    `${API_BASE}/api/reuse/sessions/labels:batch-confirm`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_ids: sessionIds, decided_by: decidedBy }),
+    },
+  );
+}
+
+/**
+ * Per-rule counts of how often a person accepted or overturned the verdict it
+ * contributed to — the only continuously available measure of which rules
+ * misfire.
+ */
+export async function fetchReuseLabelStats(): Promise<LabelStatsResponse> {
+  return apiFetch<LabelStatsResponse>(`${API_BASE}/api/reuse/label-stats`);
+}
+
+/**
+ * Asks the model to label trajectories the rules could not place.
+ *
+ * Every judgement is a paid request, so this is off unless the server was
+ * configured for it, and answers 503 when it is not.
+ */
+export async function runReuseJudgements(
+  input: { sessionIds?: string[]; limit?: number } = {},
+): Promise<JudgeReport> {
+  return apiFetch<JudgeReport>(`${API_BASE}/api/reuse/judge`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session_ids: input.sessionIds, limit: input.limit }),
+  });
+}
+
 // ─── Enforcement APIs ───────────────────────────────────────────────────────
 
 export interface EnforcementHealth {
@@ -329,11 +426,24 @@ export const createCredentialBinding = (input: CredentialBindingInput) =>
     body: JSON.stringify(input),
   });
 
-export const fetchAgentProtectionPreview = (pid: number, directory?: string) => {
+export const fetchAgentProtectionPreview = async (
+  pid: number,
+  directory?: string,
+): Promise<AgentProtectionPreview> => {
   const query = directory ? `?directory=${encodeURIComponent(directory)}` : '';
-  return enforcementRequest<AgentProtectionPreview>(
+  const preview = await enforcementRequest<AgentProtectionPreview>(
     `/api/enforcement/agent-protection/${pid}${query}`,
   );
+  // The response is typed as an object, but a server that does not implement
+  // this route can answer `200` with a body of another shape — the macOS local
+  // viewer's `/api/*` catch-all returns `[]` — and the caller then stores
+  // `preview.source_paths` (undefined) as its source list, which the protection
+  // dialog renders with `.join`/`.length`. Rejecting here routes that into the
+  // callers' existing catch paths instead of a render-time crash.
+  if (!Array.isArray(preview?.source_paths)) {
+    throw new Error('protection preview is unavailable');
+  }
+  return preview;
 };
 
 export const detachEnforcementBinding = (bindingId: string) =>
@@ -692,6 +802,15 @@ export async function fetchTimeseries(
 // ─── ATIF export APIs ────────────────────────────────────────────────────────
 
 import type { AtifDocument, AgentHealthResponse, AgentProcessHealthResponse } from '../types';
+import type {
+  ConfirmState,
+  JudgeReport,
+  LabelStatsResponse,
+  SessionLabelView,
+  SessionsResponse,
+  TrajectoryLabel,
+  TriageReport,
+} from '../types/reuse';
 
 // ─── Token Savings types ─────────────────────────────────────────────────────
 
@@ -892,14 +1011,22 @@ export interface InterruptionTypeStat {
 
 /**
  * Fetch per-type interruption stats within a time range.
+ *
+ * `agentName` must be forwarded by callers that also filter the severity
+ * badge by agent, otherwise the tooltip breakdown counts every agent while
+ * the badge shows one.
  */
 export async function fetchInterruptionStats(
   startNs: number,
-  endNs: number
+  endNs: number,
+  agentName?: string
 ): Promise<InterruptionTypeStat[]> {
   const params = new URLSearchParams();
   params.set('start_ns', String(startNs));
   params.set('end_ns', String(endNs));
+  if (agentName) {
+    params.set('agent_name', agentName);
+  }
   return apiFetch<InterruptionTypeStat[]>(
     `${API_BASE}/api/interruptions/stats?${params.toString()}`
   );
@@ -1885,6 +2012,7 @@ export async function fetchSkillMetrics(
 export type AppCapability =
   | 'agent_observability'
   | 'sessions'
+  | 'reuse_labels'
   | 'token_savings'
   | 'optimization'
   | 'skills'
@@ -1933,7 +2061,101 @@ export async function login(token: string): Promise<boolean> {
     credentials: 'same-origin',
     body: JSON.stringify({ token }),
   });
-  return res.ok;
+  if (res.status === 401) return false;
+  if (!res.ok) throw new Error(`POST /api/auth/login -> ${res.status}`);
+  return true;
+}
+
+// ─── Storage status API ─────────────────────────────────────────────────────
+
+export type StorageAvailability = 'present' | 'missing' | 'error' | 'external';
+export type StorageCoverage = 'full' | 'partial' | 'row_bounded' | 'unmanaged' | 'external';
+export type StorageSizeState =
+  | 'within_policy'
+  | 'cleanup_due'
+  | 'reusable_capacity'
+  | 'disabled'
+  | 'unknown';
+export type StorageStoreId =
+  | 'primary'
+  | 'genai'
+  | 'interruptions'
+  | 'trajectories'
+  | 'optimization'
+  | 'reuse'
+  | 'causal'
+  | 'security_audit'
+  | 'enforcement'
+  | 'tokenless';
+export type StorageMaintenanceResult = 'success' | 'error' | 'lock_busy' | 'panicked';
+
+export interface StorageSizeStatus {
+  database_bytes: number;
+  wal_bytes: number;
+  shm_bytes: number;
+  freelist_bytes: number;
+  physical_bytes: number;
+  logical_bytes: number;
+}
+
+export interface StoragePolicyStatus {
+  retention_days: number;
+  size_limit_bytes: number;
+  cleanup_trigger_bytes: number;
+  cleanup_target_bytes: number;
+  check_interval: number;
+  check_interval_unit: 'seconds' | 'none' | 'external';
+  enforced_by: string;
+}
+
+export interface StorageMaintenanceStatus {
+  scheduled: boolean;
+  worker_running: boolean;
+  worker_heartbeat_unix_ms: number | null;
+  last_attempt_unix_ms: number | null;
+  last_success_unix_ms: number | null;
+  last_result: StorageMaintenanceResult | null;
+  consecutive_failures: number;
+  next_run_unix_ms: number | null;
+}
+
+export interface StorageStoreStatus {
+  id: StorageStoreId;
+  availability: StorageAvailability;
+  size: StorageSizeStatus | null;
+  policy: StoragePolicyStatus;
+  coverage: StorageCoverage;
+  size_state: StorageSizeState;
+  maintenance: StorageMaintenanceStatus;
+}
+
+export interface StorageStatusResponse {
+  schema_version: 3;
+  observed_at_unix_ms: number;
+  /** Combined size limit in MiB; 0 disables, otherwise the minimum is 9. */
+  max_total_size_mb: number;
+  /** Combined physical bytes of every measured store. */
+  total_physical_bytes: number;
+  stores: StorageStoreStatus[];
+}
+
+/** Read effective SQLite policies and current disk allocation. */
+export async function fetchStorageStatus(): Promise<StorageStatusResponse> {
+  return apiFetch<StorageStatusResponse>(`${API_BASE}/api/storage/status`);
+}
+
+/** Persist the combined SQLite storage limit into the runtime config file. */
+export async function saveStorageLimit(maxTotalSizeMb: number): Promise<void> {
+  const res = await fetch(`${API_BASE}/api/storage/config`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'same-origin',
+    body: JSON.stringify({ max_total_size_mb: maxTotalSizeMb }),
+  });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => '');
+    throw new Error(detail || `POST /api/storage/config -> ${res.status}`);
+  }
 }
 
 // ─── Optimization analysis API ───────────────────────────────────────────────
@@ -2007,6 +2229,7 @@ export async function saveOptimizeConfig(body: {
   api_key?: string;
   base_url?: string;
   model?: string;
+  search_timeout_secs?: number;
 }): Promise<OptimizeLlmConfig> {
   return apiFetch<OptimizeLlmConfig>(`${API_BASE}/api/optimize/config`, {
     method: 'POST',

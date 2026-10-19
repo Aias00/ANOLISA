@@ -66,12 +66,45 @@ if (!version) {
   process.exit(1);
 }
 
+// The QwenPaw requirements pin carries two spellings of this one version: the
+// release-tag path keeps the raw Cargo form (the release workflow tags it
+// verbatim) while the wheel filename takes the PEP 440 normalized form the
+// pinned maturin builds and pip accepts -- a Cargo 0.9.0-rc.1 publishes
+// anolisa_tokenless-0.9.0rc1-.... packaging/raw/wheel-version.py supplies that
+// spelling from the normalizer inside packaging/raw/verify-release.py, the gate
+// that rejects a payload mixing the two up, and the Makefile's
+// stamp-adapter-templates rule asks the same helper, so the npm bundle cannot
+// drift from the raw and RPM payloads. Asked on demand: only adapter bundling
+// stamps templates.
+const WHEEL_VERSION_SCRIPT = join(tokenlessRoot, 'packaging', 'raw', 'wheel-version.py');
+
+function wheelFilenameVersion() {
+  let normalized;
+  try {
+    normalized = execFileSync('python3', [WHEEL_VERSION_SCRIPT, version], {
+      encoding: 'utf-8',
+    }).trim();
+  } catch (error) {
+    throw new Error(
+      `cannot normalize ${version} into a wheel filename version ` +
+      `(python3 ${WHEEL_VERSION_SCRIPT}): ${error.message}`,
+    );
+  }
+  if (!normalized) {
+    throw new Error(`wheel-version.py returned no wheel filename version for ${version}`);
+  }
+  return normalized;
+}
+
 const BINARIES = ['tokenless', 'rtk'];
 
 // npm registry every generated manifest and publish command is pinned to.
 // The nested dist/* package roots do NOT inherit npm/.npmrc, so without an
 // explicit publishConfig a maintainer's user-level registry would win.
 const NPM_REGISTRY = 'https://registry.npmjs.org/';
+// Floor advertised in engines.node; keep in sync with npm/package.json.
+const NODE_ENGINE_MIN = '16.7.0';
+
 const PUBLISH_CONFIG = { registry: NPM_REGISTRY, access: 'public' };
 const GLIBC_MIN = '2.17';
 
@@ -398,7 +431,7 @@ function buildAdapters() {
 /**
  * Copy the adapter tree into the root package, mirroring what the Makefile's
  * install-adapter-resources does for FHS installs: strip build-only
- * artifacts, stamp @VERSION@ templates, and mark scripts executable.
+ * artifacts, stamp the version templates, and mark scripts executable.
  */
 function copyAdapters(rootPkgDir) {
   const adaptersSrc = join(tokenlessRoot, 'adapters', 'tokenless');
@@ -414,15 +447,21 @@ function copyAdapters(rootPkgDir) {
       src !== legacyAgentscopeSrc &&
       !src.startsWith(`${legacyAgentscopeSrc}${sep}`) &&
       !src.split(sep).includes('node_modules') &&
+      !src.split(sep).includes('__pycache__') &&
+      !/\.py[co]$/.test(src) &&
       !src.endsWith(`${sep}package-lock.json`) &&
       !src.endsWith(`${sep}.gitignore`),
   });
 
   // Stamp *.in templates with the release version (Makefile does this via
-  // stamp-adapter-templates for RPM installs) and drop the raw templates.
+  // stamp-adapter-templates for RPM installs) and drop the raw templates. The
+  // QwenPaw requirements pin also needs the wheel-filename spelling.
+  const wheelVersion = wheelFilenameVersion();
   walkFiles(adaptersDest, (p) => {
     if (p.endsWith('.in')) {
-      const stamped = readFileSync(p, 'utf-8').replaceAll('@VERSION@', version);
+      const stamped = readFileSync(p, 'utf-8')
+        .replaceAll('@WHEEL_VERSION@', wheelVersion)
+        .replaceAll('@VERSION@', version);
       writeFileSync(p.slice(0, -3), stamped);
       rmSync(p);
     }
@@ -510,7 +549,11 @@ process.exit(1);
     bin: binMap,
     files: ['bin/', 'scripts/', 'adapters/', 'README.md', 'LICENSE'],
     scripts: { postinstall: 'node scripts/postinstall.js' },
-    engines: { node: '>=16.0.0' },
+    // 16.7.0, not 16.0.0: scripts/postinstall.js imports fs.cpSync, which only
+    // exists from 16.7.0. A lower floor lets npm install the package on a node
+    // that then fails to load the postinstall script at all, before any of its
+    // own platform checks run.
+    engines: { node: `>=${NODE_ENGINE_MIN}` },
     os: osSet,
     cpu: cpuSet,
     optionalDependencies: optionalDeps,

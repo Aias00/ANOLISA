@@ -2,7 +2,7 @@
 //! elements are removed; every removal is counted in the view header and the
 //! original page stays retrievable. No text-density or link-density scoring.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fmt::Write as _;
 
 use html5ever::interface::{ElemName, ElementFlags, NodeOrText, QuirksMode, TreeSink};
@@ -10,7 +10,9 @@ use html5ever::tendril::{StrTendril, TendrilSink};
 use html5ever::{Attribute, LocalName, Namespace, ParseOpts, QualName, parse_document};
 
 /// Rendered bodies shorter than this are extraction failures, not pages.
-/// Provisional until the sample set fixes the threshold.
+/// Calibrated on 44 technical-documentation, error and SPA pages: app shells
+/// render 0 chars, nav fragments of truncated pages at most 51, and the
+/// smallest real page (example.com) 167.
 const MIN_BODY_CHARS: usize = 64;
 
 /// Element nesting beyond this depth is flattened to its collapsed text
@@ -19,29 +21,45 @@ const MIN_BODY_CHARS: usize = 64;
 /// and indentation of code blocks; the words stay.
 const MAX_DEPTH: usize = 128;
 
-/// Pages whose markup nests deeper than this are not parsed at all: the
-/// HTML5 tree builder scans the open-element stack per start tag, so parse
-/// time grows quadratically with depth (about 1 s at 10 000 levels, 4 min at
-/// 160 000). Browsers cap the tree at 512; real pages stay under 50.
+/// Parsing stops once the tree nests deeper than this: the HTML5 tree
+/// builder scans the open-element stack per start tag, so parse time grows
+/// quadratically with depth (about 1 s at 10 000 levels, 4 min at 160 000).
+/// Every element the tree builder pushes counts, including void elements
+/// and the implied `tbody` and `tr` of tables, so a table nested inside a
+/// table cell costs three or four levels. Browsers cap the tree at 512;
+/// real pages stay under 50.
+///
+/// This bounds depth, and with it parse time and the cost of measuring the
+/// depth; it does not bound how many nodes a wide page allocates or the
+/// memory they take.
+///
+/// Measuring the depth costs an ancestor walk per inserted element, so the
+/// same page of 200 short paragraphs renders in 0.32 ms flat, 1.13 ms nested
+/// 128 deep and 5.47 ms nested 500 deep (release build, x86-64). The walk
+/// stops at this limit and a page over it is abandoned at the next piece
+/// boundary, which bounds the overhead to one piece of maximally nested
+/// markup; see [`Dom::max_depth`] for what would make it constant.
 const MAX_PARSE_DEPTH: usize = 512;
 
-/// Elements that never take content, so a start tag does not open a level.
-const VOID_ELEMENTS: [&str; 14] = [
-    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
-    "track", "wbr",
-];
+/// Input is fed to the parser in pieces of this size and the depth checked
+/// after each, so a page over the limit costs at most one more piece of
+/// parsing. The depth comes from the parser's own tree, not a pre-scan:
+/// foreign content, raw text, comments and attribute quoting all follow
+/// the tokenizer's rules without a second implementation of them.
+const PARSE_PIECE_BYTES: usize = 4096;
 
-/// Elements the tree builder closes implicitly before a sibling, so they
-/// cannot stack on themselves and an unclosed run does not count as nesting.
-const SELF_CLOSING_RUN: [&str; 14] = [
-    "p", "li", "dt", "dd", "tr", "td", "th", "option", "optgroup", "thead", "tbody", "tfoot",
-    "colgroup", "caption",
+/// Elements whose content the tokenizer reads as raw text, so a tag inside
+/// them is not a tag. `noscript` is one because the parser runs with
+/// scripting enabled.
+const RAW_TEXT: [&str; 7] = [
+    "script",
+    "style",
+    "textarea",
+    "title",
+    "xmp",
+    "plaintext",
+    "noscript",
 ];
-
-/// Elements whose content is raw text: tags inside them are not markup.
-/// `noscript` is left out on purpose: the parser treats it as raw text
-/// too, so counting its tags overestimates depth, which is the safe side.
-const RAW_TEXT: [&str; 6] = ["script", "style", "textarea", "title", "xmp", "plaintext"];
 
 /// Removed element categories, in header order. `form control` covers
 /// button, input, select, textarea, datalist, progress and meter; `media`
@@ -103,7 +121,8 @@ const MAX_TABLE_COLUMNS: usize = 64;
 /// One Markdown view of a complete HTML document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HtmlView {
-    /// Header line, title, URL, rendered body and end marker.
+    /// Header line, title, URL, rendered body and end marker, followed by
+    /// any text the input carried after the document's `</html>` end tag.
     pub output: String,
     /// `<title>` text, collapsed.
     pub title: Option<String>,
@@ -128,16 +147,30 @@ pub struct HtmlView {
 pub struct HtmlExtractor;
 
 impl HtmlExtractor {
-    /// Renders the page as Markdown. Returns `None` when the rendered body is
-    /// too short to be a page or the markup nests deeper than the parse
-    /// limit; callers keep the original in that case.
+    /// Renders the page as Markdown. Text after the `</html>` end tag is not
+    /// part of the page and follows the end marker as written, except that
+    /// lines imitating the view's wrapper are escaped like page text. Returns
+    /// `None` when the rendered body is too short to be a page or the markup
+    /// nests deeper than the parse limit; callers keep the original then.
     #[must_use]
     pub fn render(&self, input: &str) -> Option<HtmlView> {
-        if nesting_depth(input) > MAX_PARSE_DEPTH {
-            return None;
+        let (document, trailer) = split_trailer(input);
+        let mut parser = parse_document(Dom::default(), ParseOpts::default());
+        let mut rest = document;
+        while !rest.is_empty() {
+            let mut cut = PARSE_PIECE_BYTES.min(rest.len());
+            while !rest.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            let (piece, tail) = rest.split_at(cut);
+            parser.process(StrTendril::from_slice(piece));
+            if parser.tokenizer.sink.sink.max_depth.get() > MAX_PARSE_DEPTH {
+                return None;
+            }
+            rest = tail;
         }
-        let dom =
-            parse_document(Dom::default(), ParseOpts::default()).one(StrTendril::from_slice(input));
+        // Finishing only closes what is open; it inserts no elements.
+        let dom = parser.finish();
         let nodes = dom.nodes.into_inner();
         let html = nodes[0]
             .children
@@ -204,8 +237,9 @@ impl HtmlExtractor {
         if let Some(head) = head {
             renderer.count_removals(head, false);
         }
-        // Escaped once here, where every rendering path ends up, so the
-        // view boundary can only come from the renderer.
+        // Escaped once here, where every rendering path ends up, and once
+        // for the trailer below, so the view boundary can only come from the
+        // renderer.
         let body_markdown =
             escape_wrapper_lines(&renderer.blocks(root, is_sectioning(&nodes[root])));
         if body_markdown.chars().count() < MIN_BODY_CHARS {
@@ -238,6 +272,11 @@ impl HtmlExtractor {
         }
         output.push_str(&body_markdown);
         output.push_str("\n[End page]");
+        let trailer = trailer.trim_start();
+        if !trailer.is_empty() {
+            output.push('\n');
+            output.push_str(&escape_wrapper_lines(trailer));
+        }
         Some(HtmlView {
             output,
             title,
@@ -247,6 +286,20 @@ impl HtmlExtractor {
             outside_root,
         })
     }
+}
+
+/// Splits the input after the first `</html>` end tag that the tokenizer
+/// would see as one, so a literal inside a comment or a script string does
+/// not end the document. The parser would fold anything after the tag into
+/// the body, where a root other than `<body>` drops it from the view: a
+/// build log or grep listing printed after a fetched page would vanish. The
+/// first tag is used because a trailer can itself contain one (a second
+/// page, a grep over the page).
+fn split_trailer(input: &str) -> (&str, &str) {
+    let end = tags(input)
+        .find(|tag| tag.closing && tag.name == "html")
+        .map_or(input.len(), |tag| tag.end);
+    input.split_at(end)
 }
 
 // ---- DOM ----------------------------------------------------------------
@@ -307,6 +360,24 @@ impl Node {
 #[derive(Default)]
 struct Dom {
     nodes: RefCell<Vec<Node>>,
+    /// Deepest element inserted so far, counting `<html>` as 1, from a walk
+    /// over the ancestors at each insertion. Nothing is cached: the adoption
+    /// agency appends to and reparents into elements that are not attached
+    /// yet, so a depth stored then would be wrong for the whole subtree. An
+    /// element inserted under a detached one is counted from that root and
+    /// caught by the next insertion after the root is attached. The open
+    /// element stack is a subsequence of the current node's ancestors, so
+    /// the walk understates it by at most one, under foster parenting.
+    ///
+    /// The walk is linear in the depth of every element inserted (numbers in
+    /// [`MAX_PARSE_DEPTH`]) and capped at that limit, which is what keeps it
+    /// affordable. Caching a depth per node instead needs a generation counter
+    /// to tell a stale depth from a fresh one, bumped at the three places that
+    /// move existing nodes — a successful [`Dom::detach`],
+    /// [`Dom::remove_from_parent`] and [`Dom::reparent_children`] — with the
+    /// depths found by a walk written back along it, which would make the walk
+    /// amortised constant. Left out as bookkeeping the cap makes unnecessary.
+    max_depth: Cell<usize>,
 }
 
 impl Dom {
@@ -324,7 +395,7 @@ impl Dom {
     fn insert_child(&self, parent: usize, index: usize, child: NodeOrText<usize>) {
         match child {
             NodeOrText::AppendNode(id) => {
-                Self::insert(&mut self.nodes.borrow_mut(), parent, index, id)
+                self.insert(&mut self.nodes.borrow_mut(), parent, index, id)
             }
             NodeOrText::AppendText(text) => {
                 {
@@ -345,16 +416,43 @@ impl Dom {
         }
     }
 
+    // Children are searched from the end: in every shape measured the target
+    // is the last child or, under foster parenting, the one before it, because
+    // the tree builder removes and inserts near the current node. Nothing
+    // enforces that — `remove_from_parent` also reaches here from the adoption
+    // agency's furthest block and from a `<frameset>` body, and `Vec::remove`
+    // moves everything after the index — so the time bounds in
+    // `nesting_beyond_the_parse_limit_is_not_parsed`, which cover the wide
+    // table and the adoption-agency shape, are the alarm should a future
+    // html5ever move those targets away from the end. A scan from the front
+    // would be quadratic in the width of a table whatever the position.
     fn detach(nodes: &mut [Node], id: usize) {
         if let Some(parent) = nodes[id].parent.take() {
-            nodes[parent].children.retain(|&child| child != id);
+            let children = &mut nodes[parent].children;
+            if let Some(index) = children.iter().rposition(|&child| child == id) {
+                children.remove(index);
+            }
         }
     }
 
-    fn insert(nodes: &mut [Node], parent: usize, index: usize, id: usize) {
+    fn insert(&self, nodes: &mut [Node], parent: usize, index: usize, id: usize) {
         Self::detach(nodes, id);
         nodes[id].parent = Some(parent);
         nodes[parent].children.insert(index, id);
+        if !matches!(nodes[id].kind, NodeKind::Element { .. }) {
+            return;
+        }
+        // Capped one past the limit: the page is abandoned at that point,
+        // so a walk never costs more than the limit allows.
+        let mut depth = 1;
+        let mut ancestor = parent;
+        while let Some(next) = nodes[ancestor].parent
+            && depth <= MAX_PARSE_DEPTH
+        {
+            depth += 1;
+            ancestor = next;
+        }
+        self.max_depth.set(self.max_depth.get().max(depth));
     }
 }
 
@@ -398,11 +496,22 @@ impl TreeSink for Dom {
 
     fn create_element(&self, name: QualName, attrs: Vec<Attribute>, flags: ElementFlags) -> usize {
         let template = flags.template.then(|| self.push(NodeKind::Other));
-        self.push(NodeKind::Element {
+        let id = self.push(NodeKind::Element {
             name,
             attrs,
             template,
-        })
+        });
+        // Template contents hang off the template, so their depth counts on
+        // from it and a `<template>` cannot restart the count. The contents
+        // get a parent but never enter the template's `children`: the depth
+        // walk climbs through `parent`, while rendering and the tree searches
+        // descend through `children`, so contents count towards the parse
+        // limit and are never rendered. No other node in the tree has a parent
+        // that does not list it as a child.
+        if let Some(contents) = template {
+            self.nodes.borrow_mut()[contents].parent = Some(id);
+        }
+        id
     }
 
     fn create_comment(&self, _text: StrTendril) -> usize {
@@ -463,7 +572,7 @@ impl TreeSink for Dom {
         let index = nodes[parent]
             .children
             .iter()
-            .position(|&child| child == *sibling)
+            .rposition(|&child| child == *sibling)
             .expect("sibling is a child of its parent");
         drop(nodes);
         self.insert_child(parent, index, new_node);
@@ -495,53 +604,109 @@ impl TreeSink for Dom {
     }
 }
 
-/// Maximum element nesting of raw markup, from a single byte scan without
-/// building a tree. Errs high: an unclosed tag counts as an open level, and
-/// a `>` inside a quoted attribute value ends the tag early, so whatever
-/// follows it is scanned as content. Neither can hide real nesting.
-fn nesting_depth(input: &str) -> usize {
+/// A tag found by [`tags`]: lowercase name and the offset just past its `>`.
+struct Tag {
+    name: String,
+    closing: bool,
+    end: usize,
+}
+
+/// Scans raw markup for the tags the tokenizer would see, without building
+/// a tree: comments and raw-text elements are skipped whole, so a literal
+/// tag inside `<!-- -->` or a `<script>` string is content, not a tag. An
+/// end tag may carry whitespace or attributes before its `>`. Raw text is
+/// skipped only when the tokenizer surely reads it as such: a self-closing
+/// start tag closes the element in foreign content, and an unterminated one
+/// has no end to skip to. In doubt the scanner sees tags, because a missed
+/// `</html>` silently drops the trailer, while a false split only leaves
+/// markup after the view.
+///
+/// A comment with no `-->` does not end the scan either: the scanner carries
+/// on seeing tags after it, because the alternative is missing a real
+/// `</html>` and the trailer that follows it.
+///
+/// The `/>` test reads the two bytes before the first `>` and so is blind to
+/// attribute values: `<script src="a/>">`, whose tag ends after the quoted
+/// value, and `<script src=a/>`, whose slash the tokenizer ignores in HTML
+/// content, both look self-closing. The scanner then sees tags inside the
+/// element, where a literal `</html>` in a string ends the document early:
+/// what follows becomes the trailer, or the body falls under
+/// [`MIN_BODY_CHARS`] and the caller keeps the original. No text is lost
+/// either way, and telling those two from a foreign self-closing tag takes
+/// the tokenizer's attribute states, which this scanner exists to avoid.
+fn tags(input: &str) -> impl Iterator<Item = Tag> + '_ {
     let bytes = input.as_bytes();
-    let (mut depth, mut max, mut i) = (0usize, 0usize, 0usize);
-    let find = |from: usize, needle: &[u8]| {
+    let find = move |from: usize, needle: &[u8]| {
         bytes[from..]
             .windows(needle.len())
             .position(|w| w.eq_ignore_ascii_case(needle))
             .map(|at| from + at + needle.len())
     };
-    while i < bytes.len() {
-        if bytes[i] != b'<' {
-            i += 1;
-            continue;
+    let mut i = 0usize;
+    // Per raw-text name, and for the comment terminator, the offset from which
+    // that needle is known to be absent. A failed search covered everything
+    // after the offset it started from and `i` only grows, so every later
+    // search for the same needle fails too; without the note each unterminated
+    // comment or raw-text start tag would rescan to the end of the input and
+    // the whole scan would be quadratic in their number.
+    let mut absent = [usize::MAX; RAW_TEXT.len()];
+    let mut comment_absent = usize::MAX;
+    std::iter::from_fn(move || {
+        while i < bytes.len() {
+            if bytes[i] != b'<' {
+                i += 1;
+                continue;
+            }
+            if bytes[i..].starts_with(b"<!--") {
+                if i < comment_absent {
+                    match find(i + 4, b"-->") {
+                        Some(after) => i = after,
+                        // Jumping to the end here would hide every later tag,
+                        // including a real `</html>` and the trailer after it.
+                        None => {
+                            comment_absent = i + 4;
+                            i += 4;
+                        }
+                    }
+                } else {
+                    i += 4;
+                }
+                continue;
+            }
+            let closing = bytes.get(i + 1) == Some(&b'/');
+            let start = i + 1 + usize::from(closing);
+            let end = start
+                + bytes[start..]
+                    .iter()
+                    .take_while(|b| b.is_ascii_alphanumeric())
+                    .count();
+            if end == start || !bytes[start].is_ascii_alphabetic() {
+                i += 1;
+                continue;
+            }
+            let name = input[start..end].to_ascii_lowercase();
+            i = find(end, b">").unwrap_or(bytes.len());
+            if !closing
+                && let Some(kind) = RAW_TEXT.iter().position(|raw| *raw == name)
+                && !bytes[..i].ends_with(b"/>")
+                && i < absent[kind]
+            {
+                match find(i, format!("</{name}").as_bytes()) {
+                    Some(after) => {
+                        i = after;
+                        continue;
+                    }
+                    None => absent[kind] = i,
+                }
+            }
+            return Some(Tag {
+                name,
+                closing,
+                end: i,
+            });
         }
-        if bytes[i..].starts_with(b"<!--") {
-            i = find(i + 4, b"-->").unwrap_or(bytes.len());
-            continue;
-        }
-        let closing = bytes.get(i + 1) == Some(&b'/');
-        let start = i + 1 + usize::from(closing);
-        let end = start
-            + bytes[start..]
-                .iter()
-                .take_while(|b| b.is_ascii_alphanumeric())
-                .count();
-        if end == start || !bytes[start].is_ascii_alphabetic() {
-            i += 1;
-            continue;
-        }
-        let name = input[start..end].to_ascii_lowercase();
-        i = find(end, b">").unwrap_or(bytes.len());
-        if closing {
-            depth = depth.saturating_sub(1);
-        } else if RAW_TEXT.contains(&name.as_str()) {
-            i = find(i, format!("</{name}").as_bytes()).unwrap_or(bytes.len());
-        } else if !VOID_ELEMENTS.contains(&name.as_str())
-            && !SELF_CLOSING_RUN.contains(&name.as_str())
-        {
-            depth += 1;
-            max = max.max(depth);
-        }
-    }
-    max
+        None
+    })
 }
 
 fn find_element(nodes: &[Node], from: usize, local: &str) -> Option<usize> {
@@ -1047,7 +1212,13 @@ impl Renderer<'_> {
                     if text.is_empty() {
                         return;
                     }
-                    let ticks = if text.contains('`') { "``" } else { "`" };
+                    // A code span is closed by a backtick run of the same
+                    // length as its fence, so the fence must outgrow the
+                    // longest run in the text, exactly like a code block's.
+                    // One linear scan finds that run; probing with
+                    // `contains` for every prefix length is quadratic in
+                    // the run length, which untrusted HTML controls.
+                    let ticks = "`".repeat(longest_backtick_run(&text) + 1);
                     let _ = write!(out, "{ticks}{text}{ticks}");
                 }
                 "label" => {
@@ -1166,11 +1337,12 @@ fn flush_inline(blocks: &mut Vec<String>, inline: &mut String, open: &mut bool) 
     }
 }
 
-/// Escapes body lines that imitate the view's own wrapper lines. Applied
-/// once to the whole rendered body, so paragraphs, code, table cells and
-/// flattened deep nesting are all covered; an escaped line stays escaped.
+/// Escapes lines that imitate the view's own wrapper lines. Applied once to
+/// the whole rendered body, so paragraphs, code, table cells and flattened
+/// deep nesting are all covered, and once to the trailer; an escaped line
+/// stays escaped. Line terminators are kept as they are.
 fn escape_wrapper_lines(text: &str) -> String {
-    text.lines()
+    text.split_inclusive('\n')
         .map(|line| {
             if line.starts_with("[End page]") || line.starts_with("[HTML page rendered as Markdown")
             {
@@ -1179,8 +1351,7 @@ fn escape_wrapper_lines(text: &str) -> String {
                 line.to_owned()
             }
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .collect()
 }
 
 /// Where to insert a backslash so a line of page text is not read as a
@@ -1252,6 +1423,24 @@ fn destination(url: &str) -> Option<String> {
             escaped
         },
     )
+}
+
+/// Length of the longest consecutive backtick run, in one pass over the
+/// text. Fence selection for code spans needs exactly this: the smallest
+/// fence a run cannot close is one tick longer than the longest run.
+fn longest_backtick_run(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    let mut longest = 0usize;
+    let mut run = 0usize;
+    for &b in bytes {
+        if b == b'`' {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    longest
 }
 
 /// Whether text can sit between `[` and `]`: brackets outside code spans

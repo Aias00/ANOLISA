@@ -8,13 +8,13 @@ OpenClaw security plugin that hooks into the agent lifecycle via `agent-sec-cli`
 
 | Dependency     | Version   | Check                        |
 |----------------|-----------|------------------------------|
-| Node.js        | >= 20     | `node --version`             |
+| Node.js        | See OpenClaw 2.0 compatibility below | `node --version` |
 | npm            | >= 10     | `npm --version`              |
 | OpenClaw       | >= 2026.4.14 | `openclaw --version`       |
 | agent-sec-cli  | (latest)  | `agent-sec-cli --help`       |
 | jq             | >= 1.6    | `jq --version`               |
 
-Development and test builds use the `openclaw` dev dependency pinned in `package.json` so TypeScript can compile against the newest typed hook definitions. The OpenClaw runtime does not need to match that dev dependency. Runtime compatibility is capability-based: `2026.4.14` and `2026.4.23` are supported legacy baselines for core security hooks, while `model_call_started` and `model_call_ended` telemetry may degrade cleanly on those versions.
+Development and test builds use OpenClaw `2026.8.1` (OpenClaw 2.0), pinned in `package.json` so TypeScript checks the target release's hook definitions. The OpenClaw runtime does not need to match that dev dependency. Runtime compatibility is capability-based: `2026.4.14` and `2026.4.23` are supported legacy baselines for core security hooks, while `model_call_started` and `model_call_ended` telemetry may degrade cleanly on those versions.
 
 ## Compatibility Contract
 
@@ -24,7 +24,7 @@ The installable package declares the OpenClaw compatibility boundary in `package
 - `openclaw.compat.pluginApi: ">=2026.4.14"` declares the plugin SDK/runtime API floor used by OpenClaw install compatibility checks.
 - `peerDependencies.openclaw: ">=2026.4.14"` keeps npm peer metadata aligned with the OpenClaw installer contract.
 
-Package entrypoints follow the current OpenClaw plugin contract: `openclaw.extensions` points at the TypeScript source entry for checkout development, and `openclaw.runtimeExtensions` points at the built JavaScript entry used by installed packages. `openclaw.plugin.json` keeps its legacy `extensions` declaration pointed at the same built runtime entry for older manifest readers.
+Package entrypoints follow the current OpenClaw plugin contract: both `openclaw.extensions` and `openclaw.runtimeExtensions` point at the built JavaScript entry. `openclaw.plugin.json` keeps its legacy `extensions` declaration pointed at the same built runtime entry for older manifest readers.
 
 Deployment & upgrade guide: [OpenClaw Compatibility Deployment & Upgrade Guide](../../../docs/user-guide/en/agent-security/agent-sec-core/openclaw-deploy.md) ([中文版](../../../docs/user-guide/zh/agent-security/agent-sec-core/openclaw-deploy.md)).
 
@@ -41,7 +41,7 @@ openclaw-plugin/
 │   ├── capabilities/           # Security capability entry files
 │   │   ├── skill-ledger.ts     #   before_tool_call hook
 │   │   ├── code-scan.ts        #   before_tool_call hook
-│   │   ├── prompt-scan.ts      #   before_dispatch hook
+│   │   ├── prompt-scan.ts      #   model-entry gate hook (before_agent_run / before_dispatch)
 │   │   ├── pii-scan.ts         #   PII hooks
 │   │   └── observability.ts    #   observability hook registration
 │   └── helpers/                # Capability support code
@@ -97,6 +97,19 @@ ls dist/
 > **Note:** Test files in `tests/` are excluded from `dist/` since they live outside `src/`.
 
 ---
+
+## OpenClaw 2.0 compatibility
+
+OpenClaw `2026.8.1` requires Node `>=22.22.3 <23`, `>=24.15.0 <25`, or
+`>=25.9.0`. Use a compatible Node version for dependency installation and E2E.
+Deployment accepts this plugin's declared capabilities through the host's
+`--accept-capabilities` flag; `--force` alone does not grant consent. Operator
+`security.installPolicy` blocks still apply. Conversation access remains enabled
+separately for content inspection hooks.
+
+Hook callbacks infer their types from `api.on`; they do not import the hook types
+removed from `plugin-runtime`. E2E policy assertions use `sessions.get`, so they
+work with both legacy JSONL and 2.0 SQLite transcripts.
 
 ## Deploy to OpenClaw
 
@@ -161,9 +174,9 @@ The deployment script performs these steps:
 
 1. **Pre-checks** — Verifies `agent-sec-cli` and `jq` are in PATH; validates `openclaw.plugin.json`, `dist/`, and `dist/index.js` exist
 2. **OpenClaw version check** — Reads `openclaw --version` and requires OpenClaw `>=2026.4.14`
-3. **Installer capability check** — Reads `openclaw plugins install --help`, requires `--force`, and detects whether `--dangerously-force-unsafe-install` is available
+3. **Installer capability check** — Reads `openclaw plugins install --help`, requires `--force`, and detects capability-consent or legacy install flags
 4. **Inspect capability check** — Reads `openclaw plugins inspect --help`, requires `--json`, and detects whether `--runtime` is available
-5. **Plugin installation** — Runs `openclaw plugins install <path> --force`, adding `--dangerously-force-unsafe-install` only when the current installer advertises that compatibility flag
+5. **Plugin installation** — Runs `openclaw plugins install <path> --force`, adding `--accept-capabilities` when supported; older installers use `--dangerously-force-unsafe-install` only when advertised
 6. **Conversation access policy** — Sets `plugins.entries.agent-sec.hooks.allowConversationAccess=true` on OpenClaw `>=2026.4.24`; older supported hosts skip it and degrade conversation observability hooks
 7. **Runtime verification** — Uses `openclaw plugins inspect agent-sec --runtime --json` when supported, otherwise `openclaw plugins inspect agent-sec --json`, and fails unless the plugin status is `loaded`
 8. **User guidance** — Displays instructions to restart the OpenClaw gateway and optional policy commands (does NOT restart automatically)
@@ -253,7 +266,7 @@ does not require the shell to be activated because it detects `.venv/bin`
 directly. The same values can be provided with
 `AGENT_SEC_OPENCLAW_PILOT_AGENT_SEC_CLI` and
 `AGENT_SEC_OPENCLAW_PILOT_AGENT_SEC_DAEMON`. Use `--workdir <dir>` to keep
-logs and artifacts in a stable directory.
+logs and artifacts in a stable directory. An existing work directory must be owned by the current user and have mode `0700`, as required by the daemon.
 
 Optional pilot arguments:
 
@@ -309,8 +322,8 @@ run the same acceptance checks per supported host version.
 
 | Capability         | Hook                  | Priority | Behavior                                             |
 |--------------------|-----------------------|----------|------------------------------------------------------|
-| `pii-scan-user-input` | `before_dispatch`, `before_tool_call`, `after_tool_call`, `llm_output` | 200 before dispatch/tool call | Scans user text, tool parameters, tool output, and model output for PII/credentials; applies the unified hook policy |
-| `prompt-scan`      | `before_dispatch`     | 190      | Scans inbound messages for prompt injection attacks   |
+| `pii-scan-user-input` | `before_agent_run` or legacy `before_dispatch`; `before_tool_call`, `after_tool_call`, `llm_output` | 200 at input/tool entry | Scans host-provided text for PII/credentials; applies policy where the hook can enforce it |
+| `prompt-scan`      | `before_agent_run` or legacy `before_dispatch` | 190      | Scans user input for prompt injection / jailbreak attacks   |
 | `scan-code`        | `before_tool_call`    | 0 (default) | Scans tool commands for security issues              |
 | `skill-ledger`     | `before_tool_call`    | 80       | Checks Skill Ledger exposure summary when SKILL.md is read; default policy asks on actionable messages |
 | `observability`    | selected typed hooks  | varies   | Sends observability records to agent-sec-cli          |
@@ -329,9 +342,25 @@ openclaw config set plugins.entries.agent-sec.config.codeScanRequireApproval tru
 
 ### Configuring `pii-scan-user-input`
 
-The `pii-scan-user-input` capability scans the current inbound user text in `before_dispatch`, tool parameters in `before_tool_call`, tool results/errors in `after_tool_call`, and assistant text in `llm_output`. It intentionally does not scan assembled prompt history, memory, or RAG context, so older PII does not trigger repeated warnings on later turns.
+The `pii-scan-user-input` capability registers one input hook based on `api.runtime.version`:
 
-By default, `capabilities["pii-scan-user-input"].policy` is `observe`, so findings are audited without a user-visible warning. `warn` logs redacted warnings, `ask` requests approval for supported pre-tool calls and otherwise falls back to `warn`, and `block` rejects pre-execution `deny` verdicts. Tool output and model output cannot undo side effects and therefore fall back to warnings. Legacy `enableBlock: true/false` maps to `block/warn` when `policy` is absent.
+- Stable OpenClaw `>=2026.5.12`: `before_agent_run` scans only the current user input in `prompt`. System prompts, session history, media payloads, and message metadata are excluded. A missing, non-string, or blank `prompt` skips scanning without falling back to other fields. `source=model_input` continues to identify the model-entry hook, not full-context coverage.
+- Older supported hosts, prereleases, and unrecognized versions: `before_dispatch` scans host-provided inbound text with `source=user_input` and logs a compatibility warning. The minimum supported host remains `2026.4.14`.
+
+Startup logs identify the selected hook. The new gate uses the existing `allowConversationAccess=true` permission set by deployment. It inspects text available at run entry, does not recover credentials already masked by OpenClaw, and does not cover every model request during a run or auxiliary model calls such as session title generation. A `pass` on masked input is acceptable when the provider request also contains no original credential. The plugin does not replace model input with redacted output.
+
+Tool parameters remain on `before_tool_call`, tool results/errors on `after_tool_call`, and assistant text on `llm_output`. `after_tool_call` cannot withhold or redact tool results before subsequent model use; `llm_output` cannot prevent delivery. These existing limitations are unchanged.
+
+By default, `capabilities["pii-scan-user-input"].policy` is `observe`, so findings are audited without a user-visible warning. `warn` logs warnings without sensitive input, `ask` requests approval for supported pre-tool calls and otherwise falls back to `warn`, and `block` rejects pre-execution `deny` verdicts. Tool output and model output fall back to warnings. CLI failures warn and fail open with the existing 10-second timeout. Legacy `enableBlock: true/false` maps to `block/warn` when `policy` is absent.
+
+### Configuring `prompt-scan`
+
+The `prompt-scan` capability registers the same model-entry gate selection as `pii-scan-user-input`, based on `api.runtime.version`:
+
+- Stable OpenClaw `>=2026.5.12`: `before_agent_run` scans the assembled model input (`systemPrompt`, `prompt`, and message text) via `agent-sec-cli scan-prompt --source model_input`.
+- Older supported hosts, prereleases, and unrecognized versions: `before_dispatch` scans host-provided inbound text with `--source user_input` and logs a compatibility warning.
+
+Startup logs identify the selected hook. Every scan is recorded as `[prompt-scan] pass` / `WARN` / deny audit entries regardless of the blocking setting. Set `promptScanBlock: true` (openclaw.json plugin config) to turn a `deny` verdict into a blocked run (`{outcome: "block", reason: "prompt_scan_deny"}` at the model-entry gate, or a final reply on the legacy gate); without it a `deny` is audit-logged only. `warn` verdicts pass through with a warning at both gates. CLI failures and crashes fail open. `PROMPT_SCANNER_HOOK_ENABLED=false` disables the capability, and `PROMPT_SCANNER_SCAN_MODE=fast|standard|strict` selects the scan mode.
 
 ### Configuring `observability`
 
@@ -445,7 +474,11 @@ openclaw config set 'plugins.entries.agent-sec.config.capabilities.skill-ledger.
 
 Skill Ledger global `activationPolicy` belongs to SkillFS/daemon activation. OpenClaw `policy` only controls this host hook's user-visible behavior and log level. User decisions must be made with `agent-sec-cli skill-ledger decide`; approving an OpenClaw prompt does not write a Ledger decision.
 
-**Prerequisites**: `agent-sec-cli skill-ledger show` must be available. Signing keys are auto-initialized (no passphrase) if not present.
+**Prerequisites**: the Rust `agent-sec-cli` and its root daemon must be available. Each matched
+Skill call first runs idempotent `init --no-baseline`; only then does it run `show`. Initialization
+does not scan or rotate keys and ignores legacy HOME keys. Failed initialization stops that check
+with a diagnostic. Registration and unmatched calls do not initialize; later calls retry after a
+daemon restart. See the [V2 Hook contract](../../../docs/user-guide/en/agent-security/agent-sec-core/skillsec-v2.md#agent-hook-integration).
 
 ---
 

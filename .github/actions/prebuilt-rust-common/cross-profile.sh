@@ -16,10 +16,12 @@ GNU228_X86_BASE="docker.io/dockcross/manylinux_2_28-x64@sha256:263b776c5dc6ae7e5
 GNU228_X86_IMAGE="anolisa/rust-release-builder:gnu2.28-x86_64"
 GNU228_X86_IMAGE_ID="sha256:0a5c24bde830394d0fb585a4c7c2021b315e394bf3a3e3abb22401b70e4b35db"
 GNU228_ARM_BASE="docker.io/dockcross/manylinux_2_28-aarch64@sha256:63d09e1726a914c85b0087aa00b966df896fac962095310b915332f0135bfd74"
-GNU228_ARM_IMAGE="anolisa/rust-release-builder:gnu2.28-aarch64"
-GNU228_ARM_IMAGE_ID="sha256:8c0788e130476253259a838d7ddad7d04a34778d60ab391f6fabaf007639a2dd"
+GNU228_ARM_IMAGE="anolisa/rust-release-builder:gnu2.28-aarch64-agentsight"
+GNU228_ARM_IMAGE_ID="sha256:a60fbfb3f5bf4f5d6787ef0737fc3df7919a8da527f903fd71b4e838c443b736"
 DARWIN_IMAGE="anolisa/rust-release-builder:darwin11-aarch64"
 DARWIN_IMAGE_ID="sha256:f43abc5ea60980fe1a452607ebc481ea0636bb6e6f0acbd03f7ed1f5064459e1"
+DARWIN_X86_IMAGE="anolisa/rust-release-builder:darwin11-x86_64"
+DARWIN_X86_IMAGE_ID="sha256:938ed84677d6f90b95719e3e9f69d6b4613b0b09aa47c9e7ece659ccfdd62ddc"
 DARWIN_SDK_SHA256="71ebe09d97f45d48c9814e69b524ee3577dddfe7393aa4eac8615f07d6f7e0f5"
 DARWIN_OSXCROSS_REF="27d21e4977c9751d01199c7a226a6faf494c3dd9"
 
@@ -33,6 +35,7 @@ profile_target() {
         gnu2.17-x86_64|gnu2.28-x86_64) printf 'x86_64-unknown-linux-gnu\n' ;;
         gnu2.17-aarch64|gnu2.28-aarch64) printf 'aarch64-unknown-linux-gnu\n' ;;
         darwin11-aarch64) printf 'aarch64-apple-darwin\n' ;;
+        darwin11-x86_64) printf 'x86_64-apple-darwin\n' ;;
         *) die "unsupported release Cross profile: $1" ;;
     esac
 }
@@ -44,6 +47,7 @@ profile_image() {
         gnu2.28-x86_64) printf '%s\n' "$GNU228_X86_IMAGE" ;;
         gnu2.28-aarch64) printf '%s\n' "$GNU228_ARM_IMAGE" ;;
         darwin11-aarch64) printf '%s\n' "$DARWIN_IMAGE" ;;
+        darwin11-x86_64) printf '%s\n' "$DARWIN_X86_IMAGE" ;;
         *) die "unsupported release Cross profile: $1" ;;
     esac
 }
@@ -55,6 +59,7 @@ profile_image_id() {
         gnu2.28-x86_64) printf '%s\n' "$GNU228_X86_IMAGE_ID" ;;
         gnu2.28-aarch64) printf '%s\n' "$GNU228_ARM_IMAGE_ID" ;;
         darwin11-aarch64) printf '%s\n' "$DARWIN_IMAGE_ID" ;;
+        darwin11-x86_64) printf '%s\n' "$DARWIN_X86_IMAGE_ID" ;;
         *) die "unsupported release Cross profile: $1" ;;
     esac
 }
@@ -73,7 +78,7 @@ profile_path() {
         gnu2.28-aarch64)
             printf '/usr/xcc/aarch64-unknown-linux-gnu/bin:/opt/rh/gcc-toolset-14/root/usr/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n'
             ;;
-        darwin11-aarch64)
+        darwin11-aarch64|darwin11-x86_64)
             printf '/opt/osxcross/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n'
             ;;
         *) die "unsupported release Cross profile: $1" ;;
@@ -136,15 +141,26 @@ verify_linux_profile() {
             clang-devel llvm-devel elfutils-libelf-devel systemd-devel \
             fuse3-devel openssl-devel zlib-devel libzstd-devel \
             pkgconf-pkg-config >/dev/null
+        docker run --rm --entrypoint sh "$image" -c '
+            set -eu
+            test -f /usr/include/fuse3/fuse.h
+            readelf -h /usr/lib64/libfuse3.so.3 | grep -Fq X86-64
+            pkg-config --exists fuse3
+        '
     elif [ "$profile" = gnu2.28-aarch64 ]; then
         docker run --rm --entrypoint sh "$image" -c '
             set -eu
-            sysroot="$(aarch64-unknown-linux-gnu-gcc --print-sysroot)"
+            sysroot=/usr/xcc/aarch64-unknown-linux-gnu/aarch64-unknown-linux-gnu/sysroot
             test -f "$sysroot/usr/include/openssl/ssl.h"
             readelf -h "$sysroot/usr/lib64/libssl.so.1.1" | grep -Fq AArch64
-            PKG_CONFIG_SYSROOT_DIR="$sysroot" \
+            test -f "$sysroot/usr/include/libelf.h"
+            readelf -h "$sysroot/usr/lib64/libelf.so.1" | grep -Fq AArch64
+            clang --version >/dev/null
+            test -f "$sysroot/usr/include/fuse3/fuse.h"
+            readelf -h "$sysroot/usr/lib64/libfuse3.so.3" | grep -Fq AArch64
+            PKG_CONFIG_PATH= PKG_CONFIG_SYSROOT_DIR="$sysroot" \
                 PKG_CONFIG_LIBDIR="$sysroot/usr/lib64/pkgconfig:$sysroot/usr/share/pkgconfig" \
-                pkg-config --exists openssl
+                pkg-config --exists openssl fuse3
         '
     elif [ "$profile" = gnu2.17-x86_64 ]; then
         docker run --rm --entrypoint sh "$image" -c \
@@ -157,10 +173,13 @@ verify_linux_profile() {
 
 verify_darwin_profile() {
     local image="$1"
+    local profile="$2"
+    local target
+    target="$(profile_target "$profile")"
 
-    [ "$(image_label "$image" org.anolisa.release-builder.profile)" = darwin11-aarch64 ] || \
-        die "$image does not identify profile darwin11-aarch64"
-    [ "$(image_label "$image" org.anolisa.release-builder.target)" = aarch64-apple-darwin ] || \
+    [ "$(image_label "$image" org.anolisa.release-builder.profile)" = "$profile" ] || \
+        die "$image does not identify profile $profile"
+    [ "$(image_label "$image" org.anolisa.release-builder.target)" = "$target" ] || \
         die "$image target label is invalid"
     [ "$(image_label "$image" org.anolisa.release-builder.macos-deployment-target)" = 11.0 ] || \
         die "$image deployment target label is invalid"
@@ -172,11 +191,12 @@ verify_darwin_profile() {
         die "$image osxcross revision label is invalid"
     docker run --rm --entrypoint sh "$image" -c '
         set -eu
-        test -x /usr/local/bin/aarch64-apple-darwin-clang
-        test -x /usr/local/bin/aarch64-apple-darwin-ar
+        test -x "/usr/local/bin/$1-clang"
+        test -x "/usr/local/bin/$1-clang++"
+        test -x "/usr/local/bin/$1-ar"
         test -d /opt/osxcross/SDK/MacOSX15.5.sdk
-        /usr/local/bin/aarch64-apple-darwin-clang --version >/dev/null
-    '
+        "/usr/local/bin/$1-clang" --version >/dev/null
+    ' sh "$target"
 }
 
 verify_profile() {
@@ -197,8 +217,8 @@ verify_profile() {
     actual="$(docker run --rm --entrypoint /usr/local/bin/sccache "$image" --version)"
     [ "$actual" = "sccache $SCCACHE_VERSION" ] || \
         die "$image cannot run sccache $SCCACHE_VERSION"
-    if [ "$profile" = darwin11-aarch64 ]; then
-        verify_darwin_profile "$image"
+    if [[ "$profile" == darwin11-* ]]; then
+        verify_darwin_profile "$image" "$profile"
     else
         verify_linux_profile "$profile" "$image"
     fi
@@ -265,9 +285,9 @@ run_profile() {
             linker=aarch64-unknown-linux-gnu-gcc
             archiver=aarch64-unknown-linux-gnu-ar
             ;;
-        darwin11-aarch64)
-            linker=aarch64-apple-darwin-clang
-            archiver=aarch64-apple-darwin-ar
+        darwin11-aarch64|darwin11-x86_64)
+            linker="$target-clang"
+            archiver="$target-ar"
             ;;
     esac
 
@@ -281,7 +301,7 @@ run_profile() {
     if [ -n "${SOURCE_DATE_EPOCH:-}" ]; then
         container_opts+=" --env=SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH"
     fi
-    if [ "$profile" = darwin11-aarch64 ]; then
+    if [[ "$profile" == darwin11-* ]]; then
         deployment=11.0
         container_opts+=" --env=MACOSX_DEPLOYMENT_TARGET=$deployment"
         container_opts+=" --env=SDKROOT=/opt/osxcross/SDK/MacOSX.sdk"
@@ -297,7 +317,7 @@ run_profile() {
             "CARGO_ENCODED_RUSTFLAGS=$encoded" \
             "CARGO_TARGET_${target_env}_LINKER=$linker" \
             "CC_${target//-/_}=$linker" \
-            "CXX_${target//-/_}=aarch64-apple-darwin-clang++" \
+            "CXX_${target//-/_}=$target-clang++" \
             "AR_${target//-/_}=$archiver" \
             "CFLAGS_${target//-/_}=-mmacosx-version-min=$deployment" \
             "CXXFLAGS_${target//-/_}=-mmacosx-version-min=$deployment" \
@@ -305,8 +325,13 @@ run_profile() {
     else
         if [ "$profile" = gnu2.17-aarch64 ] || [ "$profile" = gnu2.28-aarch64 ]; then
             local sysroot=/usr/xcc/aarch64-unknown-linux-gnu/aarch64-unknown-linux-gnu/sysroot
-            container_opts+=" --env=PKG_CONFIG_SYSROOT_DIR=$sysroot"
-            container_opts+=" --env=PKG_CONFIG_LIBDIR=$sysroot/usr/lib64/pkgconfig:$sysroot/usr/share/pkgconfig"
+            container_opts+=" --env=CC_aarch64_unknown_linux_gnu=$linker"
+            container_opts+=" --env=CXX_aarch64_unknown_linux_gnu=aarch64-unknown-linux-gnu-g++"
+            container_opts+=" --env=AR_aarch64_unknown_linux_gnu=$archiver"
+            container_opts+=" --env=HOST_CC=gcc --env=HOST_CXX=g++ --env=HOST_AR=ar"
+            container_opts+=" --env=PKG_CONFIG_SYSROOT_DIR_aarch64_unknown_linux_gnu=$sysroot"
+            container_opts+=" --env=PKG_CONFIG_LIBDIR_aarch64_unknown_linux_gnu=$sysroot/usr/lib64/pkgconfig:$sysroot/usr/share/pkgconfig"
+            container_opts+=" --env=PKG_CONFIG_PATH_aarch64_unknown_linux_gnu="
         fi
         env RUSTUP_TOOLCHAIN="$RUST_TOOLCHAIN" \
             "$image_env=$image" \

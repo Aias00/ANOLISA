@@ -1,9 +1,15 @@
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use anyhow::Context;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::info;
-use ws_ckpt_common::{ErrorCode, ResolveError, Response, SnapshotEntry, SnapshotMeta};
+use ws_ckpt_common::{
+    encoded_size, ErrorCode, ResolveError, Response, SnapshotEntry, SnapshotListItem, SnapshotMeta,
+    SnapshotSummary, MAX_FRAME_SIZE,
+};
 
 use std::path::{Path, PathBuf};
 
@@ -20,7 +26,7 @@ pub(crate) struct CleanupOutcome {
 /// Batch-deletes eligible snapshots while the caller holds `state.lock_wsid(ws_id)`.
 ///
 /// The index stays unchanged during the backend call. Once every outcome is known,
-/// one write-lock acquisition applies only confirmed removals and `NotFound` markers.
+/// one write-lock acquisition prunes absent ordinary records and marks absent evidence.
 pub(crate) async fn delete_snapshots_locked(
     state: &DaemonState,
     arc: &Arc<RwLock<WorkspaceState>>,
@@ -130,12 +136,21 @@ pub(crate) async fn delete_snapshots_locked(
 
     let index_changed = !removed.is_empty() || !not_found.is_empty();
     if index_changed {
-        let removed_set = removed.iter().cloned().collect();
         let mut ws = arc.write().await;
+        not_found.retain(|id| {
+            if ws.index.governed_evidence.contains_key(id) {
+                true
+            } else {
+                removed.push(id.clone());
+                false
+            }
+        });
+        let removed_set = removed.iter().cloned().collect();
         ws.index.prune_chain(&removed_set);
         for id in &removed {
             ws.index.snapshots.remove(id);
             ws.index.governed_evidence.remove(id);
+            ws.index.recovered_orphans.remove(id);
         }
         for id in &not_found {
             if let Some(meta) = ws.index.snapshots.get_mut(id) {
@@ -219,12 +234,30 @@ pub async fn checkpoint(
     // 2. Acquire write lock after the mutation mutex.
     let mut ws = arc.write().await;
 
-    // 2a. Check write-lock quiescence (inotify-based)
-    if !state.check_workspace_quiescent(&ws.ws_id).await {
-        return Ok(Response::Error {
-            code: ErrorCode::WriteLockConflict,
-            message: "Workspace has active write operations. Please wait and retry.".to_string(),
-        });
+    // 2a. Check write-lock quiescence (inotify-based). The workspace write
+    // lock is held here, so the registration path is handed to the check
+    // directly instead of its opportunistic (never-runnable) heal path.
+    match state
+        .check_workspace_quiescent(&ws.ws_id, Some(&ws.path))
+        .await
+    {
+        crate::state::Quiescence::Safe => {}
+        crate::state::Quiescence::Writing => {
+            return Ok(Response::Error {
+                code: ErrorCode::WriteLockConflict,
+                message: "Workspace has active write operations. Please wait and retry."
+                    .to_string(),
+            })
+        }
+        crate::state::Quiescence::MonitoringUnavailable => {
+            return Ok(Response::Error {
+                code: ErrorCode::WriteLockConflict,
+                message:
+                    "Write monitoring is unavailable (the write watcher is stale and re-arming \
+                     failed). Please retry after the watcher recovers."
+                        .to_string(),
+            })
+        }
     }
 
     // 3. Check snapshot ID uniqueness within this workspace
@@ -261,17 +294,24 @@ pub async fn checkpoint(
     // make sure index directory exists
     tokio::fs::create_dir_all(&snap_dir).await?;
 
-    // 7. Create readonly snapshot via backend
+    // 7. Parse metadata BEFORE the backend creates the subvolume. A parse
+    //    failure after `create_snapshot` would strand an on-disk snapshot the
+    //    index never records: `list` cannot see it, `delete` answers
+    //    SnapshotNotFound, a same-ID retry fails with a raw btrfs EEXIST, and
+    //    only a daemon restart adopts it as a pinned recovered orphan. The
+    //    guarded V2 path validates metadata first for the same reason.
+    let parsed_metadata = match metadata {
+        Some(ref s) => Some(serde_json::from_str(s).context("invalid metadata JSON")?),
+        None => None,
+    };
+
+    // 8. Create readonly snapshot via backend
     state
         .backend
         .create_snapshot(&ws.ws_id, &snapshot_id)
         .await?;
 
-    // 8. Build metadata
-    let parsed_metadata = match metadata {
-        Some(ref s) => Some(serde_json::from_str(s)?),
-        None => None,
-    };
+    // 9. Build metadata
     let meta = SnapshotMeta {
         message,
         metadata: parsed_metadata,
@@ -282,7 +322,7 @@ pub async fn checkpoint(
         child_ids: vec![ws_ckpt_common::LIVE_CHILD.to_string()],
     };
 
-    // 9. Update index (maintain DAG bidirectional pointers)
+    // 10. Update index (maintain DAG bidirectional pointers)
     if let Some(old_head) = ws.index.head.clone() {
         if let Some(hm) = ws.index.snapshots.get_mut(&old_head) {
             hm.child_ids.retain(|c| c != ws_ckpt_common::LIVE_CHILD);
@@ -292,19 +332,19 @@ pub async fn checkpoint(
     ws.index.snapshots.insert(snapshot_id.clone(), meta);
     ws.index.head = Some(snapshot_id.clone());
 
-    // 10. Persist index
+    // 11. Persist index
     index_store::save(&snap_dir, &ws.index).await?;
 
-    // 10a. Release write lock before save_manifest (try_read inside
+    // 11a. Release write lock before save_manifest (try_read inside
     //      collect_workspace_entries would fail while write lock is held)
     drop(ws);
 
-    // 10b. Save manifest
+    // 11b. Save manifest
     if let Err(e) = state.save_manifest().await {
         tracing::warn!("save_manifest failed after checkpoint: {:#}", e);
     }
 
-    // 11. Return success
+    // 12. Return success
     Ok(Response::CheckpointOk { snapshot_id })
 }
 
@@ -355,6 +395,11 @@ pub async fn rollback(
 
     // 5. Rollback via backend (includes warmup, snapshot, cleanup)
     state.backend.rollback(&ws.ws_id, &resolved_id).await?;
+
+    // 5a. The backend swapped the live subvolume (rename aside + snapshot
+    // recreate + delete). The inotify watch still names the retired inode,
+    // so re-arm it or every later checkpoint's quiescence check is a no-op.
+    state.rearm_watcher(&ws.ws_id, &ws.path);
 
     // 6. Update head + migrate LIVE_CHILD
     if let Some(old_head) = ws.index.head.clone() {
@@ -463,7 +508,10 @@ fn reject_missing_snapshot(
     if index.snapshots.get(snapshot_id).is_some_and(|s| s.missing) {
         return Err(Box::new(Response::Error {
             code: ErrorCode::SnapshotNotFound,
-            message: format!("Snapshot '{}' subvolume is missing (data lost). Use 'ws-ckpt delete --force -w <workspace> -s {}' to remove the record.", snapshot_id, snapshot_id),
+            message: format!(
+                "Snapshot '{}' is unavailable: subvolume is missing",
+                snapshot_id
+            ),
         }));
     }
 
@@ -476,7 +524,11 @@ pub async fn warmup_snapshot_metadata(snap_path: &Path) {
 }
 
 /// List all snapshots for a workspace, sorted by created_at ascending.
-pub async fn list_snapshots(state: &Arc<DaemonState>, workspace: &str) -> anyhow::Result<Response> {
+pub async fn list_snapshots(
+    state: &Arc<DaemonState>,
+    workspace: &str,
+    orphans_only: bool,
+) -> anyhow::Result<Response> {
     let arc = match state.resolve_workspace(workspace).await {
         Some(a) => a,
         None => return Ok(workspace_not_found(workspace)),
@@ -494,6 +546,7 @@ pub async fn list_snapshots(state: &Arc<DaemonState>, workspace: &str) -> anyhow
         .index
         .snapshots
         .iter()
+        .filter(|(id, _)| !orphans_only || ws.index.recovered_orphans.contains(*id))
         .map(|(id, meta)| (id.clone(), meta.clone()))
         .collect();
 
@@ -515,7 +568,10 @@ pub async fn list_snapshots(state: &Arc<DaemonState>, workspace: &str) -> anyhow
 }
 
 /// List snapshots across all registered workspaces, sorted by created_at ascending.
-pub async fn list_all_snapshots(state: &Arc<DaemonState>) -> anyhow::Result<Response> {
+pub async fn list_all_snapshots(
+    state: &Arc<DaemonState>,
+    orphans_only: bool,
+) -> anyhow::Result<Response> {
     let all_ws = state.all_workspaces();
     let mut all_entries: Vec<SnapshotEntry> = Vec::new();
 
@@ -523,6 +579,9 @@ pub async fn list_all_snapshots(state: &Arc<DaemonState>) -> anyhow::Result<Resp
         let ws = arc.read().await;
         let ws_path = ws.index.workspace_path.to_string_lossy().to_string();
         for (id, meta) in &ws.index.snapshots {
+            if orphans_only && !ws.index.recovered_orphans.contains(id) {
+                continue;
+            }
             all_entries.push(SnapshotEntry {
                 id: id.clone(),
                 workspace: ws_path.clone(),
@@ -537,6 +596,290 @@ pub async fn list_all_snapshots(state: &Arc<DaemonState>) -> anyhow::Result<Resp
     Ok(Response::ListOk {
         snapshots: all_entries,
     })
+}
+
+const LIST_CURSOR_VERSION: u8 = 1;
+const MAX_CURSOR_LEN: usize = 16 * 1024;
+const TARGET_LIST_PAGE_SIZE: u64 = 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+struct ListKey {
+    created_at: DateTime<Utc>,
+    workspace_id: String,
+    snapshot_id: String,
+}
+
+impl ListKey {
+    fn sort_key(&self) -> (DateTime<Utc>, &str, &str) {
+        (self.created_at, &self.workspace_id, &self.snapshot_id)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ListCursor {
+    version: u8,
+    scope: Option<String>,
+    orphans_only: bool,
+    after: ListKey,
+    upper: ListKey,
+}
+
+fn encode_list_cursor(
+    scope: Option<String>,
+    after: ListKey,
+    upper: ListKey,
+    orphans_only: bool,
+) -> String {
+    hex::encode(
+        serde_json::to_vec(&ListCursor {
+            version: LIST_CURSOR_VERSION,
+            scope,
+            orphans_only,
+            after,
+            upper,
+        })
+        .expect("list cursor fields are serializable"),
+    )
+}
+
+fn decode_list_cursor(
+    raw: &str,
+    scope: &Option<String>,
+    orphans_only: bool,
+) -> Result<ListCursor, String> {
+    if raw.len() > MAX_CURSOR_LEN {
+        return Err("list cursor is too long".to_string());
+    }
+    let bytes = hex::decode(raw).map_err(|_| "list cursor is not valid".to_string())?;
+    let cursor: ListCursor =
+        serde_json::from_slice(&bytes).map_err(|_| "list cursor is not valid".to_string())?;
+    if cursor.version != LIST_CURSOR_VERSION {
+        return Err("list cursor version is not supported".to_string());
+    }
+    if &cursor.scope != scope || cursor.orphans_only != orphans_only {
+        return Err("list cursor does not match the requested workspace scope".to_string());
+    }
+    if cursor.after > cursor.upper {
+        return Err("list cursor bounds are invalid".to_string());
+    }
+    Ok(cursor)
+}
+
+fn list_meta_matches_key(meta: &SnapshotMeta, key: &ListKey) -> bool {
+    meta.created_at == key.created_at
+}
+
+fn page_error(message: impl Into<String>) -> Response {
+    Response::Error {
+        code: ErrorCode::InternalError,
+        message: message.into(),
+    }
+}
+
+/// Read one cursor page without cloning the complete global snapshot index.
+pub async fn list_snapshot_page(
+    state: &Arc<DaemonState>,
+    workspace: Option<&str>,
+    limit: usize,
+    raw_cursor: Option<&str>,
+    orphans_only: bool,
+) -> anyhow::Result<Response> {
+    let arcs = if let Some(workspace) = workspace {
+        let Some(arc) = state.resolve_workspace(workspace).await else {
+            return Ok(workspace_not_found(workspace));
+        };
+        if let Some(resp) = state.detached_registration_error(&arc).await {
+            return Ok(resp);
+        }
+        vec![arc]
+    } else {
+        state.all_workspaces()
+    };
+
+    let scope = if workspace.is_some() {
+        let ws = arcs[0].read().await;
+        Some(ws.ws_id.clone())
+    } else {
+        None
+    };
+    let decoded = match raw_cursor {
+        Some(raw) => match decode_list_cursor(raw, &scope, orphans_only) {
+            Ok(cursor) => Some(cursor),
+            Err(message) => return Ok(page_error(message)),
+        },
+        None => None,
+    };
+    let after = decoded.as_ref().map(|cursor| &cursor.after);
+    let cursor_upper = decoded.as_ref().map(|cursor| &cursor.upper);
+    // Keep at most limit + 1 identity keys. Compare borrowed fields before
+    // allocating candidate keys; the index is still scanned once per page.
+    let candidate_cap = limit.saturating_add(1);
+    let mut candidates: BTreeMap<ListKey, Arc<RwLock<WorkspaceState>>> = BTreeMap::new();
+    let mut observed_upper: Option<ListKey> = None;
+    for arc in arcs {
+        let ws = arc.read().await;
+        let mut workspace_upper = None;
+        for (id, meta) in &ws.index.snapshots {
+            if orphans_only && !ws.index.recovered_orphans.contains(id) {
+                continue;
+            }
+            let key = (meta.created_at, ws.ws_id.as_str(), id.as_str());
+            // Existing timestamps may lie ahead of the wall clock after a clock
+            // correction. Capture the maximum observed key, not Utc::now().
+            if cursor_upper.is_none() && workspace_upper.is_none_or(|current| key > current) {
+                workspace_upper = Some(key);
+            }
+            if cursor_upper.is_some_and(|upper| key > upper.sort_key())
+                || after.is_some_and(|after| key <= after.sort_key())
+            {
+                continue;
+            }
+            if candidates.len() == candidate_cap
+                && candidates
+                    .last_key_value()
+                    .is_some_and(|(last, _)| key >= last.sort_key())
+            {
+                continue;
+            }
+            candidates.insert(
+                ListKey {
+                    created_at: meta.created_at,
+                    workspace_id: ws.ws_id.clone(),
+                    snapshot_id: id.clone(),
+                },
+                Arc::clone(&arc),
+            );
+            if candidates.len() > candidate_cap {
+                candidates.pop_last();
+            }
+        }
+        if let Some(key) = workspace_upper {
+            if observed_upper
+                .as_ref()
+                .is_none_or(|current| key > current.sort_key())
+            {
+                observed_upper = Some(ListKey {
+                    created_at: key.0,
+                    workspace_id: key.1.to_string(),
+                    snapshot_id: key.2.to_string(),
+                });
+            }
+        }
+    }
+
+    let Some(upper) = cursor_upper.cloned().or(observed_upper) else {
+        return Ok(Response::ListPageOk {
+            snapshots: vec![],
+            next_cursor: None,
+        });
+    };
+
+    build_list_page(scope, upper, limit, candidates, orphans_only).await
+}
+
+async fn build_list_page(
+    scope: Option<String>,
+    upper: ListKey,
+    limit: usize,
+    candidates: BTreeMap<ListKey, Arc<RwLock<WorkspaceState>>>,
+    orphans_only: bool,
+) -> anyhow::Result<Response> {
+    let candidate_count = candidates.len();
+    let mut snapshots = Vec::new();
+    let mut serialized_items_size = 0_u64;
+    let mut last_examined = None;
+    let mut stopped_for_budget = false;
+    for (index, (key, arc)) in candidates.into_iter().enumerate() {
+        if index >= limit {
+            break;
+        }
+        let ws = arc.read().await;
+        let meta = ws
+            .index
+            .snapshots
+            .get(&key.snapshot_id)
+            .filter(|meta| list_meta_matches_key(meta, &key));
+        let Some(meta) = meta else {
+            // A deleted/recreated candidate must not replace the cursor that
+            // was budgeted with an accepted item. Empty pages still advance.
+            if snapshots.is_empty() {
+                last_examined = Some(key);
+            }
+            continue;
+        };
+        let workspace = ws.index.workspace_path.to_string_lossy().to_string();
+        let entry = SnapshotListItem::Full(SnapshotEntry {
+            id: key.snapshot_id.clone(),
+            workspace: workspace.clone(),
+            meta: meta.clone(),
+        });
+        let continuation =
+            encode_list_cursor(scope.clone(), key.clone(), upper.clone(), orphans_only);
+        let base_size = encoded_size(&Response::ListPageOk {
+            snapshots: vec![],
+            next_cursor: Some(continuation),
+        })?;
+        let entry_size = encoded_size(&entry)?;
+        let full_size = base_size
+            .checked_add(serialized_items_size)
+            .and_then(|size| size.checked_add(entry_size))
+            .context("list page size overflow")?;
+
+        if !snapshots.is_empty() && full_size > TARGET_LIST_PAGE_SIZE {
+            stopped_for_budget = true;
+            break;
+        }
+        let selected = if full_size > u64::from(MAX_FRAME_SIZE) {
+            let summary = SnapshotListItem::Summary(SnapshotSummary {
+                id: key.snapshot_id.clone(),
+                workspace,
+                created_at: meta.created_at,
+                pinned: meta.pinned,
+                missing: meta.missing,
+                omitted_fields: vec![
+                    "message".to_string(),
+                    "metadata".to_string(),
+                    "parent_id".to_string(),
+                    "child_ids".to_string(),
+                ],
+            });
+            let summary_item_size = encoded_size(&summary)?;
+            let summary_size = base_size
+                .checked_add(serialized_items_size)
+                .and_then(|size| size.checked_add(summary_item_size))
+                .context("list summary page size overflow")?;
+            if summary_size > u64::from(MAX_FRAME_SIZE) {
+                return Ok(page_error(
+                    "snapshot identity and continuation cursor exceed the IPC frame limit",
+                ));
+            }
+            summary
+        } else {
+            entry
+        };
+        serialized_items_size = serialized_items_size
+            .checked_add(encoded_size(&selected)?)
+            .context("list page item size overflow")?;
+        snapshots.push(selected);
+        last_examined = Some(key);
+    }
+
+    let has_more = stopped_for_budget || candidate_count > limit;
+    let next_cursor = if has_more {
+        last_examined.map(|after| encode_list_cursor(scope, after, upper, orphans_only))
+    } else {
+        None
+    };
+    let response = Response::ListPageOk {
+        snapshots,
+        next_cursor,
+    };
+    if encoded_size(&response)? > u64::from(MAX_FRAME_SIZE) {
+        return Ok(page_error(
+            "snapshot page and continuation cursor exceed the IPC frame limit",
+        ));
+    }
+    Ok(response)
 }
 
 /// Compute diff between two snapshots.
@@ -577,6 +920,12 @@ pub async fn diff_snapshots(
         }
         None => None,
     };
+
+    for id in std::iter::once(&from_id).chain(to_id.iter()) {
+        if let Err(resp) = reject_missing_snapshot(&ws.index, id) {
+            return Ok(*resp);
+        }
+    }
 
     let changes = state
         .backend
@@ -701,6 +1050,219 @@ mod tests {
         WorkspaceGenerationTokenV2,
     };
 
+    #[test]
+    fn list_candidate_rejects_reused_snapshot_id_with_new_key() {
+        let created_at = Utc::now();
+        let key = ListKey {
+            created_at,
+            workspace_id: "ws".into(),
+            snapshot_id: "snapshot".into(),
+        };
+        let replacement = SnapshotMeta {
+            message: Some("replacement".into()),
+            metadata: None,
+            created_at: created_at + Duration::seconds(1),
+            parent_id: None,
+            child_ids: Vec::new(),
+            pinned: false,
+            missing: false,
+        };
+
+        assert!(!list_meta_matches_key(&replacement, &key));
+    }
+
+    #[tokio::test]
+    async fn list_page_orphan_filter_is_bound_to_cursor() {
+        for workspace in [Some("ws-test"), None] {
+            let fx = GuardFixture::new("ws-test");
+            let arc = fx.state.get_by_wsid("ws-test").unwrap();
+            {
+                let mut ws = arc.write().await;
+                let created_at = Utc::now();
+                for id in ["a", "b", "c"] {
+                    ws.index
+                        .snapshots
+                        .insert(id.into(), make_snapshot_meta_at(false, created_at));
+                }
+                ws.index.recovered_orphans.extend(["a".into(), "c".into()]);
+            }
+            let first = list_snapshot_page(&fx.state, workspace, 1, None, true)
+                .await
+                .unwrap();
+            let Response::ListPageOk {
+                snapshots,
+                next_cursor: Some(cursor),
+            } = first
+            else {
+                panic!("expected orphan page and cursor");
+            };
+            assert!(
+                matches!(snapshots.as_slice(), [SnapshotListItem::Full(entry)] if entry.id == "a")
+            );
+            let mismatch = list_snapshot_page(&fx.state, workspace, 1, Some(&cursor), false)
+                .await
+                .unwrap();
+            assert!(
+                matches!(mismatch, Response::Error { message, .. } if message.contains("scope"))
+            );
+            let second = list_snapshot_page(&fx.state, workspace, 10, Some(&cursor), true)
+                .await
+                .unwrap();
+            assert!(
+                matches!(second, Response::ListPageOk { snapshots, next_cursor: None }
+                if matches!(snapshots.as_slice(), [SnapshotListItem::Full(entry)] if entry.id == "c"))
+            );
+            let all = list_snapshot_page(&fx.state, workspace, 10, None, false)
+                .await
+                .unwrap();
+            assert!(
+                matches!(all, Response::ListPageOk { snapshots, next_cursor: None } if snapshots.len() == 3)
+            );
+            let legacy = crate::dispatcher::dispatch(
+                &fx.state,
+                ws_ckpt_common::Request::ListOrphans {
+                    workspace: workspace.map(str::to_string),
+                },
+            )
+            .await;
+            assert!(matches!(legacy, Response::ListOk { snapshots }
+                if snapshots.len() == 2 && snapshots.iter().all(|entry| entry.id != "b")));
+        }
+    }
+
+    #[tokio::test]
+    async fn list_page_includes_preexisting_future_timestamps() {
+        for workspace in [Some("ws-test"), None] {
+            let fx = GuardFixture::new("ws-test");
+            let arc = fx.state.get_by_wsid("ws-test").unwrap();
+            let future = Utc::now() + Duration::days(365);
+            {
+                let mut ws = arc.write().await;
+                for (id, seconds) in [("a", 0), ("b", 1)] {
+                    ws.index.snapshots.insert(
+                        id.into(),
+                        make_snapshot_meta_at(false, future + Duration::seconds(seconds)),
+                    );
+                }
+            }
+            let first = list_snapshot_page(&fx.state, workspace, 1, None, false)
+                .await
+                .unwrap();
+            let Response::ListPageOk {
+                snapshots,
+                next_cursor: Some(cursor),
+            } = first
+            else {
+                panic!(
+                    "expected a page and cursor for preexisting future-dated snapshots: {first:?}"
+                );
+            };
+            assert!(
+                matches!(snapshots.as_slice(), [SnapshotListItem::Full(entry)] if entry.id == "a")
+            );
+            let scope = workspace.map(str::to_string);
+            assert_eq!(
+                decode_list_cursor(&cursor, &scope, false)
+                    .unwrap()
+                    .upper
+                    .snapshot_id,
+                "b"
+            );
+            arc.write().await.index.snapshots.insert(
+                "c".into(),
+                make_snapshot_meta_at(false, future + Duration::seconds(2)),
+            );
+            let second = list_snapshot_page(&fx.state, workspace, 10, Some(&cursor), false)
+                .await
+                .unwrap();
+            assert!(
+                matches!(second, Response::ListPageOk { snapshots, next_cursor: None }
+                if matches!(snapshots.as_slice(), [SnapshotListItem::Full(entry)] if entry.id == "b"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn list_page_cursor_budget_survives_deleted_or_reused_candidates() {
+        for replaced in [false, true] {
+            let fx = GuardFixture::new("ws-test");
+            let arc = fx.state.get_by_wsid("ws-test").unwrap();
+            let created_at = Utc::now();
+            let key = |id: String| ListKey {
+                created_at,
+                workspace_id: "ws-test".into(),
+                snapshot_id: id,
+            };
+            let first = key("a".into());
+            let skipped = key(format!("b{}", "x".repeat(100)));
+            let upper = key("c".into());
+            let scope = None;
+            let cursor = encode_list_cursor(scope.clone(), first.clone(), upper.clone(), false);
+            let mut entry = SnapshotEntry {
+                id: first.snapshot_id.clone(),
+                workspace: fx.ws_link.to_string_lossy().into_owned(),
+                meta: make_snapshot_meta_at(false, created_at),
+            };
+            entry.meta.message = Some(String::new());
+            let overhead = encoded_size(&Response::ListPageOk {
+                snapshots: vec![SnapshotListItem::Full(entry.clone())],
+                next_cursor: Some(cursor),
+            })
+            .unwrap();
+            entry.meta.message =
+                Some("x".repeat((u64::from(MAX_FRAME_SIZE) - overhead - 100) as usize));
+            {
+                let mut ws = arc.write().await;
+                ws.index
+                    .snapshots
+                    .insert(first.snapshot_id.clone(), entry.meta);
+                ws.index.snapshots.insert(
+                    upper.snapshot_id.clone(),
+                    make_snapshot_meta_at(false, created_at),
+                );
+                // Simulate deletion/recreation between candidate selection and page assembly.
+                if replaced {
+                    ws.index.snapshots.insert(
+                        skipped.snapshot_id.clone(),
+                        make_snapshot_meta_at(false, created_at + Duration::seconds(1)),
+                    );
+                }
+            }
+            let candidates = [first.clone(), skipped, upper.clone()]
+                .into_iter()
+                .map(|key| (key, arc.clone()))
+                .collect();
+            let response = build_list_page(scope.clone(), upper, 2, candidates, false)
+                .await
+                .unwrap();
+            assert!(
+                ws_ckpt_common::encode_frame(&response).is_ok(),
+                "final cursor must fit the actual response, even after skipped candidates"
+            );
+            let Response::ListPageOk {
+                snapshots,
+                next_cursor: Some(cursor),
+            } = response
+            else {
+                panic!("expected a usable page");
+            };
+            assert!(
+                matches!(snapshots.as_slice(), [SnapshotListItem::Full(entry)] if entry.id == "a")
+            );
+            assert_eq!(
+                decode_list_cursor(&cursor, &scope, false).unwrap().after,
+                first
+            );
+            let next = list_snapshot_page(&fx.state, None, 2, Some(&cursor), false)
+                .await
+                .unwrap();
+            assert!(
+                matches!(next, Response::ListPageOk { snapshots, next_cursor: None }
+                if matches!(snapshots.as_slice(), [SnapshotListItem::Full(entry)] if entry.id == "c"))
+            );
+        }
+    }
+
     fn test_backend() -> Arc<dyn StorageBackend> {
         Arc::new(crate::backends::btrfs_loop::BtrfsLoopBackend::new(
             PathBuf::from("/tmp/test-mount"),
@@ -783,7 +1345,7 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let backend: Arc<dyn StorageBackend> =
                 Arc::new(crate::backends::btrfs_loop::BtrfsLoopBackend::new(
-                    temp.path().to_path_buf(),
+                    temp.path().join("data"),
                     temp.path().join("test.img"),
                 ));
             let state = Arc::new(DaemonState::new(
@@ -791,15 +1353,17 @@ mod tests {
                 backend,
                 temp.path().join("state"),
             ));
-            let subvol = temp.path().join(ws_id);
+            let subvol = state.backend.data_root().join(ws_id);
             std::fs::create_dir_all(&subvol).unwrap();
             let ws_link = temp.path().join("ws-link");
             std::os::unix::fs::symlink(&subvol, &ws_link).unwrap();
-            state.register_workspace(
-                ws_id.to_string(),
-                ws_link.clone(),
-                SnapshotIndex::new(ws_link.clone()),
-            );
+            state
+                .register_workspace(
+                    ws_id.to_string(),
+                    ws_link.clone(),
+                    SnapshotIndex::new(ws_link.clone()),
+                )
+                .unwrap();
             Self {
                 _temp: temp,
                 state,
@@ -881,7 +1445,7 @@ mod tests {
                 .unwrap();
             assert_detach_error(resp, "rollback_preview", expect_dir_note);
 
-            let resp = list_snapshots(&fx.state, &ws_ref).await.unwrap();
+            let resp = list_snapshots(&fx.state, &ws_ref, false).await.unwrap();
             assert_detach_error(resp, "list_snapshots", expect_dir_note);
 
             let resp = diff_snapshots(&fx.state, &ws_ref, "snap-1", None)
@@ -933,7 +1497,7 @@ mod tests {
         }
 
         assert!(matches!(
-            list_snapshots(&fx.state, &ws_ref).await.unwrap(),
+            list_snapshots(&fx.state, &ws_ref, false).await.unwrap(),
             Response::ListOk { .. }
         ));
 
@@ -964,8 +1528,12 @@ mod tests {
         // completed — and must report the registration live.
         let fx = GuardFixture::new("ws-swap");
         let arc = fx.state.get_by_wsid(&fx.ws_id).unwrap();
-        let live = fx._temp.path().join(&fx.ws_id);
-        let tmp = fx._temp.path().join(format!("{}.rollback-tmp", fx.ws_id));
+        let live = fx.state.backend.data_root().join(&fx.ws_id);
+        let tmp = fx
+            .state
+            .backend
+            .data_root()
+            .join(format!("{}.rollback-tmp", fx.ws_id));
 
         let (mid_swap, swapped) = tokio::sync::oneshot::channel::<()>();
         let writer_arc = arc.clone();
@@ -1032,11 +1600,13 @@ mod tests {
         std::fs::create_dir(&subvol).unwrap();
         let ws_link = temp.path().join("ws-link");
         std::os::unix::fs::symlink(&subvol, &ws_link).unwrap();
-        state.register_workspace(
-            ws_id.to_string(),
-            ws_link.clone(),
-            SnapshotIndex::new(ws_link),
-        );
+        state
+            .register_workspace(
+                ws_id.to_string(),
+                ws_link.clone(),
+                SnapshotIndex::new(ws_link),
+            )
+            .unwrap();
         let arc = state.get_by_wsid(ws_id).unwrap();
 
         let probe_state = state.clone();
@@ -1215,6 +1785,89 @@ mod tests {
             }
             other => panic!("expected SnapshotAlreadyExists, got {other:?}"),
         }
+    }
+
+    // ── Checkpoint metadata validation ordering ──
+
+    #[tokio::test]
+    async fn checkpoint_invalid_metadata_creates_no_backend_snapshot() {
+        // `metadata` must be parsed BEFORE the backend snapshot is created.
+        // Parsing after the create strands an on-disk snapshot the index never
+        // records: `list` cannot see it, `delete` answers SnapshotNotFound,
+        // a same-ID retry fails with a raw btrfs EEXIST, and only the next
+        // daemon restart adopts it as a pinned recovered orphan.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_root = tmp.path().join("meta-order-data");
+        let backend = Arc::new(PartialFailBackend::new(
+            data_root.clone(),
+            std::iter::empty(),
+        ));
+        let state = Arc::new(DaemonState::new(
+            test_config(),
+            backend.clone() as Arc<dyn StorageBackend>,
+            tmp.path().join("state"),
+        ));
+
+        let ws_id = "ws-meta-order";
+        let subvol = data_root.join(ws_id);
+        std::fs::create_dir_all(&subvol).unwrap();
+        std::fs::write(subvol.join("content"), b"non-empty").unwrap();
+        let ws_path = tmp.path().join("ws-link");
+        std::os::unix::fs::symlink(&subvol, &ws_path).unwrap();
+        state
+            .register_workspace(
+                ws_id.to_string(),
+                ws_path.clone(),
+                SnapshotIndex::new(ws_path),
+            )
+            .unwrap();
+
+        let err = checkpoint(
+            &state,
+            ws_id,
+            "snap-1",
+            None,
+            Some("{not json".into()),
+            false,
+        )
+        .await
+        .expect_err("invalid metadata JSON must fail the checkpoint");
+
+        assert_eq!(
+            backend
+                .create_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "backend create_snapshot must not run for invalid metadata"
+        );
+        assert!(
+            format!("{err:#}").contains("invalid metadata JSON"),
+            "error should explain the metadata failure, got: {err:#}"
+        );
+
+        // The failed attempt left the ID unrecorded, so a corrected retry
+        // proceeds to the backend instead of tripping over a leftover
+        // subvolume from the rejected request.
+        assert!(matches!(
+            checkpoint(
+                &state,
+                ws_id,
+                "snap-1",
+                None,
+                Some(r#"{"k":1}"#.into()),
+                false
+            )
+            .await
+            .unwrap(),
+            Response::CheckpointOk { .. }
+        ));
+        assert_eq!(
+            backend
+                .create_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the corrected retry must reach the backend exactly once"
+        );
     }
 
     // ── SnapshotMeta pinned logic test ──
@@ -1629,7 +2282,7 @@ mod tests {
             async fn delete_snapshot(&self, _: &str, _: &str) -> anyhow::Result<()> {
                 unimplemented!()
             }
-            async fn recover_workspace(&self, _: &str, _: &str) -> anyhow::Result<()> {
+            async fn recover_workspace(&self, _: &str, _: &str) -> anyhow::Result<Vec<String>> {
                 unimplemented!()
             }
             async fn cleanup_snapshots(
@@ -1679,7 +2332,9 @@ mod tests {
         index
             .snapshots
             .insert("snap-from".to_string(), make_snapshot_meta(false));
-        state.register_workspace("ws-diff-live".to_string(), ws_link.clone(), index);
+        state
+            .register_workspace("ws-diff-live".to_string(), ws_link.clone(), index)
+            .unwrap();
 
         let resp = diff_snapshots(&state, "ws-diff-live", "snap-from", None)
             .await
@@ -1858,7 +2513,7 @@ mod tests {
         async fn delete_snapshot(&self, _: &str, _: &str) -> anyhow::Result<()> {
             unimplemented!()
         }
-        async fn recover_workspace(&self, _: &str, _: &str) -> anyhow::Result<()> {
+        async fn recover_workspace(&self, _: &str, _: &str) -> anyhow::Result<Vec<String>> {
             unimplemented!()
         }
         async fn diff(
@@ -1910,11 +2565,13 @@ mod tests {
         std::fs::write(subvol.join("content"), b"non-empty").unwrap();
         let ws_path = tmp.path().join("ws-link");
         std::os::unix::fs::symlink(&subvol, &ws_path).unwrap();
-        state.register_workspace(
-            ws_id.to_string(),
-            ws_path.clone(),
-            chain_index(&ws_path, ws_id, 2),
-        );
+        state
+            .register_workspace(
+                ws_id.to_string(),
+                ws_path.clone(),
+                chain_index(&ws_path, ws_id, 2),
+            )
+            .unwrap();
 
         let cleanup_state = state.clone();
         let cleanup =
@@ -2038,7 +2695,9 @@ mod tests {
             };
         }
         idx.head = Some("snap-5".to_string());
-        state.register_workspace("ws-partial".to_string(), ws_path.clone(), idx);
+        state
+            .register_workspace("ws-partial".to_string(), ws_path.clone(), idx)
+            .unwrap();
 
         // keep=0 → all 5 are removal candidates. cleanup_snapshots returns
         // Ok(Response) for routing errors (e.g. WorkspaceNotFound) but Err
@@ -2134,6 +2793,215 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deleting_absent_exact_id_never_retargets_its_prefix_peer() {
+        for gc_before_delete in [false, true] {
+            for scoped in [false, true] {
+                let fx = GuardFixture::new("ws-exact");
+                fx.add_snapshot("snap-1").await;
+                fx.add_snapshot("snap-10").await;
+                let peer = fx
+                    .state
+                    .backend
+                    .snapshots_root()
+                    .join(&fx.ws_id)
+                    .join("snap-10");
+                std::fs::create_dir_all(&peer).unwrap();
+                std::fs::write(peer.join("canary"), "preserved").unwrap();
+                let arc = fx.state.get_by_wsid(&fx.ws_id).unwrap();
+                index_store::save(&fx.state.index_dir(&fx.ws_id), &arc.read().await.index)
+                    .await
+                    .unwrap();
+                fx.state.save_manifest().await.unwrap();
+                let state = if gc_before_delete {
+                    let manifest = ws_ckpt_common::persist::load_state(&fx.state.state_dir)
+                        .unwrap()
+                        .unwrap();
+                    Arc::new(
+                        DaemonState::rebuild_from_persisted(
+                            &manifest,
+                            test_config(),
+                            fx.state.backend.clone(),
+                            fx.state.state_dir.clone(),
+                            "persisted",
+                        )
+                        .await
+                        .unwrap(),
+                    )
+                } else {
+                    fx.state.clone()
+                };
+                state.mark_bootstrapped();
+                // Includes the first NotFound that removes a stale record and
+                // identical retries, with and without force or workspace scope.
+                for force in [false, false, true, true] {
+                    let response = crate::dispatcher::dispatch(
+                        &state,
+                        ws_ckpt_common::Request::Delete {
+                            workspace: scoped.then(|| fx.ws_id.clone()),
+                            snapshot: "snap-1".into(),
+                            force,
+                        },
+                    )
+                    .await;
+                    assert!(
+                        matches!(
+                            response,
+                            Response::Error {
+                                code: ErrorCode::SnapshotNotFound,
+                                ..
+                            }
+                        ),
+                        "{response:?}"
+                    );
+                    assert!(state
+                        .get_by_wsid(&fx.ws_id)
+                        .unwrap()
+                        .read()
+                        .await
+                        .index
+                        .snapshots
+                        .contains_key("snap-10"));
+                    assert_eq!(
+                        std::fs::read_to_string(peer.join("canary")).unwrap(),
+                        "preserved"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_reconciles_interrupted_cleanup_and_preserves_evidence() {
+        let fx = GuardFixture::new("ws-reconcile");
+        let arc = fx.state.get_by_wsid(&fx.ws_id).unwrap();
+        let mut index = chain_index(&fx.ws_link, &fx.ws_id, 5);
+        for id in ["snap-2", "snap-3", "snap-5"] {
+            index.governed_evidence.remove(id);
+        }
+        index.snapshots.get_mut("snap-5").unwrap().pinned = true;
+        index.snapshots.get_mut("snap-1").unwrap().missing = true;
+        arc.write().await.index = index.clone();
+        index_store::save(&fx.state.index_dir(&fx.ws_id), &index)
+            .await
+            .unwrap();
+        fx.state.save_manifest().await.unwrap();
+        let manifest = ws_ckpt_common::persist::load_state(&fx.state.state_dir)
+            .unwrap()
+            .unwrap();
+        let snapshots = fx.state.backend.snapshots_root().join(&fx.ws_id);
+        // Persisted chain survives a crash after physical deletion of snap-2/3.
+        // snap-4 is governed, snap-5 pinned, and an orphan has no index entry.
+        for id in ["snap-1", "orphan", ".hidden", "index.json"] {
+            std::fs::create_dir_all(snapshots.join(id)).unwrap();
+            std::fs::write(snapshots.join(id).join("canary"), id).unwrap();
+        }
+        for _ in 0..2 {
+            let restarted = Arc::new(
+                DaemonState::rebuild_from_persisted(
+                    &manifest,
+                    test_config(),
+                    fx.state.backend.clone(),
+                    fx.state.state_dir.clone(),
+                    "persisted",
+                )
+                .await
+                .unwrap(),
+            );
+            let restored = index_store::load(&restarted.index_dir(&fx.ws_id))
+                .await
+                .unwrap();
+            assert_eq!(restored.snapshots.len(), 6);
+            assert!(restored.snapshots.contains_key(".hidden"));
+            assert!(restored.snapshots.contains_key("index.json"));
+            assert!(!restored.snapshots.contains_key("snap-2"));
+            assert!(!restored.snapshots.contains_key("snap-3"));
+            assert!(!restored.snapshots["snap-1"].missing);
+            assert_eq!(
+                restored.snapshots["snap-4"].parent_id.as_deref(),
+                Some("snap-1")
+            );
+            assert_eq!(restored.snapshots["snap-1"].child_ids, vec!["snap-4"]);
+            assert!(restored.snapshots["snap-4"].missing);
+            assert!(restored.snapshots["snap-5"].missing);
+            assert_eq!(restored.governed_evidence, index.governed_evidence);
+            assert_eq!(restored.head.as_deref(), Some("snap-5"));
+            assert!(!restored.snapshots["orphan"].missing);
+            assert!(restored.snapshots["orphan"].pinned);
+            assert!(restored.recovered_orphans.contains("orphan"));
+            assert_eq!(restored.snapshots["orphan"].parent_id, None);
+            let Response::ListOk { snapshots: listed } =
+                list_snapshots(&restarted, &fx.ws_id, false).await.unwrap()
+            else {
+                panic!("expected list response");
+            };
+            assert_eq!(listed.len(), 6);
+            for (from, to) in [("snap-4", None), ("snap-1", Some("snap-4"))] {
+                assert!(matches!(
+                    diff_snapshots(&restarted, &fx.ws_id, from, to)
+                        .await
+                        .unwrap(),
+                    Response::Error {
+                        code: ErrorCode::SnapshotNotFound,
+                        ..
+                    }
+                ));
+            }
+            assert!(matches!(
+                crate::workspace_mgr::delete_snapshot(&restarted, &fx.ws_id, "snap-4", false)
+                    .await
+                    .unwrap(),
+                Response::Error {
+                    code: ErrorCode::SnapshotNotFound,
+                    ..
+                }
+            ));
+            let restored = index_store::load(&restarted.index_dir(&fx.ws_id))
+                .await
+                .unwrap();
+            assert_eq!(restored.governed_evidence, index.governed_evidence);
+            for id in ["snap-1", "orphan", ".hidden", "index.json"] {
+                assert_eq!(
+                    std::fs::read_to_string(snapshots.join(id).join("canary")).unwrap(),
+                    id
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cleanup_not_found_prunes_ordinary_record_but_keeps_failed_delete() {
+        let temp = tempfile::tempdir().unwrap();
+        let backend = Arc::new(
+            PartialFailBackend::new(temp.path().join("data"), ["snap-2".to_string()])
+                .with_not_found(["snap-1".to_string()]),
+        );
+        let state = Arc::new(DaemonState::new(
+            test_config(),
+            backend.clone(),
+            temp.path().join("state"),
+        ));
+        let subvol = backend.data_root().join("ws-ordinary");
+        std::fs::create_dir_all(&subvol).unwrap();
+        let link = temp.path().join("workspace");
+        std::os::unix::fs::symlink(&subvol, &link).unwrap();
+        let mut index = chain_index(&link, "ws-ordinary", 2);
+        index.governed_evidence.clear();
+        state
+            .register_workspace("ws-ordinary".into(), link, index)
+            .unwrap();
+        assert!(cleanup_snapshots(&state, "ws-ordinary", Some(0))
+            .await
+            .is_err());
+        let index = index_store::load(&state.index_dir("ws-ordinary"))
+            .await
+            .unwrap();
+        assert_eq!(index.snapshots.len(), 1);
+        assert!(!index.snapshots["snap-2"].missing);
+        assert_eq!(index.snapshots["snap-2"].parent_id, None);
+        assert_eq!(index.head.as_deref(), Some("snap-2"));
+    }
+
+    #[tokio::test]
     async fn cleanup_not_found_marks_missing_and_stops_recleaning() {
         // A NotFound entry remains in the DAG but is marked `missing`, persisted,
         // and excluded from later cleanup passes.
@@ -2154,7 +3022,9 @@ mod tests {
         let ws_path = tmp.path().join("ws-nf-link");
         std::os::unix::fs::symlink(&subvol, &ws_path).unwrap();
         let idx = chain_index(&ws_path, "ws-nf", 3);
-        state.register_workspace("ws-nf".to_string(), ws_path.clone(), idx);
+        state
+            .register_workspace("ws-nf".to_string(), ws_path.clone(), idx)
+            .unwrap();
 
         // keep=0 → all three selected; snap-2 comes back NotFound. NotFound
         // is not a failure → no bail, the CLI stays exit-zero.

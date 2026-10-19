@@ -9,6 +9,106 @@ Tokenless 的所有重要变更都会记录在此文件中。
 
 ## [未发布]
 
+## [0.8.7] - 2026-10-15
+
+### 修复
+
+- 当 JSON 响应包含解析时无法保持精确数值的数字时，保留完整原文；仅在解码能恢复相同数值和类型时使用 TOON 转换，避免静默丢失数值精度（[#7069](https://github.com/agentic-os-org/ANOLISA/pull/7069)）。
+- OpenCode Schema 压缩保留可执行的参数校验器，仅修改发送给模型的 JSON Schema；只提供运行时 codec 的旧版宿主会跳过 Schema 压缩（[#7048](https://github.com/agentic-os-org/ANOLISA/pull/7048)）。
+- Qwen Code 和 OpenCode 卸载脚本遵守 `ANOLISA_DRY_RUN=1`，仅预览移除操作，不删除插件注册或修改启用设置（[#7348](https://github.com/agentic-os-org/ANOLISA/pull/7348)）。
+- 压缩与检索在统计数据库无法打开时发出告警，同时继续返回正常结果；遗漏的统计不会重试或重放（[#7395](https://github.com/agentic-os-org/ANOLISA/pull/7395)）。
+- Selective-Claw 将归档摘要与当前对话窗口的召回 ID 正确对应，不再用不完整或被改写轮次的摘要覆盖无关归档摘要（[#7042](https://github.com/agentic-os-org/ANOLISA/pull/7042)）。
+- 发布校验接受规范化的 Python 预发布 wheel 文件名，同时独立校验原始 release tag 拼写，并拒绝 pip 无法安装的文件名（[#5271](https://github.com/agentic-os-org/ANOLISA/pull/5271)）。
+
+## [0.8.6] - 2026-10-14
+
+### 新增
+
+- 新增 QwenWorkCN 本地模式适配器，支持命令改写、响应压缩和显式侧载桌面插件。适配器随 raw、npm 和 RPM 包分发；不支持安全工作区或 VM 会话（[#7257](https://github.com/agentic-os-org/ANOLISA/pull/7257)）。
+
+### 变更
+
+- **不兼容变更：** OpenClaw 适配器现在要求 OpenClaw 2026.6.6 或更新版本，并在同一轮模型请求前对支持的实时工具结果进行无损压缩。持久化时不再重复压缩结果。2026.8.2 等旧宿主可能在中间件执行前截断文本，Tokenless 无法恢复已丢失的内容，建议使用包含上游修复 `2f620b970a04` 的构建（[#7124](https://github.com/agentic-os-org/ANOLISA/pull/7124)）。
+
+### 修复
+
+- 使用长选项、组合短选项或多个表达式的静默、仅打印 `sed` 命令现在能正确保留 HTML 源码。修改内容或从文件读取脚本的命令不再被视为普通文件读取（[#4963](https://github.com/agentic-os-org/ANOLISA/pull/4963)）。
+- HTML 行内代码包含连续反引号时，现在会使用足够长的 Markdown 分隔符，保持代码片段完整（[#6393](https://github.com/agentic-os-org/ANOLISA/pull/6393)）。
+- 在 macOS 上，RTK 命令改写清理仅包含已退出组长的进程组时，不再拒绝原本成功的结果（[#7257](https://github.com/agentic-os-org/ANOLISA/pull/7257)）。
+- 通用及 Codex stdin hook 现在会忽略非对象 JSON 载荷，Codex 响应诊断也会忽略结构无效的载荷，避免不支持的输入触发异常堆栈（[#6691](https://github.com/agentic-os-org/ANOLISA/pull/6691)、[#6663](https://github.com/agentic-os-org/ANOLISA/pull/6663)）。
+- AgentScope 2.x 和 QwenPaw 现在会将格式错误的工具参数原样交给宿主处理，不再中止整次 Agent 回复；这些调用的响应处理仍保持无损（[#5288](https://github.com/agentic-os-org/ANOLISA/pull/5288)、[#5299](https://github.com/agentic-os-org/ANOLISA/pull/5299)）。
+- stderr 不可写时，Stats 和 Stash 库的警告不再中断原本成功的压缩、统计读取或检索（[#6911](https://github.com/agentic-os-org/ANOLISA/pull/6911)）。
+- Selective-Claw 对每个请求轮次只返回一次，并保留首次请求的顺序，避免重复召回输出和 Token 开销（[#4859](https://github.com/agentic-os-org/ANOLISA/pull/4859)）。
+- Selective-Claw 历史对齐现在会区分工具结果的调用 ID、工具标识及错误状态，即使文本相同也能保留不同结果（[#7040](https://github.com/agentic-os-org/ANOLISA/pull/7040)）。
+
+## [0.8.5] - 2026-10-11
+
+### 新增
+
+- 现在会在成功写入 SQLite Stash 时回收过期的载荷，只有压缩写入的工作负载无需先执行检索即可清理旧载荷。这不会立即缩小数据库文件，也不代表安全擦除已删除的数据（[#3565](https://github.com/agentic-os-org/ANOLISA/pull/3565)）。
+
+### 变更
+
+- CLI、Runtime 和 Python SDK 现在默认开启完整 HTML 页面的渲染。可通过 `TOKENLESS_HTML_EXTRACTION_ENABLED=0` 或 SDK `html_extraction_enabled=False` 关闭；环境变量为空时保留默认值。Git diff 上下文裁剪仍需显式开启（[#3473](https://github.com/agentic-os-org/ANOLISA/pull/3473)）。
+
+### 修复
+
+- 对于提供命令行的适配器，包括 OpenClaw、DSH、QwenPaw 和 AgentScope，`cat page.html` 等普通 Shell 文件读取现在会保持 HTML 源码原样。JSON、表格及其他支持的文件数据仍可压缩（[#3481](https://github.com/agentic-os-org/ANOLISA/pull/3481)）。
+- 单个起始字节顺序标记不再阻止 HTML、JSON、表格或堆栈跟踪进入对应的内容处理器；支持恢复的转换会保留原始字节（[#3486](https://github.com/agentic-os-org/ANOLISA/pull/3486)、[#4888](https://github.com/agentic-os-org/ANOLISA/pull/4888)）。
+- 首尾带括号但并非单个有效 JSON 文档的工具输出，包括拼接的文档和 NDJSON，现在保持原样，不再导致 PostTool 调用失败（[#4159](https://github.com/agentic-os-org/ANOLISA/pull/4159)）。
+- 带有 `env -i`、`env -u` 或 Cargo `+toolchain` 的构建、测试命令现在会保留原生日志供构建日志压缩使用，不再交给 RTK（[#4270](https://github.com/agentic-os-org/ANOLISA/pull/4270)）。
+- 即使父进程退出后子孙进程仍持有 stdout，RTK 命令改写也会遵守超时限制，并清理所属进程组（[#3552](https://github.com/agentic-os-org/ANOLISA/pull/3552)）。
+- 并发 hook 初始化或迁移统计数据库时不再竞争添加相同的列，失败的迁移会整体回滚（[#3607](https://github.com/agentic-os-org/ANOLISA/pull/3607)）。
+- 统计历史和会话差异报告现在按实际时间排序，包括混合 UTC 偏移及亚毫秒差异，使最新记录的数量限制和压缩链保持正确（[#3848](https://github.com/agentic-os-org/ANOLISA/pull/3848)）。
+- 统计记录和检索事件写入失败时现在会输出 `[tokenless-stats]` 警告，同时继续完成压缩和检索；stderr 本身不可写时也不会中断（[#3587](https://github.com/agentic-os-org/ANOLISA/pull/3587)）。
+- AgentScope 1.x 的全新安装现在包含较新 SQLAlchemy 所需的 `greenlet` 依赖。以位置参数传入的应用 postprocessor 也会正确衔接，并先于 Tokenless 处理执行（[#3496](https://github.com/agentic-os-org/ANOLISA/pull/3496)、[#3706](https://github.com/agentic-os-org/ANOLISA/pull/3706)）。
+- Hermes 现在会为失败或已停止的 Shell 调用保留完整错误封装，避免丢失只存在于 output 字段之外的诊断信息（[#3815](https://github.com/agentic-os-org/ANOLISA/pull/3815)）。
+- OpenCode 现在会转发非零 Bash 退出码供诊断，清理超时 hook 及其子孙进程，并按 UTF-8 字节执行 1 MiB 的 hook 输出限制。超限的 hook 响应会使工具输出保持原样（[#4398](https://github.com/agentic-os-org/ANOLISA/pull/4398)、[#3818](https://github.com/agentic-os-org/ANOLISA/pull/3818)、[#4757](https://github.com/agentic-os-org/ANOLISA/pull/4757)）。
+- OpenCode 宿主对已返回工具 Schema 的修改不再影响后续调用使用的缓存 Schema（[#4731](https://github.com/agentic-os-org/ANOLISA/pull/4731)）。
+- Qwen Code 适配器安装使用 `--dry-run` 时不再调用宿主 CLI、写入清单或改变当前扩展链接（[#4397](https://github.com/agentic-os-org/ANOLISA/pull/4397)）。
+- `npm rebuild` 现在可替换失效的 `tokenless` 和 `rtk` 启动器符号链接，并支持重复执行（[#4711](https://github.com/agentic-os-org/ANOLISA/pull/4711)）。
+- OpenClaw 查找二进制时现在会跳过 `PATH` 中的同名目录，继续找到后面的可执行文件或可执行符号链接（[#4855](https://github.com/agentic-os-org/ANOLISA/pull/4855)）。
+- Selective-Claw 轮次召回现在按请求顺序合并实时与归档轮次，并绑定宿主会话，避免交错处理的会话将 `expand_turn` 重定向到另一段对话（[#4670](https://github.com/agentic-os-org/ANOLISA/pull/4670)、[#4782](https://github.com/agentic-os-org/ANOLISA/pull/4782)）。
+- Selective-Claw 现在会区分开头的 system 或隐式轮次与后续 user 轮次，并将旧归档迁移为一致的序数轮次 ID（[#4673](https://github.com/agentic-os-org/ANOLISA/pull/4673)、[#4693](https://github.com/agentic-os-org/ANOLISA/pull/4693)）。
+- Selective-Claw 首次创建全文索引时，现在会使已有归档消息也能被搜索到（[#4689](https://github.com/agentic-os-org/ANOLISA/pull/4689)）。
+- Selective-Claw 重复执行生命周期调用时不再重复导入已替换的对话历史，重启引擎后也保持一致（[#4700](https://github.com/agentic-os-org/ANOLISA/pull/4700)）。
+- Selective-Claw 从归档恢复结构化宿主消息，在组装存储上下文时保留工具标识、内容块、角色别名和元数据（[#4699](https://github.com/agentic-os-org/ANOLISA/pull/4699)）。
+- Selective-Claw 现在会持久化不含 user 消息的轮次摘要，并将摘要与回退预览计入上下文 Token 估算（[#4698](https://github.com/agentic-os-org/ANOLISA/pull/4698)、[#4662](https://github.com/agentic-os-org/ANOLISA/pull/4662)）。
+- Selective-Claw 现在遵循 OpenClaw 的 `pluginConfig` 选项并展开 `~/` 归档路径，包括禁用注册的设置（[#4822](https://github.com/agentic-os-org/ANOLISA/pull/4822)）。
+
+## [0.8.4] - 2026-09-22
+
+### 新增
+
+- 在 npm 安装之外新增独立安装脚本及 `install-tokenless` OS Skill 入口。安装脚本在开始安装前选择 npm 或仅限 Linux 的源码构建，记录安装路径归属以供卸载，并在替换失败时恢复原有安装。源码构建仅安装 CLI；npm 还提供 RTK 和适配器（[#2322](https://github.com/alibaba/anolisa/pull/2322)）。
+
+### 变更
+
+- npm 安装现在要求 Node.js 16.7 或更新版本，并保留属于其他安装的共享适配器资源。用户可通过 `ANOLISA_TOKENLESS_FORCE_ADAPTERS=1` 显式替换；否则安装程序会报告包内适配器的位置（[#2322](https://github.com/alibaba/anolisa/pull/2322)）。
+- 独立卸载仅移除安装记录中仍归本次安装所有的资源，除非指定 `--purge`，否则保留运行数据；无法确认框架注册已移除时保留适配器资源。Codex 插件显示为 `not installed` 时视为已成功移除，使重复卸载可以正常完成（[#2322](https://github.com/alibaba/anolisa/pull/2322)、[#3412](https://github.com/alibaba/anolisa/pull/3412)）。
+
+### 修复
+
+- HTML 提取现在将页面 `</html>` 结束标签后的命令输出（如构建日志和 HTTP 状态码）保留在渲染后的页面之后，避免内容丢失。模仿页面边界标记的文本会被转义，并继续支持恢复原文（[#3386](https://github.com/alibaba/anolisa/pull/3386)）。
+- HTML 提取不再将包含大量自闭合 SVG 元素的浅层页面误判为嵌套过深。深度限制现在依据解析后的页面结构，异常标记和宽表格也不会再触发可能拖慢工具结果返回的重复扫描（[#3396](https://github.com/alibaba/anolisa/pull/3396)）。
+
+## [0.8.3] - 2026-09-20
+
+### 新增
+
+- Git diff 上下文裁剪可在保留全部变更行和文件元数据的同时缩减周边上下文，并支持恢复收到的原始内容。通过 `TOKENLESS_DIFF_COMPRESSION_ENABLED=1` 或 SDK `diff_compression_enabled=True` 启用；默认关闭，要求宿主支持文本替换和原文恢复（[#3299](https://github.com/alibaba/anolisa/pull/3299)）。
+- 命令或 API 返回的完整 HTML 页面可渲染为 Markdown，提供原文恢复及被移除页面元素的计数。通过 `TOKENLESS_HTML_EXTRACTION_ENABLED=1` 或 SDK `html_extraction_enabled=True` 启用；默认关闭，要求宿主支持文本替换和原文恢复，文件读取保持原样，包括通过 Shell 文件读取命令输出的 HTML（[#3306](https://github.com/alibaba/anolisa/pull/3306)）。
+
+### 变更
+
+- npm 安装在 Claude CLI 可用时自动启用 Claude Code 适配器，注册未完成时给出重试指引（[#2193](https://github.com/alibaba/anolisa/pull/2193)）。
+- QwenPaw 安装在交付插件包前检查对应 SDK wheel，确认资源缺失时报告版本和 URL。离线或镜像环境可通过 `ANOLISA_SKIP_WHEEL_PREFLIGHT=1` 跳过探测（[#3289](https://github.com/alibaba/anolisa/pull/3289)）。
+
+### 修复
+
+- Claude Code 检测在有界等待窗口内退避重试已部署插件，减少宿主注册表尚未更新时误报“未安装”的情况（[#3272](https://github.com/alibaba/anolisa/pull/3272)）。
+- Raw 包现在声明并包含 OpenCode 适配器和适配器清单，使 ANOLISA 能发现并管理随包提供的插件。启用或禁用后需重启 OpenCode（[#3324](https://github.com/alibaba/anolisa/pull/3324)、[#3346](https://github.com/alibaba/anolisa/pull/3346)）。
+
 ## [0.8.2] - 2026-09-15
 
 ### 新增

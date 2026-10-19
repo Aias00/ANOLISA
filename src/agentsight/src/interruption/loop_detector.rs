@@ -18,13 +18,15 @@ use super::types::{InterruptionEvent, InterruptionType};
 /// Configuration for the loop detector.
 #[derive(Debug, Clone)]
 pub struct LoopDetectorConfig {
-    /// Number of consecutive calls with the same tool sequence to trigger (default: 5)
+    /// Number of consecutive calls with the same tool sequence to trigger
+    /// (default: 5). `0` disables rule 1.
     pub tool_sequence_repeat_threshold: usize,
     /// Sliding window of recent calls to inspect (default: 10)
     pub window_size: usize,
     /// Jaccard similarity threshold for output text (0.0~1.0, default: 0.85)
     pub output_similarity_threshold: f64,
-    /// Number of consecutive similar outputs to trigger (default: 3)
+    /// Number of consecutive similar outputs to trigger (default: 3).
+    /// `0` disables rule 2 (output similarity) and rule 3 (token burn).
     pub similar_output_repeat_threshold: usize,
 }
 
@@ -102,6 +104,14 @@ impl LoopDetector {
     /// `recent_calls` should be ordered oldest-first (ascending by timestamp).
     /// The current call being processed should already be included as the last element.
     ///
+    /// `None` means the caller could not read the window at all, which is not
+    /// the same as an empty one: every rule below treats a short window as "too
+    /// few repetitions to be a loop", so judging an unreadable window would
+    /// answer "no loop" for a conversation that may well have one. A failed
+    /// read never fires.
+    ///
+    /// A rule whose repeat threshold is `0` is disabled and never fires.
+    ///
     /// Returns `Some(InterruptionEvent)` if a loop is detected.
     pub fn detect(
         &self,
@@ -110,8 +120,9 @@ impl LoopDetector {
         agent_name: Option<&str>,
         pid: Option<i32>,
         occurred_at_ns: i64,
-        recent_calls: &[RecentCallSummary],
+        recent_calls: Option<&[RecentCallSummary]>,
     ) -> Option<InterruptionEvent> {
+        let recent_calls = recent_calls?;
         let min_threshold = self
             .config
             .tool_sequence_repeat_threshold
@@ -170,6 +181,11 @@ impl LoopDetector {
     /// is followed by a text summary call.
     fn detect_tool_sequence_loop(&self, calls: &[RecentCallSummary]) -> Option<serde_json::Value> {
         let threshold = self.config.tool_sequence_repeat_threshold;
+        // Zero disables the rule: `len.saturating_sub(0)` yields an empty tail
+        // and indexing it below would panic.
+        if threshold == 0 {
+            return None;
+        }
 
         // Filter to only calls that have tool calls (ignore pure-text responses)
         let tool_bearing: Vec<&RecentCallSummary> =
@@ -206,6 +222,10 @@ impl LoopDetector {
         calls: &[RecentCallSummary],
     ) -> Option<serde_json::Value> {
         let threshold = self.config.similar_output_repeat_threshold;
+        // Zero disables the rule; see `detect_tool_sequence_loop`.
+        if threshold == 0 {
+            return None;
+        }
 
         // Filter to only calls that have text output
         let text_bearing: Vec<&RecentCallSummary> = calls
@@ -250,6 +270,10 @@ impl LoopDetector {
     /// alternate — we check the text responses for repetitive content with growing context.
     fn detect_token_burn(&self, calls: &[RecentCallSummary]) -> Option<serde_json::Value> {
         let threshold = self.config.similar_output_repeat_threshold;
+        // Zero disables the rule; see `detect_tool_sequence_loop`.
+        if threshold == 0 {
+            return None;
+        }
 
         // Filter to only calls that have text output (ignore pure tool_call responses)
         let text_bearing: Vec<&RecentCallSummary> = calls
@@ -370,13 +394,23 @@ fn jaccard_similarity(a: &str, b: &str) -> f64 {
 }
 
 /// Truncate a string to at most `max_len` characters, appending "..." if truncated.
+///
+/// The budget is counted in characters on both sides — the length test used to
+/// count bytes while the cut counted characters, so a CJK snippet with fewer than
+/// `max_len` characters but more bytes kept its whole text *and* gained an
+/// ellipsis, telling the reader it had been cut when it had not. The ellipsis
+/// also comes out of the budget rather than being appended on top of it: the
+/// result is the length the caller asked for, not three characters more.
 fn truncate_str(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    if s.chars().count() <= max_len {
         s.to_string()
+    } else if max_len > 3 {
+        let kept: String = s.chars().take(max_len - 3).collect();
+        format!("{kept}...")
     } else {
-        let mut result: String = s.chars().take(max_len).collect();
-        result.push_str("...");
-        result
+        // Too small to hold the marker: keeping the bound matters more than
+        // signalling the cut.
+        s.chars().take(max_len).collect()
     }
 }
 
@@ -431,7 +465,7 @@ mod tests {
             make_call(vec!["read_file"], "some output", 100),
             make_call(vec!["read_file"], "some output", 200),
         ];
-        let result = detector.detect("conv-1", None, None, None, 1000, &calls);
+        let result = detector.detect("conv-1", None, None, None, 1000, Some(&calls));
         assert!(result.is_none());
     }
 
@@ -451,7 +485,7 @@ mod tests {
             Some("agent"),
             Some(123),
             1000,
-            &calls,
+            Some(&calls),
         );
         assert!(result.is_some());
         let event = result.unwrap();
@@ -471,7 +505,7 @@ mod tests {
             make_call(vec!["write_file"], "output b", 200),
             make_call(vec!["read_file", "search"], "output c", 300),
         ];
-        let result = detector.detect("conv-1", None, None, None, 1000, &calls);
+        let result = detector.detect("conv-1", None, None, None, 1000, Some(&calls));
         // Rule 1 won't trigger (sequences differ), Rule 2/3 also won't trigger
         assert!(result.is_none());
     }
@@ -499,7 +533,7 @@ mod tests {
                 )
             })
             .collect();
-        let result = detector.detect("conv-1", None, None, None, 1000, &calls);
+        let result = detector.detect("conv-1", None, None, None, 1000, Some(&calls));
         assert!(
             result.is_none(),
             "different arguments must not count as repetition"
@@ -520,7 +554,7 @@ mod tests {
                 )
             })
             .collect();
-        let result = detector.detect("conv-1", None, None, None, 1000, &calls);
+        let result = detector.detect("conv-1", None, None, None, 1000, Some(&calls));
         assert!(result.is_some());
         let event = result.unwrap();
         let detail: serde_json::Value =
@@ -548,7 +582,7 @@ mod tests {
                 }
             })
             .collect();
-        let result = detector.detect("conv-1", None, None, None, 1000, &calls);
+        let result = detector.detect("conv-1", None, None, None, 1000, Some(&calls));
         assert!(result.is_none());
     }
 
@@ -589,7 +623,7 @@ mod tests {
             Some("agent"),
             Some(123),
             1000,
-            &calls,
+            Some(&calls),
         );
         // Rule 1 should trigger: 5 tool-bearing calls all have ["read_file"]
         assert!(result.is_some());
@@ -620,7 +654,7 @@ mod tests {
                 300,
             ),
         ];
-        let result = detector.detect("conv-1", None, None, None, 1000, &calls);
+        let result = detector.detect("conv-1", None, None, None, 1000, Some(&calls));
         assert!(result.is_some());
         let event = result.unwrap();
         let detail: serde_json::Value =
@@ -636,7 +670,7 @@ mod tests {
             make_call(vec![], "totally unrelated text beta gamma", 200),
             make_call(vec![], "yet another unique response delta", 300),
         ];
-        let result = detector.detect("conv-1", None, None, None, 1000, &calls);
+        let result = detector.detect("conv-1", None, None, None, 1000, Some(&calls));
         assert!(result.is_none());
     }
 
@@ -652,7 +686,7 @@ mod tests {
             make_call(vec![], output, 2000),
             make_call(vec![], output, 3000),
         ];
-        let result = detector.detect("conv-1", None, None, None, 1000, &calls);
+        let result = detector.detect("conv-1", None, None, None, 1000, Some(&calls));
         assert!(result.is_some());
         let event = result.unwrap();
         let detail: serde_json::Value =
@@ -677,7 +711,7 @@ mod tests {
             make_call(vec![], output, 2000), // decreasing
             make_call(vec![], output, 1000), // decreasing
         ];
-        let result = detector.detect("conv-1", None, None, None, 1000, &calls);
+        let result = detector.detect("conv-1", None, None, None, 1000, Some(&calls));
         // Neither rule fires: thresholds raised, tokens not increasing
         assert!(result.is_none());
     }
@@ -706,7 +740,7 @@ mod tests {
             Some("agent"),
             Some(123),
             1000,
-            &calls,
+            Some(&calls),
         );
         assert!(result.is_some());
         let event = result.unwrap();
@@ -733,9 +767,41 @@ mod tests {
             make_call(vec!["read_file"], "", 18200),
             make_call(vec!["read_file"], "", 18400),
         ];
-        let result = detector.detect("conv-1", None, None, None, 1000, &calls);
+        let result = detector.detect("conv-1", None, None, None, 1000, Some(&calls));
         // No text output → Rule 3 can't trigger, Rule 1 threshold raised → nothing fires
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn zero_threshold_does_not_panic() {
+        // Zero means "disabled", not "match anything": a zero threshold made
+        // the tail slice empty and `tail[0]` panicked with an index-out-of-bounds.
+        let calls = vec![
+            make_call(vec!["read_file"], "some output", 100),
+            make_call(vec!["read_file"], "some output", 200),
+        ];
+
+        let detector = LoopDetector::new(LoopDetectorConfig {
+            tool_sequence_repeat_threshold: 0,
+            ..Default::default()
+        });
+        assert!(
+            detector
+                .detect("conv-1", None, None, None, 1000, Some(&calls))
+                .is_none(),
+            "zero tool-sequence threshold must disable rule 1"
+        );
+
+        let detector = LoopDetector::new(LoopDetectorConfig {
+            similar_output_repeat_threshold: 0,
+            ..Default::default()
+        });
+        assert!(
+            detector
+                .detect("conv-1", None, None, None, 1000, Some(&calls))
+                .is_none(),
+            "zero output-repeat threshold must disable rules 2 and 3"
+        );
     }
 
     #[test]
@@ -793,6 +859,53 @@ mod tests {
         assert!(
             sim > 0.7,
             "English similarity should still work, got {sim:.4}"
+        );
+    }
+
+    /// The documented postcondition is "at most `max_len` characters", on both
+    /// the byte/character axis and the ellipsis.
+    #[test]
+    fn truncate_str_counts_characters_and_reserves_room_for_the_ellipsis() {
+        // 60 CJK characters, 180 bytes: within the character budget, so it must
+        // come back untouched rather than labelled as truncated.
+        let short_cjk = "偏".repeat(60);
+        assert_eq!(truncate_str(&short_cjk, 100), short_cjk);
+
+        // 101 CJK characters: cut to the budget, ellipsis included.
+        let long_cjk = "偏".repeat(101);
+        let truncated = truncate_str(&long_cjk, 100);
+        assert_eq!(truncated.chars().count(), 100);
+        assert!(truncated.starts_with(&"偏".repeat(97)));
+        assert!(truncated.ends_with("..."));
+
+        // A budget smaller than the marker keeps the bound.
+        assert_eq!(truncate_str("abcdef", 2).chars().count(), 2);
+    }
+
+    /// A window the caller could not read must not be judged: every rule above
+    /// reads a short window as "too few repetitions to be a loop", so `None`
+    /// would answer "no loop" for a conversation that may well have one
+    /// (#7145). The same window that fires when it was read must stay silent
+    /// when it was not.
+    #[test]
+    fn test_unreadable_window_is_not_judged() {
+        let detector = LoopDetector::default();
+        let calls = vec![
+            make_call(vec!["read_file", "search"], "output a", 100),
+            make_call(vec!["read_file", "search"], "output b", 200),
+            make_call(vec!["read_file", "search"], "output c", 300),
+            make_call(vec!["read_file", "search"], "output d", 400),
+            make_call(vec!["read_file", "search"], "output e", 500),
+        ];
+        assert!(
+            detector
+                .detect("conv-1", None, None, None, 1000, Some(&calls))
+                .is_some()
+        );
+        assert!(
+            detector
+                .detect("conv-1", None, None, None, 1000, None)
+                .is_none()
         );
     }
 }

@@ -10,25 +10,37 @@
 修改文档前请先阅读
 [`specs/documentation-standard.md`](specs/documentation-standard.md)。该文件是文件位置、双语命名和文档同步要求的唯一规范来源。
 
+## 推荐的贡献方向
+
+如果希望寻找贡献方向，推荐优先参考 [Community Roadmap](https://github.com/agentic-os-org/ANOLISA/discussions/categories/community-roadmap) 中的组件专题。
+也欢迎提交 bug 报告、bug 修复，以及其他 Issue 和 PR。
+
+Roadmap 中的专题是候选方向，不代表排期承诺，也不代表任务已可认领。实现这些方向时，按以下 Issue 流程推进：
+
+1. 检索是否已有覆盖该方向的 Issue。如果没有，创建 Issue，链接原 Discussion 并说明拟实现的范围。
+2. 开始实现前，与组件 owner 确认当前版本、范围和验收标准。
+3. Issue 达到可认领状态后，按现有的
+   [社区认领流程](.github/TRIAGE.md#claiming-community-work)，在 Issue 中评论 `/claim`。
+4. 实现约定范围并提交关联 Issue 的 PR。PR 完成该 Issue 时，使用 `closes #<issue-number>`。
+
 ## 仓库概览
 
-ANOLISA 是一个 monorepo。下表列出十二个组件及其支持的开发平台。构建名称供
+ANOLISA 是一个 monorepo。下表列出组件支持的开发平台与入口。构建名称供
 `build-all.sh` 使用，scope 用于 commit subject 和 PR title。
 
 | 组件 | 路径 | 平台 | 构建名称 | Scope | 开发入口和最低本地门禁 |
 | --- | --- | --- | --- | --- | --- |
-| copilot-shell | `src/copilot-shell/` | 所有平台 | `cosh` | `cosh` | `cd src/copilot-shell`；`make deps`、`make build`、`make lint`、`make test` |
+| copilot-shell | `deprecated/copilot-shell/` | 所有平台 | `cosh` | `cosh` | `cd deprecated/copilot-shell`；`make deps`、`make build`、`make lint`、`make test` |
 | cosh-ng | `src/cosh-ng/` | Linux 完整功能；macOS 功能受限 | `cosh-ng` | `cosh-ng` | `cd src/cosh-ng`; `cargo build --workspace`、`cargo fmt --all -- --check`，随后按 `src/cosh-ng/CONTRIBUTING_zh.md` 选择最接近改动的测试 |
 | agent-sec-core | `src/agent-sec-core/` | 仅 Linux | `sec-core` | `sec-core` | Python 3.11.6 和 `uv`; `make build-all`、`make test` |
 | agentsight | `src/agentsight/` | Linux 完整 eBPF；macOS 仅 `trace`/`serve` | `sight` | `sight` | Linux 使用 `make build-all`；macOS 使用 `make build-mac`；Linux 运行 `make lint`、`make test` |
 | tokenless | `src/tokenless/` | 完整开发在 Linux；发布的 CLI 二进制和 npm adapter 支持 macOS x64/arm64 | `tokenless` | `tokenless` | `make build`、`make lint`、`make test` |
 | agent-memory | `src/agent-memory/` | 仅 Linux | `memory` | `memory` | `make build`、`make fmt-check`、`make lint`、`make test`；MCP 改动追加 `make smoke` |
 | os-skills | `src/os-skills/` | 资源跨平台；单个脚本自行声明限制 | `skills` | `skill` | 静态 Markdown skill 定义和 shell 资源；`make build` 用于确认没有编译步骤 |
-| anolisa | `src/anolisa/` | Linux 和 macOS arm64 | 不适用 | `anolisa` | `cargo fmt --all --check`、`cargo clippy --all-targets --locked -- -D warnings`、`cargo test --locked` |
+| anolisa | `distribution/anolisa/` | Linux 和 macOS arm64 | 不适用 | `anolisa` | `cargo fmt --all --check`、`cargo clippy --all-targets --locked -- -D warnings`、`cargo test --locked` |
 | SkillFS | `src/skillfs/` | 仅 Linux | 不适用 | `skillfs` | `cargo fmt --all --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`；修改 FUSE 时运行 `scripts/test.sh` |
 | ws-ckpt | `src/ws-ckpt/` | 仅 Linux | `ws-ckpt` | `ckpt` | `make build`、`make test` |
 | ktuner | `src/ktuner/` | 仅 Linux | 不适用 | `ktuner` | `cargo fmt --all --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test` |
-| blaze | `src/blaze/` | 仅 Linux | 不适用 | `blaze` | `cargo fmt --all --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace` |
 
 `tokenless` 可以发布 macOS 产物，但其二进制需要从 Linux 交叉编译。不要把 macOS checkout 当作 tokenless 的构建环境。标为 Linux 的组件都必须在 Linux 上构建和测试。`cosh-ng` 和 `agentsight` 的 macOS 受限路径见上表。
 
@@ -47,7 +59,7 @@ ANOLISA 是一个 monorepo。下表列出十二个组件及其支持的开发平
 ```bash
 git clone https://github.com/<your-account>/anolisa.git
 cd anolisa
-git remote add upstream https://github.com/alibaba/anolisa.git
+git remote add upstream https://github.com/agentic-os-org/ANOLISA.git
 git fetch upstream
 git switch main
 git merge --ff-only upstream/main
@@ -83,7 +95,7 @@ Fork 贡献者可以使用其他分支名，分支检查只会给出非阻塞警
 - 默认集合为 `cosh`、`skills`、`sec-core`、`tokenless`、`ws-ckpt`、`memory`。
 - 可选集合为 `cosh-ng` 和 `sight`。使用 `--all` 或通过 `--component` 指定它们。
 
-它不会构建 `anolisa`、`skillfs`、`ktuner` 或 `blaze`。这四个组件请使用上方矩阵中的组件门禁。
+脚本不会构建 `anolisa`、`skillfs` 或 `ktuner`，这些组件请使用上方矩阵中的组件门禁。
 
 不指定安装模式时，组件文件会安装到用户目录 `$HOME/.local`，这一步不需要提权。
 依赖引导仍可能为了安装系统包请求 `sudo`。使用 `--system` 或 `--usr` 会采用系统
@@ -167,7 +179,7 @@ scope 会产生警告，发起 review 前应说明理由或改用推荐值。
 
 | Scope | 路径或用途 |
 | --- | --- |
-| `cosh` | `src/copilot-shell/` |
+| `cosh` | `deprecated/copilot-shell/` |
 | `cosh-ng` | `src/cosh-ng/` |
 | `sec-core` | `src/agent-sec-core/` |
 | `skill` | `src/os-skills/` |
@@ -175,10 +187,9 @@ scope 会产生警告，发起 review 前应说明理由或改用推荐值。
 | `tokenless` | `src/tokenless/` |
 | `ckpt` | `src/ws-ckpt/` |
 | `memory` | `src/agent-memory/` |
-| `anolisa` | `src/anolisa/` |
+| `anolisa` | `distribution/anolisa/` |
 | `skillfs` | `src/skillfs/` |
 | `ktuner` | `src/ktuner/` |
-| `blaze` | `src/blaze/` |
 | `deps` | 依赖变更，包括 lockfile。 |
 | `ci` | `.github/workflows/` 和 CI 配置。 |
 | `docs` | 纯文档变更。 |

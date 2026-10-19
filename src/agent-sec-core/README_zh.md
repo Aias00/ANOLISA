@@ -38,16 +38,41 @@ AgentSecCore 的相关安全控制已纳入 [ANOLISA OWASP Agentic Top 10 控制
 | **Security Events** | 本地 JSONL + SQLite 事件存储，支持查询与聚合 | `agent-sec-cli events` |
 | **Sandbox** | 系统调用级命令隔离（bubblewrap + seccomp），作为架构层使用 | `linux-sandbox` |
 
-后台守护进程 `agent-sec-daemon`（以 `agent-sec-core.service` systemd **user** unit
+V1 后台守护进程 `agent-sec-daemon`（以 `agent-sec-core.service` systemd **user** unit
 形式发布）提供健康检查、SkillFS 通知和安全查询 RPC。Prompt Scanner 通过 Rust 扩展
 在进程内执行；daemon 不会预加载 Prompt Scanner 模型，也不提供扫描 RPC。
 
-## V2 Policy CLI
+## V2 SkillSec 与 Policy CLI
 
-源码构建的 Rust `agent-sec-cli` 经 `asc-daemon` 提供全部 15 条 Policy、Scope、Binding
-CRUD 命令。参阅[命令参考](../../docs/user-guide/zh/agent-security/agent-sec-core/policy-cli.md)
-和 [V2 workspace](v2/README.md)。当前 PAP 状态仅在进程内存中，Binding 受理不代表策略已生效。
-非 root 开发与 E2E 可通过 daemon 的 `--policy-admin-uid <UID>` 配置管理员；默认仍只授权 root。
+Rust V2 核心通过现有 `skill-ledger` 命令提供 **SkillSec**：本地扫描、系统密钥签名、版本历史、
+人工决策、回滚及 SkillFS 激活由一个 root daemon 统一处理。所有本地用户均可管理已启用的默认目录、
+管理员配置范围或已认证 SkillFS 挂载内的 Skill。daemon 启动后自动授权并在后台扫描系统默认目录
+及所有本地账户 HOME 下的标准 Skill 目录，这些位置无需用户配置。`enableDefaultSkillDirs: false`
+可关闭默认范围；`managedSkillDirs` 继续支持额外绝对路径、直接子目录（`/*`）和递归子树（`/**`）。
+HOME 来自 `/etc/passwd`，不采信调用者环境变量。账户或配置修改后需重启 daemon；只读的已打包
+系统 Skill 保持明确跳过，不视为已经认证。
+扫描或认证成功后将 canonical Skill 路径记入同一配置，已被 `managedSkillDirs` 覆盖的普通目录
+不重复添加；SkillFS 路径添加精确项。移除挂载或关闭默认目录发现后，已保存项仍具有普通目录授权，
+需由管理员移除该项并重启 daemon 才撤销。`rotate-keys` 与 `init --force-keys` 不支持，返回错误
+而不改变已有信任。
+
+V2 systemd 系统服务单元名为 `agent-sec-core.service`，可执行文件名为 `agent-sec-daemon`。
+使用 `sudo systemctl status agent-sec-core.service` 检查服务状态。
+
+配置、命令以及单独的部署和 Agent Hook 验收边界见
+[V2 核心指南](../../docs/user-guide/zh/agent-security/agent-sec-core/skillsec-v2.md)。
+不导入 V1 历史及用户密钥。Hook 适配器通过 daemon 初始化，校验 `check`／`show` 结果，
+保留各宿主策略；详见 [Hook 接入边界](../../docs/user-guide/zh/agent-security/agent-sec-core/skillsec-v2.md#agent-hook-接入)。
+
+Cosh-NG 为同一次 SkillSec Hook 调用中的初始化和查询共预留 10 秒。
+
+Rust V2 客户端在发送请求前校验连接对端的内核 peer UID 为 0。
+
+源码构建的 Rust `agent-sec-cli` 经 `asc-daemon` 提供12 条 Policy、Scope、Binding 管理命令。参阅[命令参考](../../docs/user-guide/zh/agent-security/agent-sec-core/policy-cli.md)
+和 [V2 workspace](v2/README.md)。PAP 状态保存在 SQLite 中，Binding 受理不代表策略已生效。
+PolicyTemplate 是包含通用规则的可复用策略；AgentSight Adapter 当前仅执行文件删除 block 规则。
+Scope 保存不可变策略快照，拥有自动 Binding 创建、下发和清理生命周期。
+可通过 daemon 的 `--policy-admin-uid <UID>` 授权非 root Policy CLI 调用者；默认仍只授权 root。
 
 V2 原生 OTel 目前仅用于本地日志关联，不提供公开 OTLP exporter。
 现有 `--trace-context` JSON 传入 Agent 归属；`--otel-context`（version 1）传入上游
@@ -303,6 +328,9 @@ L2 分类器默认使用 ModelScope 上的
 
 详见 [Prompt Scanner 用户使用指南](../../docs/user-guide/zh/agent-security/agent-sec-core/prompt-scanner.md)。
 
+V2 包提供轻量 Rust 探针 `agent-sec-daemon-health`，发送 health 请求前先校验 daemon 的
+UID。用法见[探针说明](../../docs/user-guide/zh/agent-security/agent-sec-core/internal-commands.md#agent-sec-daemon-health)。
+
 ## Code Scanner
 
 扫描 bash 与 python 源码中的危险操作。V2 RPM 中，`scan-code` 是 Rust daemon client：
@@ -313,16 +341,25 @@ L2 分类器默认使用 ModelScope 上的
 # 部署环境提供 daemon endpoint。
 export AGENT_SEC_DAEMON_SOCKET=/run/agent-sec-core/daemon.sock
 
-# regex 引擎（V2 当前唯一可用的扫描引擎）
+# 内嵌 regex 引擎
 agent-sec-cli scan-code --code 'rm -rf /'
 agent-sec-cli --socket /run/agent-sec-core/daemon.sock \
   scan-code --code 'import os; os.system("rm -rf /")' --language python
+
+# 本地模型引擎：在 daemon service 环境中设置 AGENT_SEC_OLLAMA_MODEL，
+# 重启系统服务后再调用 CLI。
+sudo systemctl restart agent-sec-core.service
+agent-sec-cli scan-code --mode llm --code 'rm -rf /'
 ```
 
 verdict 枚举为 `pass` / `warn` / `deny` / `error`；内置规则当前只产出 `warn` 或
-`pass`。规则嵌入 V2 binary，不再从 Python 源码目录读取。`--mode llm` 为保持 CLI
-兼容而保留，但会返回 `LLM model not available`；V2 尚未支持 `--trace-context` 和
-code-scan telemetry，因此依赖它们的 hook 仍处于延期状态。
+`pass`。规则嵌入 V2 binary，不再从 Python 源码目录读取。`llm` 模式由 daemon 调用
+本地 Ollama 兼容模型服务；`AGENT_SEC_OLLAMA_MODEL` 默认值为 `warden`，backend、仅
+loopback 的 base URL 及单请求 timeout 使用共享的 `AGENT_SEC_MODEL_SERVICE_*` 配置。有效
+model-service timeout 为 1–300 秒，daemon 为可用性检查、chat 和一次 retry 预留
+`3 * timeout + 1` 秒。模型缺失、推理失败及不可解析的 verdict 返回可解析的 `error` 结果；
+`DENY` 返回成功的 `warn` 结果。V2 尚未支持 `--trace-context` 和 code-scan telemetry，
+因此依赖它们的 hook 仍处于延期状态。
 
 完整的 daemon endpoint、CLI 和宿主 hook 状态见
 [Code Scanner 用户指南](../../docs/user-guide/zh/agent-security/agent-sec-core/code-scanner.md)。
@@ -331,8 +368,9 @@ code-scan telemetry，因此依赖它们的 hook 仍处于延期状态。
 
 检测个人数据与凭证，可输出脱敏文本。
 
-随包提供的 [pii-checker Skill](skills/pii-checker/SKILL.md) 支持 Agent 通过 V1 CLI
-检查指定文本或文件，并生成脱敏文本。
+随包提供的 [pii-checker Skill](skills/pii-checker/SKILL.md) 支持 Agent 检查指定文本或文件，
+并生成脱敏文本。V2 使用 Rust daemon：设置 `AGENT_SEC_DAEMON_SOCKET` 或顶层 `--socket`；
+CLI 不会自动启动 daemon。
 
 ```bash
 agent-sec-cli scan-pii --text "contact alice@example.com" --source manual
@@ -341,7 +379,15 @@ agent-sec-cli scan-pii --text "card 4111111111111111" --redact-output
 agent-sec-cli scan-pii --input ./sample.log --include-low-confidence
 ```
 
-可在 `~/.config/agent-sec/pii-checker/rules.yaml` 中添加自定义业务类型。
+V2 在 daemon 启动时加载 `/etc/agent-sec/pii-checker/rules.yaml`，也可通过
+`agent-sec-daemon --pii-rules /absolute/path/rules.yaml` 指定其他文件；重启后更新。
+V1 保留 `~/.config/agent-sec/pii-checker/rules.yaml`。V2 报告 coverage、规则标识及 `summary.scanner_version: "2.0.0"`；
+覆盖不完整时的 `pass` 不代表检测完整。本阶段保持 Hook 契约，不切换真实宿主，也不新增 PDP 执行控制。
+公共 CLI `--trace-context` 适配通过顶层 OTel 信封传播关联信息，不支持 `params.traceContext`。
+
+正式版 OpenClaw `>=2026.5.12` 在模型运行入口扫描，记录为 `source=model_input`；
+此输入 hook 只扫描本轮 `prompt`，不扫描 system prompt 或历史消息。
+较旧的受支持版本保留入站扫描。输入是否阻断取决于策略，工具输出 hook 仍只用于观测。
 
 详见 [PII Checker 用户使用指南](../../docs/user-guide/zh/agent-security/agent-sec-core/pii-checker.md)。
 
@@ -488,6 +534,8 @@ agent-sec-cli harden --downstream-help
 
 ## Observability
 
+Rust V2 的 report/review 仅通过 daemon 查询。普通用户只见自身数据；root 可查全部。查询身份仅来自 UDS peer。report 保留 V1 的 `--session-id`、`--last`、`--format`，review 不增加业务参数，report JSON 不新增 UID 字段。`observability schema` 在本地从 Rust 契约动态生成兼容 V1 的记录 Schema。
+
 ```bash
 # 交互式下钻 TUI（需要交互式终端）
 agent-sec-cli observability review
@@ -505,6 +553,10 @@ agent-sec-cli observability schema
 ## Security Events
 
 安全事件会同时写入 JSONL 与 SQLite 存储。使用 `agent-sec-cli events` 查询该存储：
+
+V2 查询使用 UDS peer UID：普通用户读取自身事件，root 读取全部 UID。
+使用原始 session ID 筛选；root 返回所有 UID 下匹配该 ID 的事件。
+同名会话在 root 返回结果中显示为 `UID_session_id`，用于区分归属。
 
 ```bash
 agent-sec-cli events --last-hours 24

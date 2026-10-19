@@ -17,7 +17,20 @@ AgentSight 只读一个 JSON 文件：`/etc/agentsight/config.json`（可用 `--
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 5,
+  "storage": {
+    "base_path": "/var/log/sysak/.agentsight",
+    "max_total_size_mb": 2200,
+    "primary": { "retention_days": 30, "max_db_size_mb": 500, "check_interval_secs": 60 },
+    "genai": { "retention_days": 30, "max_db_size_mb": 200, "check_interval_secs": 60 },
+    "interruptions": { "retention_days": 30, "max_db_size_mb": 100, "check_interval_secs": 60 },
+    "trajectories": { "retention_days": 30, "max_db_size_mb": 500, "check_interval_secs": 300 },
+    "optimization": { "retention_days": 30, "max_db_size_mb": 200, "check_interval_secs": 300 },
+    "security_audit": { "retention_days": 30, "max_db_size_mb": 200, "check_interval_secs": 3600 },
+    "reuse": { "retention_days": 30, "max_db_size_mb": 200, "check_interval_secs": 300 },
+    "causal": { "retention_days": 30, "max_db_size_mb": 200, "check_interval_secs": 300 },
+    "enforcement": { "retention_days": 30, "max_db_size_mb": 100, "check_interval_secs": 60 }
+  },
   "runtime": {
     "sls_logtail_path": ""
   },
@@ -34,22 +47,29 @@ AgentSight 只读一个 JSON 文件：`/etc/agentsight/config.json`（可用 `--
     "session_mapping": { "enabled": true, "max_entries": 10000 },
     "sqlite_storage": { "enabled": true, "batch": { "max_size": 100, "flush_ms": 100 } },
     "resource_sampling": false,
-    "interruption_detection": { "enabled": true, "retention_days": 30, "max_db_size_mb": 100 },
+    "interruption_detection": { "enabled": true },
     "audit": true,
     "token_consumption": false,
     "sls_logtail": false,
-    "trajectory_collection": { "enabled": false, "scan_interval_secs": 30 }
+    "trajectory_collection": { "enabled": false, "scan_interval_secs": 30 },
+    "reuse_llm_judge": false
   },
   "runtime_limits": {
     "event_channel_capacity": 10000,
     "event_channel_policy": "backpressure",
     "event_channel_max_bytes_mb": 64,
     "pending_genai_max_count": 1000,
-    "pending_genai_max_bytes_mb": 64,
+    "pending_genai_max_bytes_mb": 16,
     "pid_cache_size": 1024,
+    "connection_capacity": 32,
+    "connection_max_bytes_mb": 64,
+    "ffi_channel_max_bytes_mb": 64,
     "max_connection_body_mb": 8,
+    "max_sse_retained_mb": 2,
+    "retain_raw_sse": false,
     "connection_idle_timeout_secs": 60,
-    "ring_buffer_mb": 32
+    "connection_hard_timeout_secs": 300,
+    "ring_buffer_mb": 64
   },
   "https": [
     { "rule": ["dashscope.aliyuncs.com"] },
@@ -69,6 +89,36 @@ AgentSight 只读一个 JSON 文件：`/etc/agentsight/config.json`（可用 `--
 }
 ```
 
+## SQLite 存储策略
+
+`storage.base_path` 是 AgentSight 自有数据库共用的目录。`storage.max_total_size_mb` 限制这些数据库的
+总物理占用，默认值为 `2200` MiB。设为 `0` 可关闭总量限制；启用时必须至少为 `9` MiB。每轮维护前都会
+重读有效配置；如果配置文件缺失、未写完或无效，则继续使用最近一次有效值。
+
+在 schema v5 中，每项存储策略统一使用 `retention_days`、`max_db_size_mb` 和 `check_interval_secs`。值为
+`0` 时，分别关闭按时间保留、按容量清理或定时维护；如果 `check_interval_secs` 为 `0`，即使另外两项
+非零也不会自动执行维护。
+
+| 存储 | 保留时间 | 容量上限 | 检查间隔 |
+|---|---:|---:|---:|
+| `storage.primary`（`agentsight.db`） | 30 天 | 500 MiB | 60 秒 |
+| `storage.genai`（`genai_events.db`，含评估结果） | 30 天 | 200 MiB | 60 秒 |
+| `storage.interruptions` | 30 天 | 100 MiB | 60 秒 |
+| `storage.trajectories` | 30 天 | 500 MiB | 300 秒 |
+| `storage.optimization` | 30 天 | 200 MiB | 300 秒 |
+| `storage.security_audit` | 30 天 | 200 MiB | 3,600 秒 |
+| `storage.reuse` | 30 天 | 200 MiB | 300 秒 |
+| `storage.causal` | 30 天 | 200 MiB | 300 秒 |
+| `storage.enforcement` | 30 天 | 100 MiB | 60 秒 |
+
+维护先删除允许淘汰且已经过期的行。如果数据库因此发生变化，必须成功完成 WAL checkpoint 后才进入容量
+阶段。物理占用超过 `max_db_size_mb` 时触发淘汰，并以逻辑占用降到上限的 90% 为目标。维护不会执行
+`VACUUM`，释放页会留在 SQLite freelist 中供后续写入复用。
+
+`check_interval_inserts` 已不再支持。`schema_version` 变化时配置格式整体替换：版本缺失或低于 v5 的文件
+会先备份，再替换为 schema v5，不会合并旧设置。自定义配置请从随包发布的 `agentsight.json` 开始修改，
+不要把旧字段复制到新文件。
+
 ## 功能开关
 
 `features` 下的每一项都可以独立关闭。关闭后对应模块根本不会被实例化，因此既不占内存也不产生 I/O。
@@ -85,6 +135,9 @@ AgentSight 只读一个 JSON 文件：`/etc/agentsight/config.json`（可用 `--
 | Token 消费记录 | `features.token_consumption` | `false` | 额外的聚合消费记录 |
 | 外部日志导出 | `features.sls_logtail` | `false` | 把结构化事件写入文件，供外部采集器读取 |
 | 轨迹采集 | `features.trajectory_collection.enabled` | `false` | 周期扫描本地 Agent JSONL 会话写入 `trajectories.db`（仅 trace 模式） |
+| 轨迹 LLM 判定 | `features.reuse_llm_judge` | `false` | 允许 `POST /api/reuse/judge` 调用已配置的 LLM 判定规则无法归类的轨迹；每次调用都会产生费用 |
+
+`reuse_llm_judge` 只影响 `POST /api/reuse/judge`。除非已经配置优化 LLM 且明确需要付费的二级判定，否则请保持关闭。修改后 reload 服务，让 server 读取新配置。
 
 随功能附带的调节项：
 
@@ -94,26 +147,58 @@ AgentSight 只读一个 JSON 文件：`/etc/agentsight/config.json`（可用 `--
 | `features.session_mapping.max_entries` | `10000` | response ID → session ID 映射上限 |
 | `features.sqlite_storage.batch.max_size` | `100` | 每批写入行数 |
 | `features.sqlite_storage.batch.flush_ms` | `100` | 批量写入的最大延迟（毫秒） |
-| `features.interruption_detection.retention_days` | `30` | 中断事件保留天数 |
-| `features.interruption_detection.max_db_size_mb` | `100` | `interruption_events.db` 容量上限 |
-| `features.trajectory_collection.scan_interval_secs` | `30` | 轨迹采集扫描间隔 |
+| `features.trajectory_collection.scan_interval_secs` | `30` | 轨迹文件发现间隔；存储清理由 `storage.trajectories.check_interval_secs` 控制 |
 
 ## 运行时上限
 
-这些参数限制流水线中所有内存缓冲区。忙的机器可以调高，内存紧张的机器可以调低。安装包 systemd unit
-里的 `MemoryMax=350M` 是按默认值估算的。
+这些限额约束流水线中保留的 payload。设置进程内存上限时，还应计入进程基线、eBPF ring buffer、
+解码器工作内存和 allocator 开销。安装包 systemd unit 仍使用 `MemoryMax=350M`。
 
 | 配置项 | 默认值 | 含义 |
 |---|---|---|
+| `cpu_budget_percent` | `25` | trace 进程的协作式 CPU 目标；`0` 关闭调度，`100` 表示一个逻辑核 |
 | `event_channel_capacity` | `10000` | 探针到流水线的有界通道容量 |
-| `event_channel_policy` | `backpressure` | 通道满时的策略：`backpressure`、`drop_newest`、`sample` |
-| `event_channel_max_bytes_mb` | `64` | 该通道中排队事件的字节预算，`0` 表示不限制。与容量同时生效：单条 SSL 记录最大可达 4 MiB，仅靠 10000 个槽位无法限定内存。超出预算的事件会被丢弃并计入日志 |
-| `pending_genai_max_count` | `1000` | 等待 session ID 的事件条数上限 |
-| `pending_genai_max_bytes_mb` | `64` | 同一队列的字节上限 |
+| `event_channel_policy` | `backpressure` | 通过字节限额后等待队列槽位；`drop_newest` 拒绝已满队列。`sample`、`sample:N`、`sample=N` 每 N 条保留一条（默认 N=10） |
+| `event_channel_max_bytes_mb` | `64` | 排队 probe payload 的字节上限；`0` 关闭限额。超过字节限额时丢弃事件并增加通道丢弃计数，与槽位策略分别执行 |
+| `pending_genai_max_count` | `1000` | 原始完成记录、等待 session ID 的事件与本地 SQLite 重试共享条数上限 |
+| `pending_genai_max_bytes_mb` | `16` | 同一队列的字节上限 |
 | `pid_cache_size` | `1024` | PID → Agent 名称的 LRU 条目数 |
-| `max_connection_body_mb` | `8` | 单个 HTTP 连接的 body 缓冲上限 |
-| `connection_idle_timeout_secs` | `60` | 连接缓冲被丢弃前的空闲超时 |
-| `ring_buffer_mb` | `32` | eBPF ring buffer 大小，必须是 2 的幂 |
+| `connection_capacity` | `32` | HTTP 连接缓存条目数，必须大于零；至少应达到预计同时存在的连接数 |
+| `connection_max_bytes_mb` | `64` | HTTP/1 与 HTTP/2 共用的保留字节预算，包含 buffer capacity 和解码器状态；`0` 关闭预算 |
+| `ffi_channel_max_bytes_mb` | `64` | FFI 事件 payload 的字节预算，计入执行中的 callback；`0` 关闭预算。同时受已有的 10000 条队列容量限制 |
+| `max_connection_body_mb` | `8` | 单连接 body 上限，接收分片时立即检查 |
+| `max_sse_retained_mb` | `2` | 单流保留的 SSE payload 上限，包含未完整事件；最小有效上限为 1 KiB |
+| `retain_raw_sse` | `false` | 保留原始 SSE 事件序列，关闭 provider delta 归约；仍受字节限额约束 |
+| `connection_idle_timeout_secs` | `60` | 空闲软超时：只写一次 SQLite pending 行，并保留流以便恢复 |
+| `connection_hard_timeout_secs` | `300` | 空闲硬超时：输出不完整记录并释放 HTTP/1 连接及 HTTP/2 流；`0` 关闭该超时 |
+| `ring_buffer_mb` | `64` | eBPF ring buffer 大小，必须是 2 的幂 |
+
+默认 `connection_capacity=32` 可容纳 32 个并发 HTTP/1 连接。应按所有 Agent 实际打开的连接数
+选择容量，一个 Agent 可能打开多个连接。HTTP/2 的流条目容量为该值的四倍，并共用同一字节预算。
+修改运行时限额后需要重启采集。
+
+CPU 调度默认开启，`cpu_budget_percent=25`；设为 `0` 可关闭。
+完成记录在分析和写入之前按进程 CPU 预算调度，并与 primary/GenAI
+维护共用工作准入。原始记录转移到有界队列，最多使用 pending 字节预算的一半；队列满时施加背压。
+清理在小步骤之间让出执行权，后续调度继续处理。较低目标可能增加投递和清理延迟。
+该参数是协作式目标，单次操作和其他进程线程仍可能导致超出目标；调整时需一起检查采集完整性、
+探针丢事件、队列增长及尾部排空时间。
+`agentsight_completion_queue_count`、`agentsight_completion_queue_bytes` 和
+`agentsight_completion_wait_seconds` 反映延迟投递，`agentsight_cpu_budget_deferred_total` 记录预算等待次数。
+
+容量淘汰、同 key 替换、字节超限、空闲硬超时、进程退出或采集关闭时，AgentSight 会输出已捕获的请求
+或部分响应，并设置 `finish_reason="incomplete"`。语义事件 metadata 包含 `abandon_reason` 和
+`incomplete=true`；字节超限还包含 `truncated=true`。即使关闭 SQLite，这些记录也会走正常 FFI 投递路径。
+新流量会刷新空闲计时。软超时 snapshot 依赖 SQLite 并保留在途状态；FFI 模式无采集事件时仍执行硬超时维护。
+
+仅投递语义事件时，SSE delta 会增量归约，原始 TLS buffer 在流结束前即可释放。需要原始事件序列的 exporter
+应启用 `retain_raw_sse`；FFI raw HTTPS 回退开启时也会保留原始序列。两种模式均受资源限额约束。
+
+通过 `AGENTSIGHT_METRICS_FILE` 导出的运行时指标包括
+`agentsight_http_conn_removed_total{reason,state}`、`agentsight_http_abandoned_emitted_total{reason}`、
+`agentsight_http_conn_active`、`agentsight_http_conn_retained_bytes`、`agentsight_ffi_inflight_bytes`
+和 `agentsight_ffi_dropped_total{reason}`。FFI 队列过载时丢弃最新事件，并按 `count` 或 `bytes` 原因计数，
+可据此区分捕获不完整与消费端积压。
 
 ## Agent 发现规则
 
@@ -211,27 +296,30 @@ sudo agentsight discover                                   # 跑一次自己的 
 
 ## schema_version 与升级
 
-`schema_version`（当前为 `2`）标记配置格式版本。启动时 AgentSight 会与内置版本比对：
+`schema_version`（当前为 `5`）标记配置格式版本。启动时 AgentSight 会与内置版本比对：
 
-- 相同或更新 → 保留你的文件不动；
-- 缺失或更旧 → 先把你的文件复制为 `config.json.bak.<unix秒>`，再写入合并后的文件：以当前默认配置为底，
-  把你设置过的每个顶层键（`cmdline`、`https`、`features`、`codex_offsets` 等）覆盖上去，最后提升
-  `schema_version`。
+- 相同或更新 → 保留文件不动；
+- 缺失或更旧 → 先复制为 `config.json.bak.<unix秒>`，再替换为当前默认配置。
 
-合并是按顶层键的浅合并，因此你定制过的小节会被整体保留，同时默认配置中新增的小节会被补进来。这也意味着
-只改了一半的 `cmdline` 仍然是一半——上文「替换而非追加」的规则依旧成立。
+schema v5 引入上述 HTTP 与 FFI 保留预算默认值，并下调 Probe 及延迟 GenAI 队列的字节预算。
+旧版本配置会先备份后整体替换，需要从备份重新应用自定义发现规则和设置。
 
-RPM 使用 `%config(noreplace)`，因此升级包不会覆盖磁盘上的文件，格式变更由上述检查处理。
+schema v4 把所有存储策略的按写入次数检查统一改为 `check_interval_secs`，并新增 `reuse`、`causal` 和
+`enforcement`。旧 schema 中的自定义项不会自动合并。请在新文件上重新应用需要的规则，然后 reload 服务。
 
 ## 环境变量
 
 | 变量 | 用途 |
 |---|---|
-| `AGENTSIGHT_GENAI_DB_MAX_SIZE_MB` | GenAI 事件数据库容量上限（默认 200） |
 | `AGENTSIGHT_TOKENIZER_PATH` | 本地分词器模型所在目录 |
 | `AGENTSIGHT_ENFORCER_SOCKET` | enforcer socket 路径（默认 `/run/agentsight/enforcer.sock`） |
 | `AGENTSIGHT_CHROME_TRACE` | 输出 Chrome trace 文件用于流水线性能分析 |
+| `AGENTSIGHT_METRICS_FILE` | 将 Prometheus 运行时指标原子写入指定文件；未设置或设为空时关闭导出 |
+| `AGENTSIGHT_METRICS_INTERVAL_SECS` | 运行时指标快照的最短间隔，单位为正整数秒（默认 `1`）；仅在设置 `AGENTSIGHT_METRICS_FILE` 时使用 |
 | `RUST_LOG` | 日志级别，例如 `RUST_LOG=debug` |
+
+运行时指标的更新频率不会高于设置的间隔。退出时即使间隔尚未到期，也会写入最终快照。
+启用指标导出时，`0` 等无效间隔会导致启动失败。
 
 ## 改完怎么验证
 
@@ -247,3 +335,16 @@ sudo agentsight summary --last 1
 python3 -m json.tool /etc/agentsight/config.json > /dev/null && echo "JSON ok"
 journalctl -u agentsight.service -n 30 --no-pager
 ```
+
+## Tokenless 统计 API
+
+连接远程 Tokenless 时，在传给 `agentsight serve --config /etc/agentsight/config.json`
+的配置中加入以下可选的顶层设置：
+
+```json
+{"tokenless_api":{"url":"http://127.0.0.1:7397","credential_file":"/etc/agentsight/tokenless-api-token"}}
+```
+
+凭据文件保存与 `tokenless stats serve` 相同的 Bearer token。使用私有网络或 HTTPS
+代理。服务在启动时读取文件；修改后需重启 AgentSight。凭据仅保存在后端，非法配置
+会阻止启动。不配置此项时，保留现有的本地数据库集成方式。

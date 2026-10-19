@@ -64,6 +64,7 @@ pub fn extract_token_data(
     if let Some(resp) = response_json {
         // Extract content blocks
         if let Some(content) = resp.get("content").and_then(|c| c.as_array()) {
+            let mut reasoning = String::new();
             for block in content {
                 let block_type = block.get("type").and_then(|t| t.as_str());
 
@@ -75,6 +76,23 @@ pub fn extract_token_data(
                                     content: text.to_string(),
                                 });
                                 has_content = true;
+                            }
+                        }
+                    }
+                    // Extended thinking arrives as a `thinking` block whose
+                    // text sits in the `thinking` field (a `redacting_thinking`
+                    // block carries no plaintext and stays unextracted). The
+                    // shared SSE extractor already maps thinking deltas to
+                    // reasoning_content; without this arm a non-streaming
+                    // thinking response reported no reasoning at all while its
+                    // streamed twin did.
+                    Some("thinking") => {
+                        if let Some(text) = block.get("thinking").and_then(|t| t.as_str()) {
+                            if !text.is_empty() {
+                                if !reasoning.is_empty() {
+                                    reasoning.push('\n');
+                                }
+                                reasoning.push_str(text);
                             }
                         }
                     }
@@ -92,6 +110,10 @@ pub fn extract_token_data(
                     }
                     _ => {}
                 }
+            }
+            if !reasoning.is_empty() {
+                token_data.reasoning_content = Some(reasoning);
+                has_content = true;
             }
         }
     }
@@ -121,6 +143,32 @@ fn extract_content(content: Option<&Value>) -> Option<String> {
                 Some(s.clone())
             }
         }
+        Value::Array(blocks) => {
+            let text: String = blocks
+                .iter()
+                .filter_map(|b| match b.get("type").and_then(|t| t.as_str()) {
+                    Some("text") => b.get("text").and_then(|t| t.as_str()).map(str::to_string),
+                    // A tool-result turn carries the tool's output in a
+                    // `tool_result` block, so without this arm the payload
+                    // the API actually counts vanishes from the message.
+                    Some("tool_result") => tool_result_text(b.get("content")),
+                    _ => None,
+                })
+                .collect::<Vec<String>>()
+                .join("");
+
+            if text.is_empty() { None } else { Some(text) }
+        }
+        _ => None,
+    }
+}
+
+/// Text of an Anthropic `tool_result` block's `content` field: the plain
+/// string or the array of text blocks the Messages API accepts for a tool
+/// result. `None` for an empty result — the field is optional.
+fn tool_result_text(content: Option<&Value>) -> Option<String> {
+    match content? {
+        Value::String(s) if !s.is_empty() => Some(s.clone()),
         Value::Array(blocks) => {
             let text: String = blocks
                 .iter()
@@ -238,6 +286,101 @@ mod tests {
         let data = token_data.unwrap();
         assert_eq!(data.tool_calls.len(), 1);
         assert!(data.tool_calls[0].contains("get_weather"));
+    }
+
+    /// An agentic request's bulk is the tool output, which the Messages API
+    /// returns as a `tool_result` block inside a user message. The extractor
+    /// read only `text` blocks, so that message was dropped from
+    /// `request_messages` and the tool output vanished from the character and
+    /// token estimates, while the OpenAI arm counts the same data (a
+    /// `role: "tool"` message is a plain string there).
+    #[test]
+    fn test_extract_tool_result_blocks() {
+        let request = serde_json::json!({
+            "model": "claude-3-7-sonnet",
+            "messages": [
+                {"role": "user", "content": "run the tool"},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_01", "content": "file not found"}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_02", "content": [
+                        {"type": "text", "text": "first "},
+                        {"type": "text", "text": "second"}
+                    ]},
+                    {"type": "text", "text": " trailing"}
+                ]}
+            ]
+        });
+
+        let token_data = extract_token_data(Some(&request), None).expect("request yields data");
+        assert_eq!(
+            token_data.request_messages.len(),
+            3,
+            "the two tool-result turns must be counted"
+        );
+        assert_eq!(token_data.request_messages[1].content, "file not found");
+        assert_eq!(
+            token_data.request_messages[2].content,
+            "first second trailing"
+        );
+    }
+
+    /// Extended thinking arrives as a `thinking` content block. The shared
+    /// SSE extractor already maps thinking deltas to reasoning_content, so
+    /// the non-streaming arm must too — a thinking-only response otherwise
+    /// extracted to nothing.
+    #[test]
+    fn test_extract_thinking_blocks() {
+        let response = serde_json::json!({
+            "model": "claude-3-7-sonnet",
+            "content": [
+                {"type": "thinking", "thinking": "consider the options"},
+                {"type": "text", "text": "The answer"}
+            ]
+        });
+        let token_data = extract_token_data(None, Some(&response));
+        assert!(token_data.is_some());
+        let data = token_data.unwrap();
+        assert_eq!(
+            data.reasoning_content.as_deref(),
+            Some("consider the options")
+        );
+        assert_eq!(data.response_content.len(), 1);
+        assert_eq!(data.response_content[0].content, "The answer");
+    }
+
+    #[test]
+    fn test_extract_thinking_only_response() {
+        let response = serde_json::json!({
+            "model": "claude-3-7-sonnet",
+            "content": [{"type": "thinking", "thinking": "still thinking"}]
+        });
+        let token_data = extract_token_data(None, Some(&response));
+        assert!(
+            token_data.is_some(),
+            "a thinking-only response is assistant output"
+        );
+        assert_eq!(
+            token_data.unwrap().reasoning_content.as_deref(),
+            Some("still thinking")
+        );
+    }
+
+    #[test]
+    fn test_redacted_thinking_block_is_not_extracted() {
+        let response = serde_json::json!({
+            "model": "claude-3-7-sonnet",
+            "content": [
+                {"type": "redacting_thinking", "data": "encrypted"},
+                {"type": "text", "text": "Answer"}
+            ]
+        });
+        let token_data = extract_token_data(None, Some(&response));
+        assert!(token_data.is_some());
+        let data = token_data.unwrap();
+        assert!(data.reasoning_content.is_none());
+        assert_eq!(data.response_content.len(), 1);
     }
 
     #[test]

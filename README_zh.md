@@ -26,9 +26,9 @@
 [English](README.md) · [项目网站](https://agentic-os.sh/zh/) ·
 [快速开始](https://agentic-os.sh/zh/docs/quickstart/) ·
 [用户指南](https://agentic-os.sh/zh/docs/user-guide/) ·
-[参与贡献](https://github.com/alibaba/anolisa/blob/main/CONTRIBUTING_zh.md)
+[参与贡献](https://github.com/agentic-os-org/ANOLISA/blob/main/CONTRIBUTING_zh.md)
 
-[![许可证](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/alibaba/anolisa/blob/main/LICENSE)
+[![许可证](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/agentic-os-org/ANOLISA/blob/main/LICENSE)
 [![平台](https://img.shields.io/badge/Platform-Linux%20%7C%20macOS-lightgrey.svg)](https://agentic-os.sh/zh/docs/user-guide/installation/)
 [![AARM Aligned](https://img.shields.io/badge/AARM-Aligned-blue.svg)](https://aarm.dev/builders/agentseccore-anolisa)
 [![OWASP Agentic Top 10: 7 Full, 3 Partial](https://img.shields.io/badge/OWASP_Agentic_Top_10-7_Full,_3_Partial-blue)](docs/user-guide/zh/agent-security/owasp-agentic-top10.md)
@@ -73,10 +73,13 @@ Agent 框架和沙箱。ANOLISA CLI 提供统一的安装入口，各项能力�
     <tr>
       <td></td>
       <td></td>
-      <td><strong><a href="https://agentic-os.sh/zh/docs/user-guide/runtime/blaze/">Blaze</a></strong><br><sub>沙箱生命周期</sub></td>
+      <td><strong><a href="https://agentic-os.sh/zh/docs/user-guide/user-entrypoint/aw/">AW</a></strong><br><sub>统一的 Agent 策略配置</sub></td>
     </tr>
   </tbody>
 </table>
+
+Blaze 已迁移至独立仓库
+[blaze-rs](https://github.com/agentic-os-org/blaze-rs)。
 
 ## 解决什么问题
 
@@ -242,6 +245,26 @@ anolisa install tokenless
 [源码构建](https://agentic-os.sh/zh/docs/building/) ·
 [变更日志](https://agentic-os.sh/zh/changelog/)
 
+## 仓库目录
+
+各组件保留在同一仓库中，仍可独立构建。目录按运行能力、发行工具、评测和保留的旧版实现划分；源码位置变化不改变已安装的命令、包名或发布 tag。
+
+| 目录 | 内容 |
+|---|---|
+| [`src/`](src/) | 运行能力组件，包括 AW、cosh-ng、可观测、安全、记忆和沙箱能力。各组件保留自己的构建与测试入口。 |
+| [`distribution/`](distribution/) | 发行工具。`anolisa/` 包含安装 CLI、组件清单和打包资源。 |
+| [`benchmark/`](benchmark/) | 跨组件评测工具，包括 ClawEval、SWE 和 Terminal Bench runner。组件专用 benchmark 仍保留在各组件内。 |
+| [`deprecated/`](deprecated/) | 保留的旧版实现。`copilot-shell/` 已不推荐用于新增开发；正式退役前保留现有构建、安装、CI 和发布入口。 |
+| [`scripts/`](scripts/) | 仓库级构建、打包和校验脚本。 |
+| [`tests/`](tests/) | 仓库级回归检查与测试编排。组件测试仍放在各组件内。 |
+| [`docker/`](docker/) | 容器镜像定义与构建资源。 |
+| [`docs/`](docs/) | 用户和开发者手册、源码构建说明及共享文档资源。 |
+| [`specs/`](specs/) | 贡献规范、组件接入规则和文档标准。 |
+| [`website/`](website/) | 公共网站源码和生成器。生成物不作为另一份文档来源。 |
+| [`.github/`](.github/) | CI、发布流程、组件路由元数据和维护归属。 |
+
+修改前先读 [AGENTS.md](AGENTS.md)，了解仓库规则、组件位置和构建测试命令，再读对应组件内的 `AGENTS.md`（如有）。贡献流程见 [CONTRIBUTING_zh.md](CONTRIBUTING_zh.md)。源码路径调整必须同步 `.github/components.json` 及使用它的构建、发布、维护归属和文档入口，不改变组件对外身份。
+
 ## 社区
 
 <div align="center">
@@ -252,13 +275,13 @@ anolisa install tokenless
 
 </div>
 
-- 遇到问题或有新的 Agent 场景，欢迎[提交 Issue](https://github.com/alibaba/anolisa/issues)。
+- 遇到问题或有新的 Agent 场景，欢迎[提交 Issue](https://github.com/agentic-os-org/ANOLISA/issues)。
 - 提交 Pull Request 前，请先阅读
-  [贡献指南](https://github.com/alibaba/anolisa/blob/main/CONTRIBUTING_zh.md)。
+  [贡献指南](https://github.com/agentic-os-org/ANOLISA/blob/main/CONTRIBUTING_zh.md)。
 - 安全问题请通过
-  [安全策略](https://github.com/alibaba/anolisa/blob/main/SECURITY.md)中的渠道报告。
+  [安全策略](https://github.com/agentic-os-org/ANOLISA/blob/main/SECURITY.md)中的渠道报告。
 
 ## 许可证
 
 ANOLISA 基于
-[Apache License 2.0](https://github.com/alibaba/anolisa/blob/main/LICENSE) 发布。
+[Apache License 2.0](https://github.com/agentic-os-org/ANOLISA/blob/main/LICENSE) 发布。

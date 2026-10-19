@@ -106,7 +106,7 @@ anolisa install <component>
 | Component | Description | Supported modes |
 |-----------|-------------|-----------------|
 | `cosh` | Copilot Shell — AI terminal assistant | user, system |
-| `cosh-ng` | AI-native terminal and deterministic Agent runtime (experimental) | system (Linux), user or system (macOS arm64) |
+| `cosh-ng` | AI-native terminal and deterministic Agent runtime (experimental) | system (Linux), user or system (macOS 11+ (arm64 / x86_64)) |
 | `os-skills` | System management and DevOps skills | user, system |
 | `tokenless` | Token optimization (compression) | user, system |
 | `ws-ckpt` | Workspace checkpoint/rollback | **system** |
@@ -114,6 +114,7 @@ anolisa install <component>
 | `agent-memory` | MCP-based persistent memory | user, system |
 | `agentsight` | eBPF tracing and dashboard | **system** |
 | `sec-core` | Local security runtime, scanners, and adapters | **system** |
+| `ktuner` | Deterministic kernel-tuning engine for agents | **system** (RPM, Linux x86_64) |
 
 > **Note**: System-only components require `sudo` and an explicit system scope:
 > ```bash
@@ -135,7 +136,7 @@ curl -fsSL https://get.agentic-os.sh | bash -s -- --component cosh-ng --backend 
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-On macOS arm64, the cosh-ng raw package has a separate user-scope contract:
+On macOS 11+ (arm64 / x86_64), the cosh-ng raw package has a separate user-scope contract:
 
 ```bash
 curl -fsSL https://get.agentic-os.sh | bash -s -- --component cosh-ng --backend raw --install-mode user

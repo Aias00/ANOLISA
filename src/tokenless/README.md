@@ -43,13 +43,13 @@ retrieval, and attribution.
 | Build-log compression | workload-dependent | Cleans terminal control output and reduces repeated routine progress in recognized Cargo, pytest, npm/Jest, Go, Make/C, and generic command logs while preserving diagnostics, summaries, phases, and stack traces |
 | Search path sharing | workload-dependent | Enabled by default: API search listings, including Claude native Grep, share consecutive file paths and retain every received match; disable with `TOKENLESS_SEARCH_PATH_SHARING_ENABLED=0` or SDK `search_path_sharing_enabled=False`; command output remains on its existing route |
 | Git Diff context cropping | workload-dependent | Opt in with `TOKENLESS_DIFF_COMPRESSION_ENABLED=1` or SDK `diff_compression_enabled=True`; preserves all changed lines, reduces context per hunk, and provides original recovery. Disabled by default; stable whole-Agent token savings have not been established |
-| HTML page rendering | workload-dependent | Opt in with `TOKENLESS_HTML_EXTRACTION_ENABLED=1` or SDK `html_extraction_enabled=True`; renders complete HTML documents from commands or APIs as Markdown, removes only enumerated non-content elements (scripts, styles, navigation, banners, footers, asides, form controls, media embeds) with counts in the view header, and provides original recovery. Disabled by default; file reads pass through |
+| HTML page rendering | workload-dependent | Enabled by default: renders complete HTML documents from commands or APIs as Markdown, removes only enumerated non-content elements (scripts, styles, navigation, banners, footers, asides, form controls, media embeds) with counts in the view header, and provides original recovery; disable with `TOKENLESS_HTML_EXTRACTION_ENABLED=0` or SDK `html_extraction_enabled=False`; file reads pass through |
 | CSV/TSV table compression | workload-dependent | Preserves every cell when compacting quoting and record separators; larger tables can retain selected rows with an explicit incomplete-table notice and byte-exact original retrieval. Requires a text replacement slot; file reads pass through |
 | Reversible compression (stash) | — | Omitted record collections and bounded values are stashed; supported agents run `tokenless retrieve HASH` or call their static Retrieve Tool when full data is needed |
 | TOON context compression | 17.0% on reference response | Encodes JSON to TOON format for LLMs |
 | Command rewriting | 60–90% | Filters CLI output via RTK (70+ commands supported) |
 | Tool Ready | reduces retry waste | Legacy pre-call check, auto-fix, and blocking; hard-disabled |
-| OpenClaw plugin | — | RTK ✅, lossless transcript PostTool ✅, Schema/Retrieve unavailable in the host |
+| OpenClaw plugin | — | RTK ✅, lossless live PostTool ✅, Schema/Retrieve unavailable in the host |
 | copilot-shell hooks | — | Tool Ready ⛔ hard-disabled, Command rewriting ✅; Cosh-NG supports response compression and Marker-command recovery, while legacy copilot-shell remains lossless-only; Common BeforeModel passes schemas through without authorized Retrieve |
 | Hermes Agent plugin | — | Tool Ready ⛔ hard-disabled, Core-owned command rewriting/response/TOON ✅, Marker-command recovery ✅, Schema unavailable |
 | Qoder CLI plugin | — | Tool Ready ⛔ hard-disabled, Command rewriting ✅, Response compression ✅, Marker-command recovery ✅ |
@@ -69,6 +69,8 @@ removable fields, configured thresholds, and the share of tool data in the
 session. Short or already compact payloads may save only a few percent or pass
 through unchanged. See [Measuring Tokenless Savings](../../docs/user-guide/en/token-saving/tokenless/measuring-savings.md#run-the-repository-reference-workload)
 for the exact inputs, command, full output, and limitations.
+
+PostTool leaves the entire JSON response unchanged when its parser cannot preserve a numeric value. Otherwise, cleanup and record reduction can proceed; Core selects TOON only when decoding it recovers the same retained values and types.
 
 ## Applicable Scenarios & Expected Effects
 
@@ -179,12 +181,54 @@ Installing the CLI from the same YUM repository makes it available on sudo's
 system path. `adopt` then records the directly installed RPM in system state so
 adapter commands can use its component contract.
 
-Current public packages support Linux x86_64/aarch64 and macOS Apple Silicon.
-Intel macOS does not currently have a published package. The repository's npm
-packaging sources are for release construction and are not a public
-`anolisa-tokenless` installation route. The retained
-`@anolisa/tokenless-darwin-x64` optional-dependency entry describes a release
-build target; it does not indicate registry availability.
+Two further public routes install the CLI on their own, without an anolisa
+component record. The npm route ships the prebuilt `tokenless` and `rtk`
+binaries plus the bundled Agent adapters and needs Node.js 16.7+, the release
+`fs.cpSync` arrived in and the one the package postinstall requires. The curl route
+is a standalone installer that prefers npm and builds from source instead. The
+method is chosen before npm runs (npm missing, musl Linux, or
+`TOKENLESS_FORCE_BUILD=1`); once `npm install` has been invoked the installer does
+not switch method automatically, because npm's exit status cannot prove its
+postinstall left no framework registration behind:
+
+```bash
+npm install -g anolisa-tokenless
+
+curl -fsSL https://raw.githubusercontent.com/alibaba/anolisa/main/src/tokenless/scripts/install.sh | bash
+```
+
+Because neither registers the component, `anolisa adapter enable` does not
+apply to them; enable a framework with its bundled script under
+`~/.local/share/anolisa/adapters/tokenless/<framework>/scripts/install.sh`
+instead. The curl installer records what it created in
+`~/.local/share/tokenless/install-receipt`, which `scripts/uninstall.sh`
+consumes to remove exactly those paths; its source-build path is CLI-only
+(no `rtk`, no adapters). Agent frameworks can run the same steps through the
+`install-tokenless` OS Skill. The full method matrix lives in
+`docs/user-guide/en/token-saving/tokenless/QUICKSTART.md`.
+
+`~/.local/share/anolisa/adapters/tokenless` is shared with anolisa-managed
+installs, so neither public route takes it over blindly. Ownership has to be
+proven: the npm postinstall only refreshes a tree carrying the marker it or the
+curl installer wrote, and keeps anything else — a managed component install, a
+tree from an older release, a manual copy — reporting where the resources inside
+the package are. `ANOLISA_TOKENLESS_FORCE_ADAPTERS=1` overrides that. The curl installer restores a tree another owner placed there, records no
+adapter directory for it, and proves ownership of everything it does record with
+a per-install marker (`.tokenless-owner`) rather than a content hash alone — a
+later anolisa or npm
+install of the same version reproduces the same bytes, and its files, adapter
+resources, framework registrations and npm package are left alone. A replacement
+that fails halfway (a missing tag, a build error) puts the previous install back
+instead of leaving the machine without a CLI.
+
+Published packages cover Linux x86_64/aarch64 and macOS Apple Silicon. Intel
+macOS still has no published package: the `@anolisa/tokenless-darwin-x64`
+optional-dependency entry describes a release build target, not a registry
+artifact, so the npm route cannot deliver a binary there. The standalone
+installer does not fall back to a source build on macOS either — it exits with
+an error instead of running `cargo` — so Intel macOS currently has no supported
+install route. Use Linux or Apple Silicon macOS until that package is
+published.
 
 ANOLISA-managed and adopted RPM installations place the available adapters
 without changing an Agent product's user configuration. Run these commands
@@ -384,6 +428,12 @@ echo 'name: Alice\nage: 30' | tokenless decompress-toon
 
 ### Inspect token savings
 
+`tokenless stats serve --data-dir /var/lib/tokenless --credential-file /run/secrets/tokenless-query`
+runs an independent read-only HTTP service with Bearer validation, listening on
+`127.0.0.1:7397` by default. The paths are deployment placeholders; the database
+must already exist. See the [CLI reference](../../docs/user-guide/en/token-saving/tokenless/cli-reference.md#read-only-http-queries)
+for endpoints, pagination, and content access.
+
 Use `stats summary` for totals, `show` for the stored before/after payload, or
 `diff` to explain the estimated token saving and highlight only changed lines:
 
@@ -528,13 +578,13 @@ String format `"jq"` is also supported (auto-converts to object).
 
 ## OpenClaw Plugin
 
-The plugin translates two OpenClaw events into Protocol v2 lifecycle operations:
+The plugin translates OpenClaw tool hooks and live result middleware into Protocol v2 operations:
 
 | Hook | Event | Action | Status |
 |---|---|---|---|
 | Tool Ready | `before_tool_call` | Registered silent pass-through; no check, repair, context, or block | ⛔ Hard-disabled |
 | PreTool | `before_tool_call` | Sends `exec` arguments to Core and applies the returned RTK rewrite | ✅ Active |
-| PostTool | `tool_result_persist` | Rewrites supported OpenClaw-owned transcript tool results | ✅ Active |
+| PostTool | `registerAgentToolResultMiddleware` | Replaces supported tool text before the same-turn model request | ✅ Active |
 | BeforeModel / Retrieve | — | OpenClaw exposes neither a reliable schema-transform seam nor marker-authorized recovery | — |
 
 Core owns RTK execution, JSON detection, cleanup, TOON selection, thresholds, diagnostics, and final
@@ -542,25 +592,32 @@ arbitration. The plugin carries Core's per-call `output_optimization` from PreTo
 PostTool request, so RTK output is not compressed twice. The local CLI recovery command is a trusted
 operator entry rather than Agent authorization, so the plugin applies only lossless candidates.
 
-`tool_result_persist` is a synchronous OpenClaw transcript seam. It can replace a persisted string,
-a structured value, or a single text block while preserving the surrounding Tool Result envelope;
-media and multi-block results pass through. It does not replace a tool result already consumed by
-the model in the same turn, and it does not cover non-OpenClaw transcript implementations.
+The plugin declares `contracts.agentToolResultMiddleware: ["openclaw"]` and must be explicitly
+enabled in OpenClaw. PostTool replaces a single text block while preserving the rest of the tool
+result; media and multi-block results pass through. It does not register a separate transcript
+compression hook, so persistence does not compress or count the same result again.
 
 Both operations use the single `tokenless compress` entry point and fail open if Tokenless is
-missing or returns an invalid response.
+missing or returns an invalid response. For PostTool, fail-open retains the result received
+from the host, including any prior truncation. Legacy hosts such as 2026.8.2 cap text at
+100,000 UTF-16 code units when middleware is registered. They remain supported with this
+limit; builds containing upstream commit `2f620b970a04` are recommended. See the
+[OpenClaw compatibility notes](../../docs/user-guide/en/token-saving/tokenless/framework-integration.md#openclaw)
+for host limits and how to disable PostTool.
 
 ### Configuration
 
-The adapter requires OpenClaw Plugin API `2026.4.22` or newer; package metadata enforces this
-minimum during installation on hosts that support compatibility checks.
+The adapter requires OpenClaw `2026.6.6` or newer. The install script rejects older or
+unrecognized versions before installation, and package metadata declares the same minimum.
+If the runtime middleware API is missing or registration throws, PostTool is disabled with a
+warning; PreTool can continue. There is no transcript-only fallback.
 
 Options in `openclaw.plugin.json`:
 
 | Option | Default | Description |
 |---|---|---|
 | `rtk_enabled` | `true` | Enable RTK command rewriting |
-| `post_tool_enabled` | `true` | Enable Protocol v2 PostTool handling of persisted tool results |
+| `post_tool_enabled` | `true` | Enable Protocol v2 PostTool replacement of live tool results |
 | `tool_ready_enabled` | `true` | Register the currently hard-disabled Tool Ready hook |
 | `verbose` | `false` | Log lifecycle rewrites and applied PostTool results |
 
@@ -634,6 +691,32 @@ compression so the recovered payload reaches the model unchanged.
 make qoder-install
 ```
 
+## QwenWork Plugin (macOS Local Mode)
+
+The `qwenwork` adapter targets QwenWorkCN (千问办公) local sessions. PreToolUse
+rewrites **Bash input only**; PostToolUse observes **all tools** and compresses
+eligible full results through the shared policy. Metadata-only callbacks from
+`mcp_list`, `mcp_get`, or `mcp_call` pass through without replacing their real
+output; full MCP responses remain compressible. File-content protection and RTK
+deduplication remain unchanged. Statistics use `qwenwork`, independently of Qoder CLI, Qwen Code,
+and QwenPaw.
+
+After `anolisa install tokenless`, quit QwenWorkCN and explicitly sideload the plugin:
+
+```bash
+anolisa --dry-run adapter enable tokenless qwenwork
+anolisa adapter enable tokenless qwenwork
+anolisa adapter status tokenless
+```
+
+Restart QwenWorkCN and open a new local session; check activation in the application.
+The CLI verifies managed files, while loading and activation remain `unknown`.
+It does not change settings or enable a disabled plugin. Security-workspace/VM
+sessions are unsupported. Uninstall previous script-managed installations with
+their original script before enabling through the CLI; CLI-managed copies use
+`anolisa adapter disable tokenless qwenwork`. Installation, removal, and the 1.2.5
+validation scope are covered in [QwenWork integration](../../docs/user-guide/en/token-saving/tokenless/framework-integration.md#qwenwork-macos-local-mode).
+
 ## Claude Code Plugin
 
 The plugin registers hooks at two Claude Code events, covering four strategies:
@@ -680,6 +763,10 @@ make codex-install
 ```
 
 ## OpenCode Plugin
+
+Schema compression uses the host's model-facing JSON Schema while preserving its runtime
+parameter validator. Hosts that expose only a runtime validator skip schema compression;
+response compression and command rewriting remain available.
 
 The local plugin uses OpenCode's mutable tool hooks, so compressed output
 replaces the original model-visible response instead of being appended to it.
@@ -913,6 +1000,21 @@ transformed. Tool Ready remains hard-disabled.
 For installed-package checks and optional real Agent tasks, see the
 [release regression suite](tests/release_regression/README.md). It reports
 tool-output savings and retrieval overhead separately.
+
+To check OpenClaw's live delivery boundary with a locally scripted model, build the
+CLI and plugin, then run the command matching your local Docker image:
+
+```bash
+python3 tests/test-openclaw-gateway.py --image tokenless-test-agent-openclaw:2026.8.2 --host-output-policy legacy
+python3 tests/test-openclaw-gateway.py --image tokenless-openclaw-full:2f620b970a04 --host-output-policy normalized
+```
+
+The image must provide the corresponding OpenClaw build and Python 3.11+. Use
+`legacy` for the documented 2026.8.2 image, or `normalized` for a build whose source
+includes upstream fix `2f620b970a04`; select from source provenance, not the version
+string alone. The test checks passthrough, immediate replacement, persistence,
+single-count statistics, and Core failure recovery. It prints the evidence directory
+and makes no cloud requests.
 
 | Target | Description |
 |---|---|

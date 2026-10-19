@@ -40,17 +40,48 @@ As AI Agents gradually gain OS-level execution capabilities (file I/O, network a
 | **Security Events** | Local JSONL + SQLite event store with query and aggregation | `agent-sec-cli events` |
 | **Sandbox** | Syscall-level command isolation (bubblewrap + seccomp), used as an architecture layer | `linux-sandbox` |
 
-The background daemon (`agent-sec-daemon`, shipped as the `agent-sec-core.service`
+The V1 background daemon (`agent-sec-daemon`, shipped as the `agent-sec-core.service`
 systemd **user** unit) provides health, SkillFS notification, and security-query
 RPCs. Prompt scanning runs in-process through the Rust extension; the daemon does
 not preload Prompt Scanner models or serve scan RPCs.
 
-## V2 Policy CLI
+## V2 SkillSec and Policy CLI
 
-The source-built Rust `agent-sec-cli` provides all 15 Policy, Scope and Binding CRUD
+The Rust V2 core adds **SkillSec** behind the existing `skill-ledger` command: local scanners,
+system-key signing, version history, decisions, rollback and SkillFS activation share one root
+daemon. All local users may manage all Skills within the enabled defaults, administrator-configured
+directories or authenticated SkillFS mounts. Default system directories and standard Skill directories
+for all local account homes are authorized and scanned in the background after daemon startup.
+No directory configuration is needed for these locations. Set `enableDefaultSkillDirs: false` to disable
+this scope; `managedSkillDirs` remains available for additional absolute paths, direct children (`/*`)
+and recursive trees (`/**`). Homes come from `/etc/passwd`, not caller environment variables.
+Account/configuration changes require a daemon restart. Read-only packaged system Skills remain
+visibly skipped, not certified.
+Successful scan/certify operations remember canonical Skill paths in that same configuration;
+ordinary paths already covered by `managedSkillDirs` need no extra entry. SkillFS paths receive exact
+entries. Saved entries remain ordinary authorization after mount removal or default-discovery
+disablement; revoke them by removing the entries and restarting the daemon.
+`rotate-keys` and `init --force-keys` are unsupported and return an error without changing trust.
+
+The V2 systemd system unit is `agent-sec-core.service`; `agent-sec-daemon` is the executable name.
+Check the service with `sudo systemctl status agent-sec-core.service`.
+
+See the [V2 core guide](../../docs/user-guide/en/agent-security/agent-sec-core/skillsec-v2.md)
+for configuration, commands and the separate deployment/Agent Hook acceptance boundaries.
+V1 history and per-user keys are not imported. Hook adapters use daemon-owned initialization and
+validated `check`/`show` results while retaining host policies; see the
+[Hook integration boundary](../../docs/user-guide/en/agent-security/agent-sec-core/skillsec-v2.md#agent-hook-integration).
+
+Cosh-NG reserves 10 seconds for SkillSec initialization and querying in one Hook invocation.
+
+Rust V2 clients verify the connected daemon's kernel peer UID is 0 before sending requests.
+
+The source-built Rust `agent-sec-cli` provides 12 Policy, Scope and Binding administration
 commands through `asc-daemon`. See the [command reference](../../docs/user-guide/en/agent-security/agent-sec-core/policy-cli.md)
-and [V2 workspace](v2/README.md). PAP state is currently process-local; Binding
-acceptance does not imply enforcement. For non-root development and E2E, configure
+and [V2 workspace](v2/README.md). PAP state persists in SQLite; Binding acceptance does not imply enforcement.
+PolicyTemplates are reusable policies with general rules; the AgentSight Adapter
+currently executes only file-deletion block rules. Scopes save immutable Policy snapshots and
+own automatic Binding creation, reconciliation and cleanup. To authorize non-root Policy CLI callers, configure
 the daemon with `--policy-admin-uid <UID>`; default authorization remains root-only.
 
 V2 uses native OTel for local log correlation only; it exposes no OTLP exporter.
@@ -319,6 +350,10 @@ can serve the selected model; it never downloads models automatically.
 
 Details: [Prompt Scanner User Guide](../../docs/user-guide/en/agent-security/agent-sec-core/prompt-scanner.md).
 
+The V2 packages include `agent-sec-daemon-health`, a lightweight Rust probe that
+authenticates the daemon's UID before sending a health request. See the
+[probe reference](../../docs/user-guide/en/agent-security/agent-sec-core/internal-commands.md#agent-sec-daemon-health).
+
 ## Code Scanner
 
 Scans bash and python source for dangerous operations. In the V2 RPM,
@@ -330,18 +365,28 @@ Scans bash and python source for dangerous operations. In the V2 RPM,
 # The deployment supplies the daemon endpoint.
 export AGENT_SEC_DAEMON_SOCKET=/run/agent-sec-core/daemon.sock
 
-# Regex engine (the only V2 scanning engine currently available)
+# Embedded regex engine
 agent-sec-cli scan-code --code 'rm -rf /'
 agent-sec-cli --socket /run/agent-sec-core/daemon.sock \
   scan-code --code 'import os; os.system("rm -rf /")' --language python
+
+# Local-model engine: set AGENT_SEC_OLLAMA_MODEL in the daemon service
+# environment, then restart the service before invoking the CLI.
+sudo systemctl restart agent-sec-core.service
+agent-sec-cli scan-code --mode llm --code 'rm -rf /'
 ```
 
 The verdict enum is `pass` / `warn` / `deny` / `error`; built-in rules currently
 produce `warn` or `pass`. Rules are embedded in the V2 binary rather than read
-from a Python source-tree directory. `--mode llm` remains accepted for CLI
-compatibility but returns `LLM model not available`; `--trace-context` and
-code-scan telemetry are not yet available in V2, so hooks requiring them remain
-deferred.
+from a Python source-tree directory. In `llm` mode, the daemon calls the local
+Ollama-compatible model service. `AGENT_SEC_OLLAMA_MODEL` defaults to `warden`;
+backend, loopback base URL, and per-request timeout use the shared
+`AGENT_SEC_MODEL_SERVICE_*` settings. A valid model-service timeout is 1–300
+seconds, and the daemon budgets `3 * timeout + 1` seconds for availability,
+chat, and one retry. Missing models, inference failures, and unparsable verdicts
+return a parseable `error` result; `DENY` returns a successful `warn` result.
+`--trace-context` and code-scan telemetry are not yet available in V2, so hooks
+requiring them remain deferred.
 
 Full daemon endpoint, CLI, and host-hook status:
 [Code Scanner User Guide](../../docs/user-guide/en/agent-security/agent-sec-core/code-scanner.md).
@@ -351,7 +396,8 @@ Full daemon endpoint, CLI, and host-hook status:
 Detects personal data and credentials, and can emit redacted text.
 
 The bundled [pii-checker Skill](skills/pii-checker/SKILL.md) lets an Agent scan
-specified text or files and generate redacted text with the V1 CLI.
+specified text or files and generate redacted text. V2 uses the Rust daemon:
+set `AGENT_SEC_DAEMON_SOCKET` or pass top-level `--socket`; the CLI never starts it automatically.
 
 ```bash
 agent-sec-cli scan-pii --text "contact alice@example.com" --source manual
@@ -360,7 +406,18 @@ agent-sec-cli scan-pii --text "card 4111111111111111" --redact-output
 agent-sec-cli scan-pii --input ./sample.log --include-low-confidence
 ```
 
-Custom business types can be added in `~/.config/agent-sec/pii-checker/rules.yaml`.
+V2 loads custom business rules from `/etc/agent-sec/pii-checker/rules.yaml` at daemon startup;
+`agent-sec-daemon --pii-rules /absolute/path/rules.yaml` selects an alternative. Restart to update.
+V1 retains `~/.config/agent-sec/pii-checker/rules.yaml`. V2 reports coverage, rule identity and `summary.scanner_version: "2.0.0"`;
+a `pass` result with partial coverage does not establish complete detection. This phase preserves
+Hook contracts without switching live hosts or adding PDP enforcement.
+The shared CLI `--trace-context` adapter propagates attribution through the top-level OTel
+envelope; `params.traceContext` is not supported.
+
+OpenClaw records model-entry scans as `source=model_input` on stable `>=2026.5.12`;
+this input hook scans only the current `prompt`, excluding system prompts and history.
+Older supported hosts retain inbound scanning. Input blocking depends on policy,
+and tool-output hooks remain observation-only.
 
 Details: [PII Checker User Guide](../../docs/user-guide/en/agent-security/agent-sec-core/pii-checker.md).
 
@@ -512,6 +569,8 @@ agent-sec-cli harden --downstream-help
 
 ## Observability
 
+Rust V2 report/review query the daemon exclusively. Ordinary users see their own records; root can query records across all UIDs. Query identity comes only from the UDS peer. Report keeps V1’s `--session-id`, `--last`, and `--format`; review takes no command-specific options. Report JSON adds no UID field. `observability schema` generates the V1-compatible record schema locally from the Rust contracts.
+
 ```bash
 # Interactive drill-down TUI (requires an interactive terminal)
 agent-sec-cli observability review
@@ -530,6 +589,10 @@ Details: [Observability User Guide](../../docs/user-guide/en/agent-security/agen
 
 Security events are written both as JSONL and into a SQLite store. Query the store
 with `agent-sec-cli events`:
+
+V2 queries use the UDS peer UID: ordinary users read their own events and root reads
+all UIDs. Filter with the original session ID; root receives matching events from all UIDs.
+For colliding session IDs, root response labels use `UID_session_id` to distinguish owners.
 
 ```bash
 agent-sec-cli events --last-hours 24

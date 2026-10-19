@@ -193,12 +193,104 @@ pub enum StepSource {
     Agent,
 }
 
+impl StepSource {
+    /// Wire representation, matching the `lowercase` serde renaming.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::User => "user",
+            Self::Agent => "agent",
+        }
+    }
+}
+
+/// Derived, multi-label classification of a [`Step`] for querying.
+///
+/// Not part of the ATIF wire format: `source` alone cannot express tool or
+/// reasoning activity (both live *inside* an agent step), so these labels are
+/// computed from the typed step fields by [`Step::categories`]. A single step
+/// may carry several labels — an agent step can reason and call tools at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepCategory {
+    UserInput,
+    System,
+    AgentMessage,
+    Thinking,
+    ToolCall,
+    ToolResult,
+}
+
+impl StepCategory {
+    /// Every category, in the order surfaced to API clients.
+    pub const ALL: [StepCategory; 6] = [
+        Self::UserInput,
+        Self::System,
+        Self::AgentMessage,
+        Self::Thinking,
+        Self::ToolCall,
+        Self::ToolResult,
+    ];
+
+    /// Wire representation, matching the `snake_case` serde renaming.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::UserInput => "user_input",
+            Self::System => "system",
+            Self::AgentMessage => "agent_message",
+            Self::Thinking => "thinking",
+            Self::ToolCall => "tool_call",
+            Self::ToolResult => "tool_result",
+        }
+    }
+
+    /// Parses a query-parameter token; `None` for an unknown category so
+    /// callers can reject it rather than silently returning wrong results.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "user_input" => Some(Self::UserInput),
+            "system" => Some(Self::System),
+            "agent_message" => Some(Self::AgentMessage),
+            "thinking" => Some(Self::Thinking),
+            "tool_call" => Some(Self::ToolCall),
+            "tool_result" => Some(Self::ToolResult),
+            _ => None,
+        }
+    }
+}
+
+/// Flatten a step message to the text consumers read.
+///
+/// ATIF v1.6+ types `StepObject.message` as `String | Array<ContentPart>`, the
+/// array form being how a multimodal step carries its text and attachments. The
+/// in-repo producers always write the string form, but the format is
+/// interoperable, so a document from another producer — or a hand-written one —
+/// used to fail the whole parse with "invalid type: sequence, expected a
+/// string", losing every step rather than flattening one field. Non-string
+/// values are flattened to their JSON text, the same result the analyzer-side
+/// reader (`agentsight-opt`'s `de_step_message`) produces, so every reader of
+/// this schema accepts the same documents.
+///
+/// An explicit `null` message means the producer recorded no text, not the
+/// four-character string "null"; flatten it to the empty string, which is what
+/// the analyzer-side reader's `None` conveys.
+fn de_message<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match serde_json::Value::deserialize(deserializer)? {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::String(text) => text,
+        other => other.to_string(),
+    })
+}
+
 /// A single step in an ATIF trajectory.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Step {
     pub step_id: usize,
     pub source: StepSource,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "de_message")]
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<String>,
@@ -220,6 +312,71 @@ pub struct Step {
     pub llm_call_count: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_copied_context: Option<bool>,
+}
+
+impl Step {
+    /// Derived query labels for this step; see [`StepCategory`].
+    ///
+    /// Multi-label by design: an agent step that reasons and then calls a tool
+    /// yields `agent_message`/`thinking`/`tool_call` together, so filtering on
+    /// any one of them finds it. Labels are emitted in [`StepCategory::ALL`]
+    /// order for stable output.
+    pub fn categories(&self) -> Vec<StepCategory> {
+        let mut out = Vec::new();
+        match self.source {
+            StepSource::User => out.push(StepCategory::UserInput),
+            StepSource::System => out.push(StepCategory::System),
+            StepSource::Agent => {
+                // Blank agent turns (pure tool dispatch, empty completion)
+                // carry no message worth surfacing as `agent_message`.
+                if !self.message.trim().is_empty() {
+                    out.push(StepCategory::AgentMessage);
+                }
+            }
+        }
+        if self.has_reasoning() {
+            out.push(StepCategory::Thinking);
+        }
+        if self.has_tool_calls() {
+            out.push(StepCategory::ToolCall);
+        }
+        if self.has_observation() {
+            out.push(StepCategory::ToolResult);
+        }
+        out
+    }
+
+    /// Whether this step carries non-blank reasoning content.
+    pub fn has_reasoning(&self) -> bool {
+        self.reasoning_content
+            .as_ref()
+            .is_some_and(|r| !r.trim().is_empty())
+    }
+
+    /// Whether this step dispatched at least one tool call.
+    pub fn has_tool_calls(&self) -> bool {
+        self.tool_calls.as_ref().is_some_and(|tc| !tc.is_empty())
+    }
+
+    /// Whether this step carries at least one observation result.
+    ///
+    /// An `Observation` with an empty `results` vector conveys nothing, so it
+    /// does not count as a tool result.
+    pub fn has_observation(&self) -> bool {
+        self.observation
+            .as_ref()
+            .is_some_and(|o| !o.results.is_empty())
+    }
+
+    /// Names of the functions invoked by this step, in call order.
+    pub fn tool_names(&self) -> Vec<&str> {
+        self.tool_calls
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|tc| tc.function_name.as_str())
+            .collect()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -255,13 +412,12 @@ fn default_schema_version() -> String {
 }
 
 impl AtifTrajectory {
-    /// Serialize to a JSON Value with `None` fields stripped out.
+    /// Serialize with absent optional fields omitted and JSON payloads preserved.
     ///
     /// # Errors
     /// Returns a `serde_json` error if serialization fails.
     pub fn to_json_value(&self) -> serde_json::Result<serde_json::Value> {
-        let v = serde_json::to_value(self)?;
-        Ok(strip_nulls(v))
+        serde_json::to_value(self)
     }
 
     /// Validate step_id sequence (1-based, contiguous).
@@ -280,24 +436,6 @@ impl AtifTrajectory {
             }
         }
         Ok(())
-    }
-}
-
-/// Recursively strip null values from a JSON object.
-fn strip_nulls(v: serde_json::Value) -> serde_json::Value {
-    match v {
-        serde_json::Value::Object(map) => {
-            let filtered: serde_json::Map<String, serde_json::Value> = map
-                .into_iter()
-                .filter(|(_, val)| !val.is_null())
-                .map(|(k, val)| (k, strip_nulls(val)))
-                .collect();
-            serde_json::Value::Object(filtered)
-        }
-        serde_json::Value::Array(arr) => {
-            serde_json::Value::Array(arr.into_iter().map(strip_nulls).collect())
-        }
-        other => other,
     }
 }
 
@@ -373,6 +511,22 @@ mod tests {
     }
 
     #[test]
+    fn explicit_null_message_is_absent_not_the_text_null() {
+        // A producer that serializes an absent message as JSON null must not
+        // hand consumers the four-character string "null", which would read as
+        // a fabricated user turn and be written back on the next round trip.
+        let json = r#"{
+            "agent": {"name": "a"},
+            "steps": [{"step_id": 1, "source": "user", "message": null}]
+        }"#;
+        let traj: AtifTrajectory = serde_json::from_str(json).expect("null message parses");
+        assert_eq!(traj.steps[0].message, "");
+
+        let round_trip = serde_json::to_value(&traj).expect("trajectory serializes");
+        assert_eq!(round_trip["steps"][0]["message"], "");
+    }
+
+    #[test]
     fn serialize_skips_none_fields() {
         let traj = minimal_trajectory();
         let json = serde_json::to_string(&traj).unwrap();
@@ -391,6 +545,50 @@ mod tests {
         assert_eq!(parsed.steps.len(), 1);
     }
 
+    /// ATIF v1.6+ types `StepObject.message` as `String | Array<ContentPart>`,
+    /// the array form being how a multimodal step carries its text and
+    /// attachments. In-repo producers write the string form, but the format is
+    /// interoperable: a document from another producer used to fail the whole
+    /// parse with "invalid type: sequence, expected a string", losing every
+    /// step of the trajectory rather than flattening one field.
+    #[test]
+    fn accepts_the_content_part_message_union() {
+        let json = r#"{
+            "schema_version": "ATIF-v1.7",
+            "session_id": "s-union",
+            "agent": {"name": "qoder", "version": "unknown"},
+            "steps": [{
+                "step_id": 1,
+                "source": "user",
+                "timestamp": "2026-01-01T00:00:00Z",
+                "message": [
+                    {"type": "text", "text": "What is in this image?"},
+                    {"type": "image", "source": {"media_type": "image/png", "path": "a.png"}}
+                ]
+            }]
+        }"#;
+        let parsed =
+            validate_trajectory_str(json).expect("the v1.6+ content-part message must validate");
+        assert!(
+            parsed.steps[0].message.contains("What is in this image?"),
+            "the text part must survive the flattening: {:?}",
+            parsed.steps[0].message
+        );
+    }
+
+    /// The string form stays the canonical shape: it parses untouched and is
+    /// what serialization writes back, so consumers never re-encode a document
+    /// they only read.
+    #[test]
+    fn the_string_message_writes_back_unchanged() {
+        let mut traj = minimal_trajectory();
+        traj.steps[0].message = "plain text".into();
+        let json = serde_json::to_string(&traj).unwrap();
+        assert!(json.contains(r#""message":"plain text""#));
+        let parsed = validate_trajectory_str(&json).unwrap();
+        assert_eq!(parsed.steps[0].message, "plain text");
+    }
+
     #[test]
     fn validate_rejects_bad_step_ids() {
         let mut traj = minimal_trajectory();
@@ -399,9 +597,178 @@ mod tests {
     }
 
     #[test]
-    fn strip_nulls_removes_nested_nulls() {
-        let v = serde_json::json!({"a": null, "b": {"c": null, "d": 1}, "e": [null, 2]});
-        let stripped = strip_nulls(v);
-        assert_eq!(stripped, serde_json::json!({"b": {"d": 1}, "e": [null, 2]}));
+    fn json_value_omits_unset_metadata_and_roundtrips() {
+        let value = minimal_trajectory().to_json_value().unwrap();
+        assert!(value.get("trajectory_id").is_none());
+        assert!(value["agent"].get("tool_definitions").is_none());
+        assert!(value["steps"][0].get("reasoning_content").is_none());
+        let parsed = validate_trajectory_str(&value.to_string()).unwrap();
+        assert_eq!(parsed.steps[0].message, "hello");
+        assert_eq!(parsed.session_id.as_deref(), Some("s-1"));
+    }
+
+    // ─── Derived step categories ─────────────────────────────────────────
+
+    /// A bare step with everything optional left unset.
+    fn bare_step(source: StepSource) -> Step {
+        Step {
+            step_id: 1,
+            source,
+            message: String::new(),
+            timestamp: None,
+            model_name: None,
+            reasoning_effort: None,
+            reasoning_content: None,
+            tool_calls: None,
+            observation: None,
+            metrics: None,
+            extra: None,
+            llm_call_count: None,
+            is_copied_context: None,
+        }
+    }
+
+    fn tool_call(name: &str) -> ToolCall {
+        ToolCall {
+            tool_call_id: "tc-1".into(),
+            function_name: name.into(),
+            arguments: serde_json::json!({}),
+            extra: None,
+        }
+    }
+
+    #[test]
+    fn category_user_input() {
+        let mut step = bare_step(StepSource::User);
+        step.message = "list files".into();
+        assert_eq!(step.categories(), vec![StepCategory::UserInput]);
+    }
+
+    #[test]
+    fn category_system() {
+        let mut step = bare_step(StepSource::System);
+        step.message = "you are a helpful assistant".into();
+        assert_eq!(step.categories(), vec![StepCategory::System]);
+    }
+
+    #[test]
+    fn category_agent_message() {
+        let mut step = bare_step(StepSource::Agent);
+        step.message = "Only a.txt exists.".into();
+        assert_eq!(step.categories(), vec![StepCategory::AgentMessage]);
+    }
+
+    #[test]
+    fn category_thinking() {
+        let mut step = bare_step(StepSource::Agent);
+        step.reasoning_content = Some("need to run ls".into());
+        assert_eq!(step.categories(), vec![StepCategory::Thinking]);
+    }
+
+    #[test]
+    fn category_tool_call() {
+        let mut step = bare_step(StepSource::Agent);
+        step.tool_calls = Some(vec![tool_call("bash")]);
+        assert_eq!(step.categories(), vec![StepCategory::ToolCall]);
+        assert_eq!(step.tool_names(), vec!["bash"]);
+    }
+
+    #[test]
+    fn category_tool_result() {
+        let mut step = bare_step(StepSource::User);
+        step.observation = Some(Observation {
+            results: vec![ObservationResult {
+                source_call_id: Some("tc-1".into()),
+                content: Some(serde_json::json!("a.txt")),
+                subagent_trajectory_ref: None,
+                extra: None,
+            }],
+        });
+        // A tool result arrives on a user-role turn, so both labels apply.
+        assert_eq!(
+            step.categories(),
+            vec![StepCategory::UserInput, StepCategory::ToolResult]
+        );
+    }
+
+    #[test]
+    fn categories_are_multi_label() {
+        let mut step = bare_step(StepSource::Agent);
+        step.message = "Let me check.".into();
+        step.reasoning_content = Some("need to run ls".into());
+        step.tool_calls = Some(vec![tool_call("bash"), tool_call("read")]);
+        assert_eq!(
+            step.categories(),
+            vec![
+                StepCategory::AgentMessage,
+                StepCategory::Thinking,
+                StepCategory::ToolCall,
+            ]
+        );
+        assert_eq!(step.tool_names(), vec!["bash", "read"]);
+    }
+
+    #[test]
+    fn blank_agent_message_is_not_a_category() {
+        let mut step = bare_step(StepSource::Agent);
+        step.message = "   \n\t ".into();
+        step.tool_calls = Some(vec![tool_call("bash")]);
+        // Pure tool dispatch: no readable message, so no `agent_message`.
+        assert_eq!(step.categories(), vec![StepCategory::ToolCall]);
+    }
+
+    #[test]
+    fn blank_reasoning_is_not_thinking() {
+        let mut step = bare_step(StepSource::Agent);
+        step.message = "done".into();
+        step.reasoning_content = Some("  ".into());
+        assert_eq!(step.categories(), vec![StepCategory::AgentMessage]);
+        assert!(!step.has_reasoning());
+    }
+
+    #[test]
+    fn empty_collections_are_not_categories() {
+        let mut step = bare_step(StepSource::Agent);
+        step.message = "done".into();
+        step.tool_calls = Some(Vec::new());
+        step.observation = Some(Observation {
+            results: Vec::new(),
+        });
+        // Present-but-empty conveys nothing.
+        assert_eq!(step.categories(), vec![StepCategory::AgentMessage]);
+        assert!(!step.has_tool_calls());
+        assert!(!step.has_observation());
+        assert!(step.tool_names().is_empty());
+    }
+
+    #[test]
+    fn category_parse_roundtrip() {
+        for category in StepCategory::ALL {
+            assert_eq!(StepCategory::parse(category.as_str()), Some(category));
+        }
+        assert_eq!(
+            StepCategory::parse(" tool_call "),
+            Some(StepCategory::ToolCall)
+        );
+        assert_eq!(StepCategory::parse("assistant"), None);
+        assert_eq!(StepCategory::parse(""), None);
+    }
+
+    #[test]
+    fn category_wire_names_match_serde() {
+        // `as_str` must agree with the snake_case serde renaming, since clients
+        // filter using the values they see in responses.
+        for category in StepCategory::ALL {
+            let json = serde_json::to_string(&category).unwrap();
+            assert_eq!(json, format!("\"{}\"", category.as_str()));
+        }
+    }
+
+    #[test]
+    fn step_source_wire_names_match_serde() {
+        for source in [StepSource::System, StepSource::User, StepSource::Agent] {
+            let json = serde_json::to_string(&source).unwrap();
+            assert_eq!(json, format!("\"{}\"", source.as_str()));
+        }
     }
 }

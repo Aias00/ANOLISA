@@ -2,7 +2,7 @@
 
 [中文版](../../../zh/agent-observability/agentsight/cli-reference.md)
 
-All flags on this page are taken from `agentsight 0.11.x --help` on Linux. The sample output keeps
+All flags on this page are taken from `agentsight 0.13.0 --help` on Linux. The sample output keeps
 the real layout, but every identifier is a placeholder and every count is a round number — none of
 it is a real capture.
 
@@ -12,9 +12,9 @@ it is a real capture.
 |---|---|
 | Privileges | `trace` needs root (or `CAP_BPF` + `CAP_PERFMON`). Query commands need read access to `/var/log/sysak/.agentsight`, which the packaged service owns — use `sudo`. |
 | Config file | Commands that read rules accept `--config`, default `/etc/agentsight/config.json`. `discover` reads the same file `trace` does, so it reflects your custom rules. |
-| Data location | Fixed at `/var/log/sysak/.agentsight`. `serve`, `dashboard`, and `skill-metrics` accept `--db` to point at a different database file. |
-| Machine output | `--json` is available on `token`, `audit`, `summary`, `interruption *`, and `skill-metrics *`. |
-| Output language | `summary`, `metrics`, and `interruption` print English; `discover` and `token` print Chinese regardless of locale. Use `--json` for stable, language-neutral text — note `discover` has no such flag. |
+| Data location | Fixed at `/var/log/sysak/.agentsight`. `serve`, `dashboard`, `skill-metrics`, `audit`, `metrics`, `summary`, and `interruption` accept `--db` to point at a different database file. |
+| Machine output | `--json` is available on `discover`, `token`, `audit`, `summary`, `interruption *`, and `skill-metrics *`. |
+| Output language | `summary`, `metrics`, and `interruption` print English; `discover` and `token` print Chinese regardless of locale. Use `--json` for stable, language-neutral text. |
 | Platform | On macOS only `trace` (trajectory collector) and `serve` exist. |
 | Sample IDs | Session, conversation, trace, and interruption IDs in the examples are placeholders — substitute the ones from your own output. |
 
@@ -156,9 +156,11 @@ One-command health picture for a recent window.
 
 ```
 FLAGS:
-        --json           Output as JSON
+        --json                          Output as JSON
 OPTIONS:
-        --last <last>    Query the last N hours (default: 24) [default: 24]
+        --db <db>                       Override the sessions database path
+        --last <last>                   Query the last N hours (default: 24) [default: 24]
+        --tokenless-db <tokenless-db>   Override the tokenless stats database path
 ```
 
 ```bash
@@ -175,6 +177,17 @@ Interruptions 1
   low         0
 
 Tokenless     10% saved (110.0K -> 99.0K, 20 ops)
+```
+
+`--db` reads a copy of the databases — for example one copied off another host — instead of the
+default directory, so the report needs no `sudo` and mixes in no live data. The interruption
+database is read from the same directory (`interruption_events.db`), matching the default layout.
+The tokenless store lives outside those databases, in the caller's home directory, so `--db` does
+not move it: pass `--tokenless-db` to read a copy of `stats.db` and keep the whole report free of
+the reading host's own data.
+
+```bash
+agentsight summary --last 24 --db /backup/agentsight/genai_events.db
 ```
 
 ## agentsight token
@@ -224,6 +237,7 @@ OPTIONS:
                                   substrings. Repeatable. The hidden count is reported
         --last <last>             Query last N hours (e.g. 24)
         --pid <pid>               Filter by PID
+        --db <db>                 Override the database path
 ```
 
 ```bash
@@ -256,6 +270,13 @@ Filter them out with repeated `--exclude`:
 
 ```bash
 sudo agentsight audit --last 1 --exclude agent-sec-cli --exclude observability_hook.py
+```
+
+`--db` reads a copy of `agentsight.db` — for example one copied off another host — instead of the
+default directory:
+
+```bash
+agentsight audit --last 24 --db /backup/agentsight/agentsight.db
 ```
 
 ## agentsight discover
@@ -316,10 +337,21 @@ agentsight_token_output_total{agent="CoshNG"} 10000
 The running server exposes the same content at `GET /metrics` (localhost only), which is usually
 easier to scrape. See [Data and storage](data-and-storage.md#prometheus-metrics).
 
+`--db` reads a copy of `genai_events.db` instead of the default directory:
+
+```bash
+agentsight metrics --db /backup/agentsight/genai_events.db
+```
+
 ## agentsight interruption
 
 Queries and resolves detected interruptions. Database:
-`/var/log/sysak/.agentsight/interruption_events.db`.
+`/var/log/sysak/.agentsight/interruption_events.db`. `--db` (before the subcommand) reads a copy of
+the database instead — for example one copied off another host:
+
+```bash
+agentsight interruption --db /backup/agentsight/interruption_events.db stats --last 168
+```
 
 ```
 SUBCOMMANDS:
@@ -432,3 +464,21 @@ The same numbers appear on the Dashboard's Skill Metrics page.
 - [Configuration](configuration.md) — what the config file controls
 - [Dashboard guide](dashboard.md) — UI equivalents of these queries
 - [Data and storage](data-and-storage.md) — HTTP API and database layout
+
+## Benchmark artifacts
+
+From the repository root, `bash src/agentsight/scripts/benchmark/single_run/resource_run.sh --help`
+lists controls for the Linux standalone resource benchmark (formerly `memory_run.sh`).
+It defaults to 32 Agents at 100 output tok/s each for 60 seconds and requires root
+or eBPF capabilities. `resource-report.txt` and `resource-summary.json` report
+load-window average/peak RSS and average/P95/peak CPU, with response drain separate.
+CPU 100% means one logical CPU. Cooperative pacing defaults to 25%.
+`--cpu-budget-percent N` overrides the target; `0` disables it, and omission uses the configured
+target or 25% when unset. Check response drain and queue growth
+alongside CPU and RSS. See the
+[benchmark usage guide](../../../../../src/agentsight/scripts/docs/BENCHMARK_USAGE.md)
+for configuration, A/B comparisons and validity checks.
+
+Running `scripts/benchmark/campaign/aggregate_report.py --campaign <campaign.json> --results <results>` also exports UTF-8 `run-inventory.csv`. It contains every discovered formal `runs/**/run-result.json` across smoke, capacity, matrix, soak, recovery and fault scenarios, sorted by relative artifact path. Columns retain run settings, harness exit code, verdict, JSON arrays of missing/failed gates, and `result_path`; absent optional values stay empty. Archived incomplete runs are outside this inventory. Existing summary reports and source artifacts are preserved.
+
+Resource reports accept either plain CSV or gzip CSV via `render_report.py --metrics <file.csv.gz>`. Campaign recovery evidence uses `measurement/metrics.csv`, falling back to `measurement/metrics.csv.gz` only when the plain file is absent. Compression preserves the same columns and calculations; corrupt compressed input remains an error.

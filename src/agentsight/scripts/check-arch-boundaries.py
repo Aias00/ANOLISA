@@ -24,13 +24,19 @@ LAYER_MAP = {
     "tokenizer":   4,   # L4: Analyze
     "genai":       5,   # L5: Semantic
     "atif":        5,   # L5: Semantic
+    "grounding":   5,   # L5: Semantic (deterministic ATIF analysis, no crate deps)
     "storage":     6,   # L6: Persist
+    "storage_budget": 6,  # L6: Shared SQLite capacity budget
+    "storage_status": 6,  # L6: Cross-platform read-only storage status
     "agent_sec":   7,   # L7: Serve
     "grader":      7,   # L7: Serve
     "enforcement": 7,   # L7: Security control plane
     "security":    7,   # L7: Security audit and containment
     "server":      7,   # L7: Serve
     "health":      7,   # L7: Serve
+    "preferences": 7,   # L7: Serve (on-demand analysis shared by both servers)
+    "reuse":       7,   # L7: Serve (trajectory reuse labels shared by both servers)
+    "semantic_search": 7,  # L7: Serve (session search contract shared by both servers)
     "bin":         8,   # L8: Entry
     "unified":     8,   # L8: Entry
     "config":      8,   # L8: Entry
@@ -47,19 +53,40 @@ ALLOWED_DEPS = {
     "tokenizer":   set(),
     "genai":       {"analyzer", "aggregator", "parser"},
     "atif":        {"genai", "storage"},
+    # Reads only the `agentsight_atif` crate, never `crate::` — which is what lets
+    # more than one subsystem share it.
+    "grounding":   set(),
     "storage":     {"analyzer", "genai", "security"},
+    "storage_budget": set(),
+    "storage_status": set(),
     "grader":      {"storage"},
     "enforcement": {"storage"},
     "security":    {"enforcement"},
     "server":      {
         "storage",
+        "storage_budget",
+        "storage_status",
         "health",
         "atif",
         "agent_sec",
         "grader",
         "enforcement",
         "security",
+        "grounding",
+        "preferences",
+        "reuse",
+        "semantic_search",
     },
+    # Same-layer peers of `server`: both are transport-agnostic contracts the
+    # Linux and macOS handlers share, so they may only read downwards.
+    "preferences": {"genai", "storage", "atif"},
+    # May read the grounding engine, and nothing else — in particular not
+    # `server`. The labelling rules themselves take grounding's conclusions as an
+    # argument; only the adapter that folds them reaches for the engine. Keeping
+    # the set this narrow is what stops an import of `server` from being quietly
+    # reintroduced.
+    "reuse":       {"grounding"},
+    "semantic_search": {"storage"},
     "agent_sec":   set(),
     "health":      {"storage"},
     "unified":     "*",
@@ -71,6 +98,7 @@ ALLOWED_DEPS = {
 # Cross-cutting modules — any module may import these.
 CROSS_CUTTING = {
     "config",          # global configuration
+    "database",        # cross-platform SQLite registry and maintenance owner
     "chrome_trace",    # data format helpers
     "interruption",    # cross-layer event detection
     "response_map",    # session mapping helpers
@@ -81,6 +109,7 @@ CROSS_CUTTING = {
     "token_breakdown", # token analysis helpers
     "ecs_metadata",    # shared ECS metadata client primitives
     "private_sqlite",  # private state-file creation shared by control modules
+    "runtime_metrics",  # low-overhead instrumentation shared by pipeline stages
 }
 
 # Known violations: (source_file_relative_to_src, target_module, reason)
@@ -91,6 +120,7 @@ KNOWN_VIOLATIONS = [
 
 USE_RE = re.compile(r"use\s+crate::(\w+)")
 PATH_RE = re.compile(r"crate::(\w+)::")
+GROUP_START_RE = re.compile(r"use\s+crate::\{")
 CFG_TEST_RE = re.compile(r"#\[cfg\(test\)\]")
 MOD_RE = re.compile(r"\bmod\s+\w+")
 
@@ -119,11 +149,52 @@ def is_test_file(rel_path: Path) -> bool:
     return False
 
 
+def parse_grouped_import(text: str):
+    """Parse the body of a `use crate::{...}` group.
+
+    ``text`` is everything after the opening `use crate::{`. Returns
+    ``(modules, closed)`` where ``modules`` holds the first identifier of each
+    top-level item (the module actually imported, matching what the simple
+    `use crate::x::y;` form yields) and ``closed`` reports whether the group's
+    closing brace is present in ``text`` — a multi-line group is continued
+    across lines until it is.
+    """
+    items = []
+    current = []
+    depth = 0
+    for ch in text:
+        if ch == "{":
+            depth += 1
+            current.append(ch)
+        elif ch == "}":
+            if depth == 0:
+                break
+            depth -= 1
+            current.append(ch)
+        elif ch == "," and depth == 0:
+            items.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+    else:
+        # The closing brace has not been seen yet.
+        return [], False
+    items.append("".join(current))
+
+    modules = []
+    for item in items:
+        m = re.match(r"\s*(\w+)", item)
+        if m and m.group(1) not in ("self", "super", "crate"):
+            modules.append(m.group(1))
+    return modules, True
+
+
 def extract_imports(text: str):
     """Yield (line_no, target_module) tuples for crate-internal imports.
 
-    Skips imports inside `#[cfg(test)] mod ... { ... }` blocks using a simple
-    brace-depth tracker.
+    Recognises the simple `use crate::x::y;` form and brace groups
+    (`use crate::{x, y};`), including multi-line groups. Skips imports inside
+    `#[cfg(test)] mod ... { ... }` blocks using a simple brace-depth tracker.
 
     Limitations:
       - Only recognises `#[cfg(test)]` followed by `mod <name> {` with the
@@ -136,6 +207,9 @@ def extract_imports(text: str):
     test_block_depth = 0  # brace depth at which the test block was opened
     depth = 0
     pending_cfg_test = False
+    # Body of a multi-line `use crate::{...}` group being accumulated.
+    group_body = None
+    group_line_no = 0
 
     for idx, line in enumerate(lines, start=1):
         # Skip comment lines (line comments and doc comments).
@@ -164,10 +238,27 @@ def extract_imports(text: str):
 
         # Process imports if not inside a test block.
         if not in_test_block:
-            for m in USE_RE.finditer(line):
-                yield idx, m.group(1)
-            for m in PATH_RE.finditer(line):
-                yield idx, m.group(1)
+            if group_body is not None:
+                group_body += "\n" + line
+                modules, closed = parse_grouped_import(group_body)
+                if closed:
+                    for module in modules:
+                        yield group_line_no, module
+                    group_body = None
+            else:
+                for m in USE_RE.finditer(line):
+                    yield idx, m.group(1)
+                for m in PATH_RE.finditer(line):
+                    yield idx, m.group(1)
+                for m in GROUP_START_RE.finditer(line):
+                    body = line[m.end():]
+                    modules, closed = parse_grouped_import(body)
+                    if closed:
+                        for module in modules:
+                            yield idx, module
+                    else:
+                        group_body = body
+                        group_line_no = idx
 
         depth = new_depth
 

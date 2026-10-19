@@ -2,7 +2,7 @@ manifest_version = 2
 
 [component]
 name = "sec-core"
-version = "0.12.0"
+version = "1.0.1"
 layer = "runtime"
 domain = "security"
 display_name = "Agent Security Core"
@@ -13,7 +13,7 @@ repository = "https://github.com/alibaba/anolisa"
 
 [component.contract]
 schema_version = "1.0"
-min_anolisa_version = "0.2.17"
+min_anolisa_version = "0.3.15"
 
 [backends.rpm]
 package = "agent-sec-core"
@@ -74,6 +74,12 @@ mode = "0755"
 type = "executable"
 
 [[component.layout.files]]
+source = "bin/agent-sec-daemon-health"
+target = "{bindir}/agent-sec-daemon-health"
+mode = "0755"
+type = "executable"
+
+[[component.layout.files]]
 source = "bin/agent-sec-python"
 target = "{bindir}/agent-sec-python"
 mode = "0755"
@@ -107,18 +113,13 @@ target = "{libdir}/sec-core/python3.11/runtime/LICENSES.sha256"
 mode = "0644"
 
 [[component.layout.files]]
-source = "lib/anolisa/sec-core/python3.11/site-packages/"
-target = "{libdir}/sec-core/python3.11/site-packages/"
-mode = "0644"
-
-[[component.layout.files]]
 source = "share/anolisa/skills/"
 target = "{datadir}/skills/"
 mode = "0644"
 
 [[component.layout.files]]
 source = "share/anolisa/sec-core/agent-sec-core.service.in"
-target = "{userunitdir}/agent-sec-core.service"
+target = "{unitdir}/agent-sec-core.service"
 mode = "0644"
 render = "anolisa-paths-v1"
 
@@ -129,7 +130,7 @@ mode = "0644"
 
 [[component.services]]
 unit = "agent-sec-core.service"
-scope = "user"
+scope = "system"
 enable = false
 start = false
 
@@ -151,6 +152,7 @@ detect = { binary = "openclaw" }
 
 [adapters.backends.rpm]
 resource_root = "/opt/agent-sec/openclaw-plugin/"
+managed_packages = ["agent-sec-openclaw-hook", "agent-sec-skills"]
 
 [adapters.compat]
 framework_version = ">=2026.4.14"
@@ -197,6 +199,7 @@ detect = { binary = "hermes" }
 
 [adapters.backends.rpm]
 resource_root = "/opt/agent-sec/hermes-plugin/src/"
+managed_packages = ["agent-sec-hermes-hook", "agent-sec-skills"]
 
 [adapters.bundle]
 schema = 1
@@ -235,6 +238,7 @@ detect = { binary = "codex" }
 
 [adapters.backends.rpm]
 resource_root = "/opt/agent-sec/codex-plugin/hooks-plugin/"
+managed_packages = ["agent-sec-codex-hook"]
 
 [adapters.bundle]
 schema = 1
@@ -253,6 +257,7 @@ detect = { binary = "qodercli" }
 
 [adapters.backends.rpm]
 resource_root = "/opt/agent-sec/qoder-plugin/"
+managed_packages = ["agent-sec-qoder-hook"]
 
 [adapters.bundle]
 schema = 1
@@ -271,6 +276,7 @@ detect = { binary = "qwen" }
 
 [adapters.backends.rpm]
 resource_root = "/opt/agent-sec/qwen-code-extension/"
+managed_packages = ["agent-sec-qwen-code-hook"]
 
 [adapters.bundle]
 schema = 1
@@ -289,6 +295,7 @@ detect = { binary = "cosh" }
 
 [adapters.backends.rpm]
 resource_root = "{datadir}/extensions/agent-sec-core/"
+managed_packages = ["agent-sec-cosh-hook"]
 
 [adapters.bundle]
 schema = 1

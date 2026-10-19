@@ -1,6 +1,6 @@
 # Workspace Checkpoints (ws-ckpt)
 
-ws-ckpt provides millisecond-level workspace checkpoint and rollback for AI Agents. It leverages filesystem COW (Copy-on-Write) to create instant snapshots of the working directory, enabling safe experimentation and fast recovery.
+ws-ckpt provides copy-on-write workspace checkpoint and rollback for AI Agents. It uses filesystem COW (Copy-on-Write) snapshots to support safe experimentation and recovery; operation latency depends on the filesystem, workload, and host environment.
 
 ---
 
@@ -8,8 +8,8 @@ ws-ckpt provides millisecond-level workspace checkpoint and rollback for AI Agen
 
 When AI Agents modify code, configurations, or data files, mistakes can be costly. ws-ckpt allows Agents (and users) to:
 
-- Create instant snapshots before risky operations
-- Roll back to any previous checkpoint in milliseconds
+- Create COW snapshots before risky operations
+- Roll back to a previous checkpoint when needed
 - Compare differences between checkpoints
 - Auto-checkpoint via plugin integration
 
@@ -74,17 +74,57 @@ The OpenClaw plugin requires OpenClaw >= 2026.2.13, the first release whose conf
 | `ws-ckpt checkpoint -w <workspace> -s <snapshot-id> -m <message> [--metadata <json>]` | Create a new checkpoint |
 | `ws-ckpt rollback -w <workspace> -s <snapshot> [--preview]` | Restore workspace to a checkpoint |
 | `ws-ckpt rollback -w <workspace> -n <num-ancestors>` | Rollback N ancestors |
-| `ws-ckpt list [-w <workspace>] [--format table\|json]` | List all checkpoints |
+| `ws-ckpt list [-w <workspace>] [--orphans] [--format table\|json] [--limit N] [--cursor TOKEN]` | List checkpoints; auto-page by default |
 | `ws-ckpt diff -w <workspace> -f <from> [-t <to>]` | Show differences between checkpoints |
-| `ws-ckpt delete [-w <workspace>] -s <snapshot> [--force]` | Delete a specific checkpoint |
+| `ws-ckpt delete [-w <workspace>] -s <complete-id> [--force]` | Delete a specific checkpoint |
 | `ws-ckpt status [-w <workspace>] [--format table\|json]` | Show current workspace status |
 | `ws-ckpt cleanup -w <workspace> [--keep 20]` | Remove old checkpoints |
 | `ws-ckpt config [-g \| -w <workspace>] [--enable-auto-cleanup] [--auto-cleanup-keep <N\|Nd>]` | View/edit configuration |
 | `ws-ckpt plugin install --runtime openclaw\|hermes` | Install runtime plugin |
 | `ws-ckpt plugin uninstall --runtime openclaw\|hermes` | Uninstall runtime plugin |
-| `ws-ckpt recover [-w <workspace> \| --all] [--force]` | Recover from interrupted operations |
+| `ws-ckpt recover [-w <workspace> \| --all] [--force]` | Restore a plain directory or an interrupted initialization backup |
+| `ws-ckpt unregister -w <workspace> [--force]` | Remove a registration only when its live subvolume is missing; restore no data |
 | `ws-ckpt reload` | Reload daemon configuration |
 | `ws-ckpt daemon [--mount-path ...] [--socket ...] [--log-level ...]` | Start the daemon process |
+
+### Listing large snapshot histories
+
+`list` uses byte-bounded cursor pages internally. With neither `--limit` nor
+`--cursor`, the CLI follows every cursor and preserves the original output
+contract: JSON is one array and table output is one complete listing. If a later
+page fails, JSON emits no partial array and exits non-zero.
+
+Use `--limit` or `--cursor` to request exactly one page:
+
+```bash
+ws-ckpt list -w /home/user/projects/my-project --limit 1000 --format json
+ws-ckpt list -w /home/user/projects/my-project --limit 1000 --cursor '<next_cursor>' --format json
+ws-ckpt status -w /home/user/projects/my-project --format json
+```
+
+`--orphans` uses the same pagination and restricts results to recovered orphan
+snapshots. Keep this filter unchanged when continuing a cursor.
+
+Explicit-page JSON is an object with `snapshots` and `next_cursor`. Pages sort
+oldest first by `(created_at, workspace_id, snapshot_id)`. A cursor is opaque,
+versioned, scoped to the original workspace query, and carries the first page's
+upper bound, the maximum key observed in its index scan (not the current time).
+Inserts newer than that bound do not appear; inserts within the
+bound and deletions can still affect later pages. For a mutation-free,
+point-in-time listing, pause checkpoint and cleanup operations during the scan.
+
+The daemon reads each page from its in-memory snapshot index and does not scan
+snapshot file contents. Each page scans the query scope again: N snapshots over
+P pages require O(N * P) index visits, plus candidate maintenance and rendering.
+Only selected candidate keys are copied, but the repeated scan remains; no
+fixed latency is guaranteed. Pages target about 1 MiB and never exceed the 16 MiB IPC frame limit.
+If one entry's optional `message` or `metadata` would exceed that limit, the
+entry is returned as `detail: "summary"` with `omitted_fields`. Its retained
+`created_at`, `pinned`, and `missing` fields stay under `meta`, as in full entries;
+omitted fields are absent, not null. It remains addressable by snapshot ID. Use `status` for counts and health probes rather
+than enumerating snapshots. `cleanup --keep N` can reduce an existing history,
+but deletes old unpinned snapshots. Pagination requires an updated daemon;
+legacy unpaged requests remain compatible.
 
 ### Examples
 
@@ -113,6 +153,99 @@ ws-ckpt cleanup -w /home/user/projects/my-project --keep 20
 # Enable auto-cleanup for workspace
 ws-ckpt config -w /home/user/projects/my-project --enable-auto-cleanup --auto-cleanup-keep 7d
 ```
+
+### Snapshot recovery after an interrupted cleanup
+
+After restart, the daemon removes missing ordinary, unpinned snapshot records
+and repairs their parent/child links. Pinned snapshots and guarded evidence
+remain marked unavailable; `list` shows the missing marker and `diff` returns
+`SnapshotNotFound`. A `delete` whose subvolume is already absent also returns
+`SnapshotNotFound`, removes the ordinary record, and retains guarded evidence.
+Pinned records still require `--force`.
+
+Snapshot directories absent from the index are registered as **pinned recovered
+orphans**. Their original protection state, message, metadata, creation time and
+ancestry are unknown: the displayed timestamp is the recovery time, not the
+original creation time. Count/Age cleanup excludes them, including after new
+checkpoints and restarts. A retained guarded receipt prevents adopting an
+unverified orphan under that ID.
+
+Query recovered orphans separately from ordinary pinned snapshots, then delete
+only the ones you have confirmed are no longer needed:
+
+```bash
+ws-ckpt list -w "/path/to/workspace" --orphans --format json
+ws-ckpt delete -w "/path/to/workspace" -s "complete-snapshot-id" --force
+```
+
+Omit `-w` to query recovered orphans across all workspaces. JSON includes the
+complete `id`, `workspace`, and `meta.pinned`; table output also shows protection.
+Recovered orphans continue to occupy disk space until explicitly deleted.
+
+**Delete accepts complete IDs only**, with or without `-w`; short prefixes are
+rejected even with `--force`. If the complete ID exists in multiple workspaces,
+specify `-w`. Other commands retain their existing prefix behavior. Upgrade the
+CLI and daemon together for `--orphans` and exact deletion semantics.
+
+Recovery reconciles completed deletions; it does not resume the interrupted
+cleanup's remaining plan. Run `cleanup` again to finish ordinary retention.
+
+### Recovering interrupted initialization and stale registrations
+
+Recovery confirmation comes from the daemon: aliases, parent symlinks and `..`
+resolve to the same registered workspace. The prompt shows its registered path
+and the number of snapshot directories that recovery will delete, including
+snapshots absent from the index. Execution uses that resolved workspace ID and
+rechecks the target and deletion set; if either changed, run the command again
+and confirm the new preview. `--force` skips the interactive prompt but still
+uses this preview and revalidation. Update the CLI and daemon together; an older
+daemon that does not support recovery preview cannot execute this CLI flow.
+
+Normally, `recover` copies a registered workspace into a plain directory, then
+removes its managed subvolume and snapshots. After interrupted initialization,
+choose the action that matches the remaining state:
+
+| State | Action |
+|-------|--------|
+| Only `<workspace>.pre-init-bak` remains, with no historical subvolume | Run `init` again; it restores the backup before initializing. The original path must be missing, an empty directory, or a symlink. |
+| The workspace is unregistered, with both backup and migrated subvolume present | Run `recover -w <workspace>` to restore the complete backup. Potentially partial or newer subvolumes and snapshots remain, and their locations are reported for inspection. You can then run `init` again. |
+| The workspace is registered but its live subvolume is missing | `recover` reports the missing source. Run `unregister -w <workspace>` to remove the stale registration while retaining recovery material. |
+
+Backup restoration refuses to overwrite a non-empty directory or a regular file.
+Inspect and move any conflicting data first. A `.pre-init-bak` left after a
+registered workspace is recovered moves to `.pre-init-bak.recovered` (with a
+numeric suffix if occupied). Its contents are retained and the location is
+reported, so it does not block the next `init`. Archive failures report the
+backup location and require inspecting and moving it before reinitialization.
+`recover --all` processes registered workspaces only; address an unregistered,
+interrupted initialization by its original workspace path.
+
+```bash
+ws-ckpt recover -w /path/to/workspace --force
+```
+
+`unregister` accepts a registered path or workspace ID and refuses to run while
+the live subvolume exists. It restores no data and deletes neither snapshots nor
+`.pre-init-bak`. The old index moves to
+`<state-dir>/indexes/<ws_id>.unregistered` so a later initialization cannot inherit
+its metadata; an occupied archive location is never overwritten. The command
+lists existing retained locations for later manual recovery or cleanup.
+If the daemon stops after archiving the index but before persisting the
+unregistration, startup restores that index and its policy before loading the
+still-registered workspace. It removes only
+the managed symlink pointing to the missing subvolume, preserving other files or
+directories at the original path. A later initialization allocates a fresh ID
+when snapshots or an archived index still occupy the old ID.
+
+```bash
+ws-ckpt unregister -w /path/to/workspace --force
+mkdir -p /path/to/workspace
+ws-ckpt init -w /path/to/workspace
+```
+
+Both commands ask for confirmation by default. `--force` only skips that prompt;
+it does not permit overwriting conflicting data or unregistering a workspace
+whose live subvolume still exists.
 
 ### diff Output Markers
 

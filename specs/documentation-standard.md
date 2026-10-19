@@ -139,6 +139,11 @@ Design documents live **only** in the component's own directory:
 src/<component>/docs/design/    ← component-specific design docs
 ```
 
+For distribution tooling or retained deprecated components, substitute the source
+root registered in `.github/components.json`, such as
+`distribution/anolisa/docs/design/`. Component-local documentation stays with its
+component when that directory moves.
+
 Design docs are **never** placed at:
 - Repository root
 - `docs/` top level
@@ -235,7 +240,7 @@ AgentSight captures kernel-level events without modifying agent code...
 
 **Content boundaries:**
 
-- Only document components whose source code exists in `src/`. No code = no docs.
+- Only document components whose source code exists at their registered repository path (`src/`, `distribution/`, or `deprecated/`). No code = no docs.
 - Cloud-specific configuration (SLS endpoints, AK/SK auth, security groups) belongs to cloud vendor docs
 - Never document planned-but-unimplemented features as available
 
@@ -271,6 +276,21 @@ When a PR introduces any of the following changes, documentation MUST be updated
 
 **CHANGELOG update timing**: Daily feature/fix PRs update README and user-guide only; CHANGELOG is written exclusively in **release version bump PRs** that aggregate all user-perceivable changes since the last release.
 
+**Release-note requirement (all release components)**: Every component with a
+non-null `release_tag_prefix` in `.github/components.json` MUST include exactly
+one non-empty section for the release version in its English `CHANGELOG.md` in
+the next and every subsequent version bump PR. Match the version in the release tag, aggregate the
+user-visible changes, and include any breaking changes and migration steps.
+Keep `CHANGELOG_zh.md` semantically equivalent. The English version section at
+the tagged commit is the source of the GitHub Release body.
+
+This requirement also applies to first releases, including ktuner. Before
+pushing the first version tag, the version bump PR MUST finalize the applicable
+`Unreleased` content into the matching version section. `Unreleased` alone does
+not satisfy the requirement. A missing CHANGELOG, missing or duplicate matching
+section, or empty section stops publication before the GitHub Release is
+created; the workflow does not fall back to commit subjects or another version.
+
 ---
 
-*Last updated: 2026-07-29*
+*Last updated: 2026-10-15*

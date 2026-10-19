@@ -131,7 +131,7 @@ class TokenlessSdkTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(TokenlessError, "not authorized"):
             await sdk.retrieve(RetrieveRequest(marker.group(1), frozenset(), self.attribution))
 
-    async def test_html_extraction_is_opt_in_and_recovers_the_page(self) -> None:
+    async def test_html_extraction_is_on_by_default_and_recovers_the_page(self) -> None:
         original = (
             "<!DOCTYPE html><html><head><title>Guide</title></head><body>"
             "<nav><a href='/'>Home</a></nav><main><h1>Guide</h1>"
@@ -140,15 +140,19 @@ class TokenlessSdkTests(unittest.IsolatedAsyncioTestCase):
             "</body></html>"
         )
         default_sdk = self.sdk(rtk_enabled=False)
-        enabled_sdk = self.sdk(rtk_enabled=False, html_extraction_enabled=True)
-        for sdk, origin, applied in (
-            (default_sdk, ContentOrigin.COMMAND_OUTPUT, False),
-            (enabled_sdk, ContentOrigin.COMMAND_OUTPUT, True),
-            (enabled_sdk, ContentOrigin.API_RESPONSE, True),
-            (enabled_sdk, ContentOrigin.FILE_CONTENT, False),
-            (enabled_sdk, ContentOrigin.FILE_READ, False),
+        disabled_sdk = self.sdk(rtk_enabled=False, html_extraction_enabled=False)
+        for sdk, origin, command, applied in (
+            (disabled_sdk, ContentOrigin.COMMAND_OUTPUT, None, False),
+            (default_sdk, ContentOrigin.COMMAND_OUTPUT, None, True),
+            (default_sdk, ContentOrigin.COMMAND_OUTPUT, "cat page.html", False),
+            (default_sdk, ContentOrigin.COMMAND_OUTPUT, "cat page.html | head -c 9000", True),
+            (default_sdk, ContentOrigin.API_RESPONSE, "cat page.html", True),
+            (default_sdk, ContentOrigin.FILE_CONTENT, None, False),
+            (default_sdk, ContentOrigin.FILE_READ, None, False),
         ):
-            with self.subTest(enabled=sdk.config.html_extraction_enabled, origin=origin):
+            with self.subTest(
+                enabled=sdk.config.html_extraction_enabled, origin=origin, command=command
+            ):
                 attribution = Attribution("sdk-agent", "sdk-session", "html-1")
                 result = await sdk.post_tool(
                     PostToolRequest(
@@ -162,6 +166,7 @@ class TokenlessSdkTests(unittest.IsolatedAsyncioTestCase):
                             True, RecoveryMethod.tool("tokenless_retrieve"), True
                         ),
                         attribution=attribution,
+                        command=command,
                     )
                 )
                 self.assertEqual(result.content_type, ContentType.HTML)
@@ -421,7 +426,7 @@ class TokenlessSdkTests(unittest.IsolatedAsyncioTestCase):
         )
         default_sdk = self.sdk(rtk_enabled=False)
         self.assertFalse(default_sdk.config.diff_compression_enabled)
-        self.assertFalse(default_sdk.config.html_extraction_enabled)
+        self.assertTrue(default_sdk.config.html_extraction_enabled)
         enabled_sdk = self.sdk(rtk_enabled=False, diff_compression_enabled=True)
         for sdk, optimization, applied in (
             (default_sdk, OutputOptimization.NONE, False),

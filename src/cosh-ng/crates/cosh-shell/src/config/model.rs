@@ -11,6 +11,14 @@ pub struct CoshConfig {
     /// prompt. Off by default so the child shell keeps its native prompt
     /// appearance; `COSH_SHELL_STATUS_SYMBOLS` overrides per session.
     pub status_symbols: bool,
+    /// #R2: `shell.login_identity` — when enabled, a login + Enhanced +
+    /// non-isolated interactive session launches Bash with a real login
+    /// identity (`argv0="-bash" --posix` + `$ENV` inject) instead of the
+    /// interactive-but-non-login `--rcfile <marker>`. Default is `true`: the
+    /// ECS/real-sshd flip-on gate passed (H group incl. H1 PAM-chage and H3
+    /// x86_64 dual-arch, both == oracle). Set `shell.login_identity = false`
+    /// to fall back to the non-login `--rcfile` behaviour.
+    pub login_identity: bool,
     pub analysis_mode: String,
     pub approval_mode: CoshApprovalMode,
     pub adapter_default: String,
@@ -27,7 +35,20 @@ pub struct CoshConfig {
     pub recommendations: RecommendationsConfig,
     pub trusted_commands: Vec<String>,
     pub trusted_project_roots: Vec<PathBuf>,
+    /// Project hook roots the user consented to, bound to the approved content.
+    pub consented_project_hooks: Vec<ConsentedProjectHook>,
     pub(super) readonly: RuntimeReadonlyConfig,
+}
+
+/// One user-consented project hook root.
+///
+/// `digest` is the content fingerprint approved at consent time. `None` marks a
+/// legacy store entry written before content binding existed; a legacy entry is
+/// never treated as consent for the current content.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConsentedProjectHook {
+    pub root: PathBuf,
+    pub digest: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +117,7 @@ impl Default for CoshConfig {
             shell_default: "auto".into(),
             shell_integration: "enhanced".into(),
             status_symbols: false,
+            login_identity: true,
             analysis_mode: "smart".into(),
             approval_mode: CoshApprovalMode::Auto,
             adapter_default: "cosh-core".into(),
@@ -103,13 +125,14 @@ impl Default for CoshConfig {
             startup_banner: true,
             startup_hooks: false,
             debug: false,
-            log_level: "warn".into(),
+            log_level: "info".into(),
             ai_enabled: true,
             input_wait_timeout_secs: 120,
             health: HealthConfig::default(),
             recommendations: RecommendationsConfig::default(),
             trusted_commands: Vec::new(),
             trusted_project_roots: Vec::new(),
+            consented_project_hooks: Vec::new(),
             readonly: RuntimeReadonlyConfig::default(),
         }
     }
