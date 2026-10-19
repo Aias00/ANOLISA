@@ -20,6 +20,7 @@ thiserror.workspace = true
 semver.workspace = true
 chrono.workspace = true
 sha2.workspace = true
+percent-encoding.workspace = true
 ureq.workspace = true
 flate2.workspace = true
 tar.workspace = true

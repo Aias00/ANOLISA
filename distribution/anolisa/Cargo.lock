@@ -79,6 +79,7 @@ dependencies = [
  "fs2",
  "json5",
  "nix",
+ "percent-encoding",
  "plist",
  "semver",
  "serde",

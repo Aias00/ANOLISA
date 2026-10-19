@@ -327,7 +327,40 @@ fn parse_file_url(url: &str) -> Result<PathBuf, DownloadError> {
             reason: "file:// URL must have an empty host and absolute path".to_string(),
         });
     }
-    Ok(PathBuf::from(rest))
+    let bytes = rest.as_bytes();
+    for (index, byte) in bytes.iter().enumerate() {
+        if *byte == b'%'
+            && (index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit())
+        {
+            return Err(DownloadError::MalformedUrl {
+                url: url.to_string(),
+                reason: "invalid percent escape in file path".to_string(),
+            });
+        }
+    }
+    let decoded = percent_encoding::percent_decode_str(rest).collect::<Vec<_>>();
+    if decoded.contains(&0) {
+        return Err(DownloadError::MalformedUrl {
+            url: url.to_string(),
+            reason: "file path contains a NUL byte".to_string(),
+        });
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Ok(PathBuf::from(std::ffi::OsString::from_vec(decoded)))
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8(decoded)
+            .map(PathBuf::from)
+            .map_err(|error| DownloadError::MalformedUrl {
+                url: url.to_string(),
+                reason: format!("file path is not UTF-8: {error}"),
+            })
+    }
 }
 
 fn tmp_sibling(cached_path: &Path) -> PathBuf {
@@ -558,6 +591,43 @@ mod tests {
             stream.write_all(body).expect("write body");
         });
         format!("http://{addr}/agentsight")
+    }
+
+    #[test]
+    fn file_url_decodes_encoded_paths_once() {
+        let source_dir = tempdir().unwrap();
+        let cache_dir = tempdir().unwrap();
+        let cache = DownloadCache::new(cache_dir.path().into());
+        for (name, encoded) in [
+            ("artifact with space.bin", "artifact%20with%20space.bin"),
+            ("中文.bin", "%E4%B8%AD%E6%96%87.bin"),
+            ("literal%20.bin", "literal%2520.bin"),
+            ("hash#query?.bin", "hash%23query%3F.bin"),
+        ] {
+            let bytes = name.as_bytes();
+            write_source(source_dir.path(), name, bytes);
+            let url = format!("file://{}/{encoded}", source_dir.path().display());
+            let artifact = cache.fetch(&url, Some(&sha256_of(bytes))).unwrap();
+            assert_eq!(fs::read(artifact.cached_path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn file_url_rejects_invalid_escapes_and_nul() {
+        for path in ["/tmp/bad%", "/tmp/bad%2", "/tmp/bad%GG", "/tmp/bad%00"] {
+            assert!(matches!(
+                parse_file_url(&format!("file://{path}")),
+                Err(DownloadError::MalformedUrl { .. })
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_url_preserves_non_utf8_filename_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+        let decoded = parse_file_url("file:///tmp/raw-%FF.bin").unwrap();
+        assert_eq!(decoded.as_os_str().as_bytes(), b"/tmp/raw-\xff.bin");
     }
 
     #[test]
