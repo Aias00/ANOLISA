@@ -704,7 +704,7 @@ pub(crate) fn load_component_index_from_base(
         });
     }
     let temporary_cache;
-    let downloaded = match cache.fetch(&url, None) {
+    let downloaded = match cache.fetch_snapshot(&url, None) {
         Err(DownloadError::Io { path, source })
             if source.kind() == std::io::ErrorKind::PermissionDenied
                 && path.starts_with(&layout.cache_dir) =>
@@ -714,7 +714,7 @@ pub(crate) fn load_component_index_from_base(
             temporary_cache = tempfile::tempdir().map_err(|err| ComponentIndexError::Fetch {
                 reason: format!("cannot create temporary component index cache: {err}"),
             })?;
-            DownloadCache::new(temporary_cache.path().to_path_buf()).fetch(&url, None)
+            DownloadCache::new(temporary_cache.path().to_path_buf()).fetch_snapshot(&url, None)
         }
         result => result,
     }

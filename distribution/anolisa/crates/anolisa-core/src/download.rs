@@ -145,6 +145,34 @@ impl DownloadCache {
         url: &str,
         expected_sha256: Option<&str>,
     ) -> Result<DownloadedArtifact, DownloadError> {
+        self.fetch_inner(url, expected_sha256, false)
+    }
+
+    /// Fetch into a URL-and-content-keyed snapshot that later fetches cannot replace.
+    ///
+    /// The URL-entry lock covers download, verification, and publication. Identical
+    /// content reuses the same snapshot path; changed content gets a distinct path.
+    /// Snapshots remain until the cache is externally cleaned, so callers must budget
+    /// disk space for retained versions. This does not protect against external edits.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same transport, filesystem, and checksum errors as [`Self::fetch`].
+    /// A rejected download never publishes or removes a previously returned snapshot.
+    pub fn fetch_snapshot(
+        &self,
+        url: &str,
+        expected_sha256: Option<&str>,
+    ) -> Result<DownloadedArtifact, DownloadError> {
+        self.fetch_inner(url, expected_sha256, true)
+    }
+
+    fn fetch_inner(
+        &self,
+        url: &str,
+        expected_sha256: Option<&str>,
+        snapshot: bool,
+    ) -> Result<DownloadedArtifact, DownloadError> {
         let scheme = scheme_of(url)?;
         let cached_path = self.cached_path_for(url);
 
@@ -191,6 +219,39 @@ impl DownloadCache {
                 return Err(err);
             }
         };
+
+        if snapshot {
+            if let Some(expected) = expected_sha256 {
+                let expected = expected.to_ascii_lowercase();
+                if expected != sha256 {
+                    let _ = fs::remove_file(&tmp_path);
+                    return Err(DownloadError::ChecksumMismatch {
+                        url: url.to_string(),
+                        expected,
+                        actual: sha256,
+                    });
+                }
+            }
+            // Legacy entries start with a URL hash; this non-hex prefix keeps the
+            // namespaces disjoint even when an artifact basename resembles a hash.
+            let mut name = std::ffi::OsString::from(format!("snapshot-{sha256}-"));
+            name.push(cached_path.file_name().ok_or_else(|| DownloadError::Io {
+                path: cached_path.clone(),
+                source: io::Error::other("cache path has no file name"),
+            })?);
+            let snapshot_path = cached_path.with_file_name(name);
+            fs::rename(&tmp_path, &snapshot_path).map_err(|source| {
+                let _ = fs::remove_file(&tmp_path);
+                DownloadError::Io {
+                    path: snapshot_path.clone(),
+                    source,
+                }
+            })?;
+            return Ok(DownloadedArtifact {
+                cached_path: snapshot_path,
+                sha256,
+            });
+        }
 
         fs::rename(&tmp_path, &cached_path).map_err(|source| {
             let _ = fs::remove_file(&tmp_path);
@@ -558,6 +619,103 @@ mod tests {
             stream.write_all(body).expect("write body");
         });
         format!("http://{addr}/agentsight")
+    }
+
+    #[test]
+    fn snapshot_keeps_both_versions_and_survives_legacy_fetch() {
+        let sources = tempdir().unwrap();
+        let cache_dir = tempdir().unwrap();
+        let source = write_source(sources.path(), "payload.bin", b"first");
+        let cache = DownloadCache::new(cache_dir.path().into());
+        let url = file_url(&source);
+        let first = cache
+            .fetch_snapshot(&url, Some(&sha256_of(b"first")))
+            .unwrap();
+        fs::write(&source, b"second").unwrap();
+        let second = cache
+            .fetch_snapshot(&url, Some(&sha256_of(b"second")))
+            .unwrap();
+        assert_ne!(first.cached_path, second.cached_path);
+        assert_eq!(fs::read(&first.cached_path).unwrap(), b"first");
+        assert_eq!(fs::read(&second.cached_path).unwrap(), b"second");
+        fs::write(&source, b"third").unwrap();
+        let legacy = cache.fetch(&url, None).unwrap();
+        assert_eq!(fs::read(legacy.cached_path).unwrap(), b"third");
+        assert_eq!(fs::read(first.cached_path).unwrap(), b"first");
+        assert_eq!(fs::read(second.cached_path).unwrap(), b"second");
+    }
+
+    #[test]
+    fn snapshot_rejected_fetch_preserves_previous_verified_bytes() {
+        let sources = tempdir().unwrap();
+        let cache_dir = tempdir().unwrap();
+        let source = write_source(sources.path(), "payload.bin", b"first");
+        let cache = DownloadCache::new(cache_dir.path().into());
+        let url = file_url(&source);
+        let first = cache
+            .fetch_snapshot(&url, Some(&sha256_of(b"first")))
+            .unwrap();
+        fs::write(&source, b"rejected").unwrap();
+        assert!(matches!(
+            cache.fetch_snapshot(&url, Some(&first.sha256)),
+            Err(DownloadError::ChecksumMismatch { .. })
+        ));
+        assert_eq!(fs::read(first.cached_path).unwrap(), b"first");
+    }
+
+    #[test]
+    fn snapshot_cannot_alias_a_different_urls_mutable_cache_path() {
+        for reject_legacy in [false, true] {
+            let sources = tempdir().unwrap();
+            let cache_dir = tempdir().unwrap();
+            let source_a = sources.path().join("a.bin");
+            let url_a = file_url(&source_a);
+            let source_b = sources
+                .path()
+                .join(format!("{}-a.bin", hash_hex_of(&url_a)));
+            let url_b = file_url(&source_b);
+            fs::write(&source_a, url_b.as_bytes()).unwrap();
+            fs::write(&source_b, b"mutable payload").unwrap();
+            let cache = DownloadCache::new(cache_dir.path().into());
+            let snapshot = cache
+                .fetch_snapshot(&url_a, Some(&sha256_of(url_b.as_bytes())))
+                .unwrap();
+            if reject_legacy {
+                assert!(matches!(
+                    cache.fetch(&url_b, Some(&"0".repeat(64))),
+                    Err(DownloadError::ChecksumMismatch { .. })
+                ));
+            } else {
+                let legacy = cache.fetch(&url_b, None).unwrap();
+                assert_eq!(fs::read(legacy.cached_path).unwrap(), b"mutable payload");
+            }
+            assert_eq!(fs::read(snapshot.cached_path).unwrap(), url_b.as_bytes());
+        }
+    }
+
+    #[test]
+    fn snapshot_concurrent_identical_fetches_reuse_verified_path() {
+        let sources = tempdir().unwrap();
+        let cache_dir = tempdir().unwrap();
+        let source = write_source(sources.path(), "payload.bin", b"shared");
+        let cache = Arc::new(DownloadCache::new(cache_dir.path().into()));
+        let url = Arc::new(file_url(&source));
+        let handles = (0..8)
+            .map(|_| {
+                let cache = cache.clone();
+                let url = url.clone();
+                thread::spawn(move || cache.fetch_snapshot(&url, None).unwrap())
+            })
+            .collect::<Vec<_>>();
+        let artifacts = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>();
+        for artifact in &artifacts {
+            assert_eq!(artifact.cached_path, artifacts[0].cached_path);
+            assert_eq!(artifact.sha256, sha256_of(b"shared"));
+            assert_eq!(fs::read(&artifact.cached_path).unwrap(), b"shared");
+        }
     }
 
     #[test]

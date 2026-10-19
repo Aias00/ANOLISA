@@ -95,14 +95,14 @@ fn fetch_raw_index(
     repository_origin: Option<&RawRepositoryOrigin>,
 ) -> Result<(String, std::path::PathBuf), CliError> {
     let v2_url = raw_index_v2_url(base_url);
-    match cache.fetch(&v2_url, None) {
+    match cache.fetch_snapshot(&v2_url, None) {
         Ok(downloaded) => Ok((v2_url, downloaded.cached_path)),
         // Absence only: a transport fault here must not downgrade a gen-2
         // repository to its gen-1 view.
         Err(err) if remote_file_absent(&err) => {
             let v1_url = raw_index_url(base_url);
             let downloaded = cache
-                .fetch(&v1_url, None)
+                .fetch_snapshot(&v1_url, None)
                 .map_err(|err| index_fetch_error(&v1_url, err, repository_origin))?;
             Ok((v1_url, downloaded.cached_path))
         }
@@ -415,7 +415,7 @@ pub(crate) fn load_dry_run_install_contract(
         &resolution.entry.component,
         &resolution.entry.version,
     ) {
-        let downloaded = match cache.fetch(&meta_url, expected_sha) {
+        let downloaded = match cache.fetch_snapshot(&meta_url, expected_sha) {
             Ok(downloaded) => downloaded,
             // Absence only. A network, digest, or parse failure on metadata
             // the repository *does* publish must fail the dry-run: falling
@@ -540,7 +540,7 @@ pub(crate) fn prepare_raw_execution(
 
     let cache = DownloadCache::new(layout.cache_dir.clone());
     let artifact = cache
-        .fetch(&resolution.artifact_url, Some(sha256))
+        .fetch_snapshot(&resolution.artifact_url, Some(sha256))
         .map_err(|err| CliError::Runtime {
             command: COMMAND.to_string(),
             reason: format!(
