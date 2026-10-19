@@ -202,15 +202,14 @@ fn check_binary(
     if let Some(reason) = reject_unowned_executable(env.layout, exe) {
         return CheckOutcome::leaf(label, CheckStatus::Unsupported, Some(reason));
     }
-    let capture = expect_pattern.is_some();
     let timeout = timeout_secs
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_PROBE_TIMEOUT);
-    match spawn_and_wait(exe, args, capture, timeout) {
+    match spawn_and_wait(exe, args, expect_pattern, timeout) {
         SpawnResult::Exited {
             success,
             code,
-            stdout,
+            pattern_found,
         } => {
             if !success {
                 return CheckOutcome::leaf(
@@ -223,7 +222,7 @@ fn check_binary(
                 );
             }
             if let Some(pattern) = expect_pattern
-                && !stdout.contains(pattern)
+                && !pattern_found
             {
                 return CheckOutcome::leaf(
                     label,
@@ -397,7 +396,7 @@ fn check_command(
         return CheckOutcome::leaf(label, CheckStatus::Unsupported, Some(reason));
     }
     let args: Vec<&str> = expanded[1..].iter().map(String::as_str).collect();
-    match spawn_and_wait(exe, &args, false, DEFAULT_PROBE_TIMEOUT) {
+    match spawn_and_wait(exe, &args, None, DEFAULT_PROBE_TIMEOUT) {
         SpawnResult::Exited { code, .. } => {
             let want = expect_exit_code.unwrap_or(0);
             if code == want {
@@ -432,7 +431,7 @@ enum SpawnResult {
     Exited {
         success: bool,
         code: i32,
-        stdout: String,
+        pattern_found: bool,
     },
     /// Child exceeded the timeout and was killed.
     Timeout,
@@ -440,17 +439,18 @@ enum SpawnResult {
     SpawnError(std::io::Error),
 }
 
-/// Spawn `exe args`, poll until exit or timeout, and (when `capture`) return
-/// stdout. stdin/stderr are always null; stdout is null unless captured.
-fn spawn_and_wait(exe: &Path, args: &[&str], capture: bool, timeout: Duration) -> SpawnResult {
-    let stdout_cfg = if capture {
+/// Spawn a probe and match stdout without retaining its complete output or waiting for EOF.
+fn spawn_and_wait(
+    exe: &Path,
+    args: &[&str],
+    pattern: Option<&str>,
+    timeout: Duration,
+) -> SpawnResult {
+    let stdout_cfg = if pattern.is_some() {
         Stdio::piped()
     } else {
         Stdio::null()
     };
-    // spawn_retry_etxtbsy: health probes exec binaries ANOLISA installed;
-    // a concurrent fork elsewhere can hold the write descriptor for a
-    // moment and fail exec with ETXTBSY.
     let mut child = match crate::process::spawn_retry_etxtbsy(
         Command::new(exe)
             .args(args)
@@ -458,38 +458,95 @@ fn spawn_and_wait(exe: &Path, args: &[&str], capture: bool, timeout: Duration) -
             .stdout(stdout_cfg)
             .stderr(Stdio::null()),
     ) {
-        Ok(c) => c,
-        Err(err) => return SpawnResult::SpawnError(err),
+        Ok(child) => child,
+        Err(error) => return SpawnResult::SpawnError(error),
     };
     let started = Instant::now();
+    let mut pipe = child.stdout.take();
+    if let Some(error) = pipe
+        .as_ref()
+        .and_then(|pipe| crate::hooks::set_nonblocking(pipe).err())
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return SpawnResult::SpawnError(error);
+    }
+    let mut matcher = OutputMatcher::new(pattern.unwrap_or(""));
     loop {
+        crate::hooks::drain_pipe(&mut pipe, |chunk| matcher.push(chunk));
         match child.try_wait() {
             Ok(Some(status)) => {
-                let stdout = if capture {
-                    use std::io::Read;
-                    let mut buf = String::new();
-                    if let Some(mut out) = child.stdout.take() {
-                        let _ = out.read_to_string(&mut buf);
-                    }
-                    buf
-                } else {
-                    String::new()
-                };
+                // An inherited writer must not extend the deadline or force an EOF wait.
+                crate::hooks::drain_pipe(&mut pipe, |chunk| matcher.push(chunk));
                 return SpawnResult::Exited {
                     success: status.success(),
                     code: status.code().unwrap_or(-1),
-                    stdout,
+                    pattern_found: matcher.found,
                 };
             }
-            Ok(None) => {
-                if started.elapsed() > timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return SpawnResult::Timeout;
-                }
-                std::thread::sleep(PROBE_POLL);
+            Ok(None) if started.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return SpawnResult::Timeout;
             }
-            Err(err) => return SpawnResult::SpawnError(err),
+            Ok(None) => {
+                std::thread::sleep(PROBE_POLL.min(timeout.saturating_sub(started.elapsed())))
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return SpawnResult::SpawnError(error);
+            }
+        }
+    }
+}
+
+struct OutputMatcher<'a> {
+    pattern: &'a [u8],
+    failure: Vec<usize>,
+    matched: usize,
+    found: bool,
+}
+
+impl<'a> OutputMatcher<'a> {
+    fn new(pattern: &'a str) -> Self {
+        let pattern = pattern.as_bytes();
+        let mut failure = vec![0; pattern.len()];
+        let mut matched = 0;
+        for index in 1..pattern.len() {
+            while matched > 0 && pattern[index] != pattern[matched] {
+                matched = failure[matched - 1];
+            }
+            if pattern[index] == pattern[matched] {
+                matched += 1;
+            }
+            failure[index] = matched;
+        }
+        Self {
+            pattern,
+            failure,
+            matched: 0,
+            found: pattern.is_empty(),
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        if self.found {
+            return;
+        }
+        // KMP reuses matched prefixes across chunks instead of comparing each
+        // output window again, keeping a drain linear in the bytes consumed.
+        for &byte in chunk {
+            while self.matched > 0 && byte != self.pattern[self.matched] {
+                self.matched = self.failure[self.matched - 1];
+            }
+            if byte == self.pattern[self.matched] {
+                self.matched += 1;
+                if self.matched == self.pattern.len() {
+                    self.found = true;
+                    return;
+                }
+            }
         }
     }
 }
@@ -596,6 +653,115 @@ mod tests {
         perms.set_mode(0o755);
         fs::set_permissions(&path, perms).expect("chmod");
         path
+    }
+
+    #[test]
+    fn matcher_preserves_overlapping_prefixes_across_chunks() {
+        let mut matcher = OutputMatcher::new("ababac");
+        matcher.push(b"abababab");
+        assert!(!matcher.found);
+        matcher.push(b"ac");
+        assert!(matcher.found);
+        let mut empty = OutputMatcher::new("");
+        empty.push(b"anything");
+        assert!(empty.found);
+    }
+
+    #[test]
+    fn repeated_prefix_mismatch_stays_within_probe_deadline() {
+        let home = tempdir().unwrap();
+        let layout = layout_for(home.path());
+        let exe = write_exec(
+            &layout.bin_dir,
+            "long-output",
+            "#!/bin/sh\nhead -c 2097152 /dev/zero | tr '\\000' a\n",
+        );
+        let pattern = format!("{}b", "a".repeat(1_048_576));
+        let started = Instant::now();
+        let outcome = run_check(
+            &CheckSpec::BinaryVersion {
+                binary: exe.display().to_string(),
+                expect_pattern: Some(pattern),
+                timeout_secs: Some(1),
+            },
+            &CheckEnv {
+                layout: &layout,
+                dry_run: false,
+                service_probes: None,
+            },
+        );
+        assert_eq!(outcome.status, CheckStatus::Failed);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "matching exceeded probe deadline: {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn health_probe_matcher_handles_chunk_boundaries_with_bounded_memory() {
+        let mut matcher = OutputMatcher::new("expected");
+        for _ in 0..100 {
+            matcher.push(&[b'x'; 8192]);
+            assert!(matcher.matched < "expected".len());
+            assert_eq!(matcher.failure.len(), "expected".len());
+        }
+        matcher.push(b"expe");
+        matcher.push(b"cted");
+        assert!(matcher.found);
+    }
+
+    #[test]
+    fn health_probe_continuous_output_stays_deadline_bounded() {
+        let started = Instant::now();
+        let out = spawn_and_wait(
+            Path::new("/bin/sh"),
+            &["-c", "exec yes x"],
+            Some("missing"),
+            Duration::from_millis(100),
+        );
+        assert!(matches!(out, SpawnResult::Timeout));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn health_probe_drains_large_stdout_and_matches_a_late_pattern() {
+        let home = tempdir().expect("tempdir");
+        let layout = layout_for(home.path());
+        let exe = write_exec(
+            &layout.bin_dir,
+            "chatty",
+            "#!/bin/sh\nhead -c 1048576 /dev/zero\nprintf 'tool 1.2.3'\n",
+        );
+        let out = run_check(
+            &CheckSpec::BinaryVersion {
+                binary: exe.display().to_string(),
+                expect_pattern: Some("tool 1.2.3".into()),
+                timeout_secs: Some(1),
+            },
+            &CheckEnv {
+                layout: &layout,
+                dry_run: false,
+                service_probes: None,
+            },
+        );
+        assert_eq!(out.status, CheckStatus::Ok, "detail={:?}", out.detail);
+    }
+
+    #[test]
+    fn health_probe_does_not_wait_for_an_inherited_stdout_to_close() {
+        let started = Instant::now();
+        let out = spawn_and_wait(
+            Path::new("/bin/sh"),
+            &["-c", "(sleep 2) & printf expected"],
+            Some("expected"),
+            Duration::from_millis(100),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "inherited pipe defeated the probe deadline"
+        );
+        assert!(matches!(out, SpawnResult::Exited { success: true, .. }));
     }
 
     #[test]

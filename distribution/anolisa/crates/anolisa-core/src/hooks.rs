@@ -442,7 +442,7 @@ const DRAIN_BUDGET_PER_POLL: usize = 1 << 20;
 
 /// Switch a pipe read end to non-blocking mode so the poll loop can drain
 /// it in place instead of parking a helper thread on it.
-fn set_nonblocking(pipe: &impl std::os::fd::AsRawFd) -> std::io::Result<()> {
+pub(crate) fn set_nonblocking(pipe: &impl std::os::fd::AsRawFd) -> std::io::Result<()> {
     nix::fcntl::fcntl(
         pipe.as_raw_fd(),
         nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
@@ -455,7 +455,7 @@ fn set_nonblocking(pipe: &impl std::os::fd::AsRawFd) -> std::io::Result<()> {
 /// EOF, on `WouldBlock`, or once the per-iteration budget is exhausted.
 /// The pipe must already be non-blocking; callers own that setup so this
 /// helper can never park the caller's poll loop on a stalled writer.
-fn drain_pipe(pipe: &mut Option<impl Read>, mut consume: impl FnMut(&[u8])) {
+pub(crate) fn drain_pipe(pipe: &mut Option<impl Read>, mut consume: impl FnMut(&[u8])) {
     let Some(pipe) = pipe.as_mut() else {
         return;
     };
