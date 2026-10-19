@@ -286,8 +286,9 @@ describe("withLock ownership", () => {
 
       const pending = CrontabManager.sync("/ws", []);
       await vi.advanceTimersByTimeAsync(5100);
-      // Fail-open is the documented behavior: the sync still runs.
-      expect(await pending).toBe(true);
+      // A contender must never read or rewrite the crontab without ownership.
+      expect(await pending).toBe(false);
+      expect(mockRunCrontab).not.toHaveBeenCalled();
       // But the caller never owned the lock, so it must not remove it —
       // doing so would admit a third writer while the holder still runs.
       expect(mockRmdirSync).not.toHaveBeenCalled();
@@ -308,10 +309,40 @@ describe("withLock ownership", () => {
 
       const pending = CrontabManager.sync("/ws", []);
       await vi.advanceTimersByTimeAsync(5100);
-      expect(await pending).toBe(true);
+      expect(await pending).toBe(false);
+      expect(mockRunCrontab).not.toHaveBeenCalled();
+      expect(mockMkdirSync).toHaveBeenCalledTimes(1);
       expect(mockRmdirSync).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("withLock recovery", () => {
+  it("waits for the owner to release before touching the crontab", async () => {
+    vi.useFakeTimers();
+    try {
+      mockMkdirSync.mockImplementationOnce(() => {
+        throw Object.assign(new Error("busy"), { code: "EEXIST" });
+      });
+      mockRunCrontab.mockResolvedValue({ exitCode: 0, stdout: "", stderr: "" });
+      const pending = CrontabManager.sync("/ws", []);
+      expect(mockRunCrontab).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(50);
+      expect(await pending).toBe(true);
+      expect(mockRunCrontab).toHaveBeenCalledTimes(2);
+      expect(mockRmdirSync).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("releases its own lock when the operation throws", async () => {
+    mockRunCrontab.mockRejectedValueOnce(new Error("spawn failed"));
+    await expect(CrontabManager.sync("/ws", [])).rejects.toThrow(
+      "spawn failed",
+    );
+    expect(mockRmdirSync).toHaveBeenCalledTimes(1);
   });
 });

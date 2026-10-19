@@ -4,7 +4,7 @@ use std::path::{Component, Path};
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
-use ws_ckpt_common::backend::DiffError;
+use ws_ckpt_common::backend::{CreateAdmissionRefused, DiffError};
 use ws_ckpt_common::{
     validate_checkpoint_id_v2, validate_workspace_id_v2, ErrorCode, GuardedCheckpointEvidenceV2,
     GuardedCheckpointOutcomeV2, GuardedCheckpointRejectionCodeV2, GuardedRollbackEvidenceV2,
@@ -218,6 +218,13 @@ pub(crate) async fn checkpoint(
     };
 
     if let Err(error) = state.backend.create_snapshot(ws_id, checkpoint_id).await {
+        // Admission refuses before any snapshot exists: retry is safe (#7234).
+        if error.downcast_ref::<CreateAdmissionRefused>().is_some() {
+            return rejected(
+                GuardedCheckpointRejectionCodeV2::InsufficientSpace,
+                format!("{error:#}"),
+            );
+        }
         return backend_effect_error(format!(
             "guarded checkpoint backend operation failed; reconcile before retrying: {error:#}"
         ));
@@ -589,6 +596,15 @@ pub(crate) async fn rollback(
     }
 
     if let Err(error) = state.backend.rollback(ws_id, target_snapshot_id).await {
+        // Admission refuses before the workspace is moved: release the
+        // reservation so the operation stays retryable (#7234).
+        if error.downcast_ref::<CreateAdmissionRefused>().is_some() {
+            let response = rollback_rejected(
+                GuardedRollbackRejectionCodeV2::InsufficientSpace,
+                format!("{error:#}"),
+            );
+            return abort_reserved_rollback(state, &mut workspace, operation_id, response).await;
+        }
         return mark_rollback_unknown(
             state,
             &mut workspace,
@@ -939,6 +955,9 @@ fn rollback_diff_rejected(error: anyhow::Error, context: &str) -> Response {
     let code = match error.downcast_ref::<DiffError>() {
         Some(DiffError::UnsupportedWorkspacePath { .. }) => {
             GuardedRollbackRejectionCodeV2::UnsupportedWorkspacePath
+        }
+        None if error.downcast_ref::<CreateAdmissionRefused>().is_some() => {
+            GuardedRollbackRejectionCodeV2::InsufficientSpace
         }
         None => GuardedRollbackRejectionCodeV2::DaemonNotReady,
     };
