@@ -40,9 +40,10 @@ const HTTP_READ_TIMEOUT: Duration = Duration::from_secs(15);
 /// Default poll interval between upload rounds.
 const DEFAULT_SLEEP_SECS: u64 = 120;
 /// Maximum lines shipped in a single PutWebtracking request per component.
-/// SLS caps the uncompressed body at 10 MB; this keeps memory and request
-/// size bounded even when a log file grows quickly between rounds.
+/// Limits work collected from one component before checkpointing.
 const MAX_LINES_PER_ROUND: usize = 1000;
+/// Include the complete JSON envelope and enriched fields in the endpoint cap.
+const MAX_BODY_BYTES: usize = 10_000_000;
 
 // ── Endpoint ─────────────────────────────────────────────────────────
 
@@ -581,14 +582,14 @@ impl Uploader {
             // logstore is the component name (e.g. agent-sec-core.jsonl →
             // logstore agent-sec-core).
             let url = endpoint.track_url(&region, use_internal, &component);
-            let body = build_body(
+            let batch = build_batch(
                 &lines,
                 link_id.as_deref(),
                 &common,
                 &self.config.topic,
                 &self.config.source,
-            )?;
-            match post(&url, &body) {
+            );
+            match post_batch(batch, &url, &mut post) {
                 Ok(()) => {}
                 Err(UploaderError::Http { code: 404, .. }) => {
                     // Logstore does not exist (or WebTracking not enabled);
@@ -649,6 +650,27 @@ pub fn build_body(
     topic: &str,
     source: &str,
 ) -> Result<String, serde_json::Error> {
+    serde_json::to_string(&build_batch(lines, link_id, common, topic, source))
+}
+
+// Preserve PutWebtracking field names while splitting a batch without rebuilding metadata.
+#[derive(Serialize)]
+struct UploadBatch {
+    #[serde(rename = "__logs__")]
+    logs: Vec<Value>,
+    #[serde(rename = "__topic__")]
+    topic: String,
+    #[serde(rename = "__source__")]
+    source: String,
+}
+
+fn build_batch(
+    lines: &[String],
+    link_id: Option<&str>,
+    common: &BTreeMap<String, Value>,
+    topic: &str,
+    source: &str,
+) -> UploadBatch {
     let now = unix_now();
     let logs: Vec<Value> = lines
         .iter()
@@ -672,12 +694,55 @@ pub fn build_body(
         })
         .collect();
 
-    let body = serde_json::json!({
-        "__logs__": logs,
-        "__topic__": topic,
-        "__source__": source,
-    });
-    serde_json::to_string(&body)
+    UploadBatch {
+        logs,
+        topic: topic.to_string(),
+        source: source.to_string(),
+    }
+}
+
+fn post_batch(
+    mut batch: UploadBatch,
+    url: &str,
+    post: &mut impl FnMut(&str, &str) -> Result<(), UploaderError>,
+) -> Result<(), UploaderError> {
+    let body = serde_json::to_string(&batch)?;
+    if body.len() <= MAX_BODY_BYTES {
+        match post(url, &body) {
+            Err(UploaderError::Http { code: 413, .. }) => {}
+            result => return result,
+        }
+    }
+    if batch.logs.len() <= 1 {
+        eprintln!(
+            "[anolisa] telemetry: single record rejected by payload size limit at {url} ({} bytes), skipping",
+            body.len()
+        );
+        return Ok(());
+    }
+    // Keep record order and enrichment stable while isolating a size rejection.
+    // A retryable child failure leaves the source offset unchanged; already
+    // accepted children may be replayed, preserving at-least-once delivery.
+    let right_logs = batch.logs.split_off(batch.logs.len() / 2);
+    let right = UploadBatch {
+        logs: right_logs,
+        topic: batch.topic.clone(),
+        source: batch.source.clone(),
+    };
+    drop(body);
+    match post_batch(batch, url, post) {
+        Err(UploaderError::Http { code, .. })
+            if (400..500).contains(&code) && code != 408 && code != 429 =>
+        {
+            // Reject only the attempted child, then try its unsent sibling.
+            // Top-level rejections still reach the caller's component policy.
+            eprintln!(
+                "[anolisa] telemetry: child batch rejected with HTTP {code} at {url}, skipping"
+            );
+        }
+        result => result?,
+    }
+    post_batch(right, url, post)
 }
 
 /// Normalize a log object's field values to strings.
@@ -1051,6 +1116,223 @@ mod tests {
 
     fn write_lines(path: &Path, content: &str) {
         fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn size_limit_splits_enriched_batches_without_losing_records() {
+        crate::telemetry::metadata::with_cloud_init_disabled(|| {
+            let dir = TempDir::new().unwrap();
+            let up = test_uploader(&dir);
+            let path = up.jsonl_path("cosh");
+            let content: String = (0..1000)
+                .map(|id| {
+                    format!(
+                        "{}\n",
+                        serde_json::json!({"id": id, "message": "a".repeat(12000)})
+                    )
+                })
+                .collect();
+            write_lines(&path, &content);
+            let mut ids = Vec::new();
+            let mut calls = 0;
+            up.run_once_with_post(|_, body| {
+                assert!(body.len() <= 10_000_000);
+                calls += 1;
+                let body: Value = serde_json::from_str(body).unwrap();
+                for log in body["__logs__"].as_array().unwrap() {
+                    assert!(log["telemetry_id"].is_string());
+                    ids.push(log["id"].as_str().unwrap().parse::<usize>().unwrap());
+                }
+                Ok(())
+            })
+            .unwrap();
+            assert!(calls > 1);
+            assert_eq!(ids, (0..1000).collect::<Vec<_>>());
+            assert_eq!(up.load_offsets()["cosh"].offset, content.len() as u64);
+        });
+    }
+
+    #[test]
+    fn size_limit_retries_413_with_smaller_batches() {
+        crate::telemetry::metadata::with_cloud_init_disabled(|| {
+            let dir = TempDir::new().unwrap();
+            let up = test_uploader(&dir);
+            let content = "{\"id\":1}\n{\"id\":2}\n{\"id\":3}\n{\"id\":4}\n";
+            write_lines(&up.jsonl_path("cosh"), content);
+            let mut ids = Vec::new();
+            let mut rejections = 0;
+            up.run_once_with_post(|url, body| {
+                let body: Value = serde_json::from_str(body).unwrap();
+                let logs = body["__logs__"].as_array().unwrap();
+                if logs.len() > 1 {
+                    rejections += 1;
+                    return Err(UploaderError::Http {
+                        code: 413,
+                        url: url.to_string(),
+                    });
+                }
+                ids.push(logs[0]["id"].as_str().unwrap().to_string());
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(rejections, 3);
+            assert_eq!(ids, ["1", "2", "3", "4"]);
+            assert_eq!(up.load_offsets()["cosh"].offset, content.len() as u64);
+        });
+    }
+
+    #[test]
+    fn size_limit_isolates_a_rejected_record_from_its_neighbors() {
+        crate::telemetry::metadata::with_cloud_init_disabled(|| {
+            let dir = TempDir::new().unwrap();
+            let up = test_uploader(&dir);
+            write_lines(
+                &up.jsonl_path("cosh"),
+                "{\"id\":1}\n{\"id\":2}\n{\"id\":3}\n",
+            );
+            let mut ids = Vec::new();
+            up.run_once_with_post(|url, body| {
+                let body: Value = serde_json::from_str(body).unwrap();
+                let logs = body["__logs__"].as_array().unwrap();
+                if logs.iter().any(|log| log["id"] == "2") {
+                    return Err(UploaderError::Http {
+                        code: 413,
+                        url: url.to_string(),
+                    });
+                }
+                ids.extend(
+                    logs.iter()
+                        .map(|log| log["id"].as_str().unwrap().to_string()),
+                );
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(ids, ["1", "3"]);
+            assert!(up.load_offsets().contains_key("cosh"));
+        });
+    }
+
+    #[test]
+    fn size_limit_preserves_top_level_permanent_rejection() {
+        let batch = build_batch(
+            &[r#"{"id":1}"#.to_string()],
+            None,
+            &BTreeMap::new(),
+            "topic",
+            "source",
+        );
+        let mut attempts = 0;
+        let result = post_batch(batch, "https://example.invalid/track", &mut |url, _| {
+            attempts += 1;
+            Err(UploaderError::Http {
+                code: 400,
+                url: url.to_string(),
+            })
+        });
+        assert!(matches!(result, Err(UploaderError::Http { code: 400, .. })));
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn size_limit_permanent_child_rejection_preserves_unsent_siblings() {
+        crate::telemetry::metadata::with_cloud_init_disabled(|| {
+            for local_split in [false, true] {
+                let dir = TempDir::new().unwrap();
+                let up = test_uploader(&dir);
+                let message = if local_split {
+                    "a".repeat(5_100_000)
+                } else {
+                    String::new()
+                };
+                let content = format!(
+                    "{}\n{}\n",
+                    serde_json::json!({"id": 1, "message": message}),
+                    serde_json::json!({"id": 2, "message": message})
+                );
+                write_lines(&up.jsonl_path("cosh"), &content);
+                let mut attempted = Vec::new();
+                up.run_once_with_post(|url, body| {
+                    let body: Value = serde_json::from_str(body).unwrap();
+                    let ids = body["__logs__"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|log| log["id"].as_str().unwrap().to_string())
+                        .collect::<Vec<_>>();
+                    attempted.push(ids.clone());
+                    if ids.len() > 1 {
+                        return Err(UploaderError::Http {
+                            code: 413,
+                            url: url.to_string(),
+                        });
+                    }
+                    if ids[0] == "1" {
+                        return Err(UploaderError::Http {
+                            code: 400,
+                            url: url.to_string(),
+                        });
+                    }
+                    Ok(())
+                })
+                .unwrap();
+                assert_eq!(attempted.last().unwrap(), &["2"]);
+                assert_eq!(up.load_offsets()["cosh"].offset, content.len() as u64);
+            }
+        });
+    }
+
+    #[test]
+    fn size_limit_skips_only_a_locally_oversized_record() {
+        let lines = vec![
+            serde_json::json!({"id": "large", "message": "a".repeat(MAX_BODY_BYTES)}).to_string(),
+            r#"{"id":"normal"}"#.to_string(),
+        ];
+        let batch = build_batch(&lines, None, &BTreeMap::new(), "topic", "source");
+        let mut shipped = Vec::new();
+        post_batch(batch, "https://example.invalid/track", &mut |_, body| {
+            assert!(body.len() <= MAX_BODY_BYTES);
+            let body: Value = serde_json::from_str(body).unwrap();
+            shipped.extend(
+                body["__logs__"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|log| log["id"].as_str().unwrap().to_string()),
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(shipped, ["normal"]);
+    }
+
+    #[test]
+    fn size_limit_keeps_offset_on_retryable_split_failure() {
+        crate::telemetry::metadata::with_cloud_init_disabled(|| {
+            let dir = TempDir::new().unwrap();
+            let up = test_uploader(&dir);
+            write_lines(&up.jsonl_path("cosh"), "{\"id\":1}\n{\"id\":2}\n");
+            let mut accepted = 0;
+            let result = up.run_once_with_post(|url, body| {
+                let body: Value = serde_json::from_str(body).unwrap();
+                if body["__logs__"].as_array().unwrap().len() > 1 {
+                    return Err(UploaderError::Http {
+                        code: 413,
+                        url: url.to_string(),
+                    });
+                }
+                if body["__logs__"][0]["id"] == "2" {
+                    return Err(UploaderError::Http {
+                        code: 503,
+                        url: url.to_string(),
+                    });
+                }
+                accepted += 1;
+                Ok(())
+            });
+            assert!(matches!(result, Err(UploaderError::Http { code: 503, .. })));
+            assert_eq!(accepted, 1);
+            assert!(!up.load_offsets().contains_key("cosh"));
+        });
     }
 
     #[test]
