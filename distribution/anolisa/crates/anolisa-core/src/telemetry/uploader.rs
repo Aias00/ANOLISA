@@ -43,6 +43,8 @@ const DEFAULT_SLEEP_SECS: u64 = 120;
 /// SLS caps the uncompressed body at 10 MB; this keeps memory and request
 /// size bounded even when a log file grows quickly between rounds.
 const MAX_LINES_PER_ROUND: usize = 1000;
+/// Bound catch-up work so a busy component cannot monopolize an upload round.
+const MAX_BATCHES_PER_COMPONENT: usize = 8;
 
 // ── Endpoint ─────────────────────────────────────────────────────────
 
@@ -566,59 +568,69 @@ impl Uploader {
         let mut last_err: Option<UploaderError> = None;
 
         for component in self.discover_components() {
-            // Finish the current round after SIGTERM. If the signal arrives
-            // while sleeping, `run_loop` starts one final round before exit.
-            let stored = offsets.get(&component).cloned();
-            let collected = match self.collect_component(&component, stored.as_ref()) {
-                Ok(Some(v)) => v,
-                Ok(None) => continue,
-                Err(e) => {
-                    last_err = Some(UploaderError::Io(e));
-                    continue;
+            for _ in 0..MAX_BATCHES_PER_COMPONENT {
+                if !self.collection_enabled() {
+                    return last_err.map_or(Ok(()), Err);
                 }
-            };
-            let (lines, new_offset) = collected;
-            // logstore is the component name (e.g. agent-sec-core.jsonl →
-            // logstore agent-sec-core).
-            let url = endpoint.track_url(&region, use_internal, &component);
-            let body = build_body(
-                &lines,
-                link_id.as_deref(),
-                &common,
-                &self.config.topic,
-                &self.config.source,
-            )?;
-            match post(&url, &body) {
-                Ok(()) => {}
-                Err(UploaderError::Http { code: 404, .. }) => {
-                    // Logstore does not exist (or WebTracking not enabled);
-                    // advance the offset so we don't retry this component
-                    // forever, and continue with the remaining components.
-                    eprintln!("[anolisa] telemetry: logstore `{component}` not found, skipping");
-                }
-                Err(UploaderError::Http { code, .. })
-                    if (400..500).contains(&code) && code != 408 && code != 429 =>
-                {
-                    // Client error: the request itself is invalid (e.g., malformed
-                    // body or unsupported content). Retrying the same payload will
-                    // never succeed, so advance the offset to avoid blocking the
-                    // pipeline indefinitely. The error is still logged above for
-                    // visibility. 408 Request Timeout and 429 Too Many Requests
-                    // are excluded: per RFC 9110 they are retryable (the server
-                    // invites a repeat, possibly later), so they fall through to
-                    // the retryable arm below and the batch is resent next round.
-                    eprintln!(
-                        "[anolisa] telemetry: logstore `{component}` rejected request with HTTP {code}, skipping"
-                    );
-                }
-                Err(e) => {
-                    // Do not advance offset; retry next round.
-                    last_err = Some(e);
-                    continue;
+                let stored = offsets.get(&component).cloned();
+                let collected = match self.collect_component(&component, stored.as_ref()) {
+                    Ok(Some(v)) => v,
+                    Ok(None) => break,
+                    Err(e) => {
+                        last_err = Some(UploaderError::Io(e));
+                        break;
+                    }
+                };
+                let (lines, new_offset) = collected;
+                // logstore is the component name (e.g. agent-sec-core.jsonl →
+                // logstore agent-sec-core).
+                let url = endpoint.track_url(&region, use_internal, &component);
+                let body = build_body(
+                    &lines,
+                    link_id.as_deref(),
+                    &common,
+                    &self.config.topic,
+                    &self.config.source,
+                )?;
+                let accepted = match post(&url, &body) {
+                    Ok(()) => true,
+                    Err(UploaderError::Http { code: 404, .. }) => {
+                        // Logstore does not exist (or WebTracking not enabled);
+                        // advance the offset so we don't retry this component
+                        // forever, and continue with the remaining components.
+                        eprintln!(
+                            "[anolisa] telemetry: logstore `{component}` not found, skipping"
+                        );
+                        false
+                    }
+                    Err(UploaderError::Http { code, .. })
+                        if (400..500).contains(&code) && code != 408 && code != 429 =>
+                    {
+                        // Client error: the request itself is invalid (e.g., malformed
+                        // body or unsupported content). Retrying the same payload will
+                        // never succeed, so advance the offset to avoid blocking the
+                        // pipeline indefinitely. The error is still logged above for
+                        // visibility. 408 Request Timeout and 429 Too Many Requests
+                        // are excluded: per RFC 9110 they are retryable (the server
+                        // invites a repeat, possibly later), so they fall through to
+                        // the retryable arm below and the batch is resent next round.
+                        eprintln!(
+                            "[anolisa] telemetry: logstore `{component}` rejected request with HTTP {code}, skipping"
+                        );
+                        false
+                    }
+                    Err(e) => {
+                        // Do not advance offset; retry next round.
+                        last_err = Some(e);
+                        break;
+                    }
+                };
+                offsets.insert(component.clone(), new_offset);
+                self.save_offsets(&offsets)?;
+                if !accepted || lines.len() < MAX_LINES_PER_ROUND {
+                    break;
                 }
             }
-            offsets.insert(component, new_offset);
-            self.save_offsets(&offsets)?;
         }
 
         match last_err {
@@ -1051,6 +1063,145 @@ mod tests {
 
     fn write_lines(path: &Path, content: &str) {
         fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn drain_backlog_sends_multiple_batches_in_one_round() {
+        crate::telemetry::metadata::with_cloud_init_disabled(|| {
+            let dir = TempDir::new().unwrap();
+            let up = test_uploader(&dir);
+            let content: String = (0..2501).map(|id| format!("{{\"id\":{id}}}\n")).collect();
+            write_lines(&up.jsonl_path("cosh"), &content);
+            let mut ids = Vec::new();
+            let mut calls = 0;
+            up.run_once_with_post(|_, body| {
+                calls += 1;
+                let body: Value = serde_json::from_str(body).unwrap();
+                ids.extend(
+                    body["__logs__"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|log| log["id"].as_str().unwrap().parse::<usize>().unwrap()),
+                );
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(calls, 3);
+            assert_eq!(ids, (0..2501).collect::<Vec<_>>());
+            assert_eq!(up.load_offsets()["cosh"].offset, content.len() as u64);
+        });
+    }
+
+    #[test]
+    fn drain_backlog_budget_leaves_room_for_other_components() {
+        crate::telemetry::metadata::with_cloud_init_disabled(|| {
+            let dir = TempDir::new().unwrap();
+            let up = test_uploader(&dir);
+            let line = "{\"id\":1}\n";
+            write_lines(&up.jsonl_path("cosh"), &line.repeat(9001));
+            write_lines(&up.jsonl_path("skillfs"), line);
+            let mut calls = Vec::new();
+            up.run_once_with_post(|url, _| {
+                calls.push(url.to_string());
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(calls.len(), 9);
+            assert!(calls[..8].iter().all(|url| url.ends_with("/cosh/track")));
+            assert!(calls[8].ends_with("/skillfs/track"));
+            assert_eq!(up.load_offsets()["cosh"].offset, (8000 * line.len()) as u64);
+            let mut remaining = 0;
+            up.run_once_with_post(|_, body| {
+                let body: Value = serde_json::from_str(body).unwrap();
+                remaining += body["__logs__"].as_array().unwrap().len();
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(remaining, 1001);
+            assert_eq!(up.load_offsets()["cosh"].offset, (9001 * line.len()) as u64);
+        });
+    }
+
+    #[test]
+    fn drain_backlog_checkpoints_before_a_later_failure() {
+        crate::telemetry::metadata::with_cloud_init_disabled(|| {
+            let dir = TempDir::new().unwrap();
+            let up = test_uploader(&dir);
+            let line = "{\"id\":1}\n";
+            write_lines(&up.jsonl_path("cosh"), &line.repeat(2001));
+            write_lines(&up.jsonl_path("skillfs"), line);
+            let mut cosh_calls = 0;
+            let mut other_calls = 0;
+            let result = up.run_once_with_post(|url, _| {
+                if url.ends_with("/cosh/track") {
+                    cosh_calls += 1;
+                    if cosh_calls == 2 {
+                        assert_eq!(up.load_offsets()["cosh"].offset, (1000 * line.len()) as u64);
+                        return Err(UploaderError::Http {
+                            code: 503,
+                            url: url.to_string(),
+                        });
+                    }
+                } else {
+                    other_calls += 1;
+                }
+                Ok(())
+            });
+            assert!(matches!(result, Err(UploaderError::Http { code: 503, .. })));
+            assert_eq!((cosh_calls, other_calls), (2, 1));
+            assert_eq!(up.load_offsets()["cosh"].offset, (1000 * line.len()) as u64);
+            let mut remaining = 0;
+            up.run_once_with_post(|_, body| {
+                let body: Value = serde_json::from_str(body).unwrap();
+                remaining += body["__logs__"].as_array().unwrap().len();
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(remaining, 1001);
+        });
+    }
+
+    #[test]
+    fn drain_backlog_honors_opt_out_between_batches() {
+        crate::telemetry::metadata::with_cloud_init_disabled(|| {
+            let dir = TempDir::new().unwrap();
+            let up = test_uploader(&dir);
+            let line = "{\"id\":1}\n";
+            write_lines(&up.jsonl_path("cosh"), &line.repeat(2001));
+            write_lines(&up.jsonl_path("skillfs"), line);
+            let mut calls = 0;
+            up.run_once_with_post(|_, _| {
+                calls += 1;
+                fs::write(&up.config.disable_marker_path, "").unwrap();
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(calls, 1);
+            assert_eq!(up.load_offsets()["cosh"].offset, (1000 * line.len()) as u64);
+            assert!(!up.load_offsets().contains_key("skillfs"));
+        });
+    }
+
+    #[test]
+    fn drain_backlog_stops_a_rejected_component_for_the_round() {
+        crate::telemetry::metadata::with_cloud_init_disabled(|| {
+            let dir = TempDir::new().unwrap();
+            let up = test_uploader(&dir);
+            let line = "{\"id\":1}\n";
+            write_lines(&up.jsonl_path("cosh"), &line.repeat(2001));
+            let mut calls = 0;
+            up.run_once_with_post(|url, _| {
+                calls += 1;
+                Err(UploaderError::Http {
+                    code: 404,
+                    url: url.to_string(),
+                })
+            })
+            .unwrap();
+            assert_eq!(calls, 1);
+            assert_eq!(up.load_offsets()["cosh"].offset, (1000 * line.len()) as u64);
+        });
     }
 
     #[test]
