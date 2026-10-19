@@ -7,6 +7,12 @@
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
+
+mod command;
+
+const CLOUD_INIT_TIMEOUT: Duration = Duration::from_secs(2);
+const CLOUD_INIT_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 
 /// Client for querying Alibaba Cloud instance metadata and cloud-init datasource.
 ///
@@ -123,18 +129,17 @@ impl MetadataClient {
 
     /// Query cloud-init datasource via `cloud-init query ds`.
     ///
-    /// Returns the raw JSON value, or `None` on any failure.
+    /// Returns the raw JSON value, or `None` on failure, a two-second timeout,
+    /// or output exceeding 4 MiB.
     pub fn query_cloud_init_ds(&self) -> Option<serde_json::Value> {
-        let output = Command::new("cloud-init")
-            .args(["query", "ds"])
-            .output()
-            .ok()?;
+        let output = command::capture(
+            Command::new("cloud-init").args(["query", "ds"]),
+            CLOUD_INIT_TIMEOUT,
+            CLOUD_INIT_OUTPUT_LIMIT,
+        )
+        .ok()?;
 
-        if !output.status.success() {
-            return None;
-        }
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stdout = String::from_utf8_lossy(&output);
         serde_json::from_str(&stdout).ok()
     }
 
@@ -183,16 +188,14 @@ impl MetadataClient {
 
     /// Run `cloud-init query <path>` and return a trimmed non-empty string.
     fn cloud_init_query_path(&self, path: &str) -> Option<String> {
-        let output = Command::new("cloud-init")
-            .args(["query", path])
-            .output()
-            .ok()?;
+        let output = command::capture(
+            Command::new("cloud-init").args(["query", path]),
+            CLOUD_INIT_TIMEOUT,
+            CLOUD_INIT_OUTPUT_LIMIT,
+        )
+        .ok()?;
 
-        if !output.status.success() {
-            return None;
-        }
-
-        let val = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let val = String::from_utf8_lossy(&output).trim().to_string();
         if val.is_empty() { None } else { Some(val) }
     }
 
@@ -234,14 +237,13 @@ impl MetadataClient {
             return None;
         }
         *attempted = true;
-        let output = Command::new("cloud-init")
-            .args(["query", "--all"])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        let stdout = String::from_utf8_lossy(&output.stdout);
+        let output = command::capture(
+            Command::new("cloud-init").args(["query", "--all"]),
+            CLOUD_INIT_TIMEOUT,
+            CLOUD_INIT_OUTPUT_LIMIT,
+        )
+        .ok()?;
+        let stdout = String::from_utf8_lossy(&output);
         let value = serde_json::from_str(&stdout).ok()?;
         Some(self.cloud_init_all.get_or_init(|| value))
     }
@@ -346,6 +348,32 @@ where
     }
 
     result
+}
+
+#[cfg(test)]
+mod command_limits_regression {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn cloud_init_deadline_applies_to_all_query_forms() {
+        for path in ["ds", "ds.meta_data.region-id", "--all"] {
+            with_cloud_init_responses(&[(path, "$(exec sleep 4)")], || {
+                let client = MetadataClient::new("http://127.0.0.1:1");
+                let started = Instant::now();
+                match path {
+                    "ds" => assert!(client.query_cloud_init_ds().is_none()),
+                    "--all" => assert!(client.cloud_init_all().is_none()),
+                    _ => assert!(client.cloud_init_query_path(path).is_none()),
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(3),
+                    "query {path} exceeded its deadline: {:?}",
+                    started.elapsed()
+                );
+            });
+        }
+    }
 }
 
 // ── Unit tests ───────────────────────────────────────────────────────
