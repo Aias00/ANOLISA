@@ -1,6 +1,6 @@
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -8,7 +8,7 @@ use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 use ws_ckpt_common::backend::{
-    BackendType, DiffError, EnvironmentStatus, GcResult, StorageBackend,
+    BackendType, CreateAdmissionRefused, DiffError, EnvironmentStatus, GcResult, StorageBackend,
 };
 use ws_ckpt_common::{
     decode_payload, encode_frame, ChangeType, DaemonConfig, DiffEntry, GuardedCheckpointOutcomeV2,
@@ -41,6 +41,7 @@ struct TestBackend {
     diff_calls: AtomicUsize,
     rollback_calls: AtomicUsize,
     rollback_error: Mutex<Option<String>>,
+    admission_refused: AtomicBool,
     diff_error: Mutex<Option<anyhow::Error>>,
     current_diff: Mutex<Vec<DiffEntry>>,
     diff_after_first: Mutex<Option<Vec<DiffEntry>>>,
@@ -58,6 +59,7 @@ impl TestBackend {
             diff_calls: AtomicUsize::new(0),
             rollback_calls: AtomicUsize::new(0),
             rollback_error: Mutex::new(None),
+            admission_refused: AtomicBool::new(false),
             diff_error: Mutex::new(None),
             current_diff: Mutex::new(vec![DiffEntry {
                 path: "1.txt".to_string(),
@@ -89,11 +91,17 @@ impl StorageBackend for TestBackend {
 
     async fn create_snapshot(&self, _: &str, _: &str) -> anyhow::Result<()> {
         self.create_calls.fetch_add(1, Ordering::SeqCst);
+        if self.admission_refused.load(Ordering::SeqCst) {
+            return Err(CreateAdmissionRefused("refusing to create subvolume".to_string()).into());
+        }
         Ok(())
     }
 
     async fn rollback(&self, _: &str, _: &str) -> anyhow::Result<PathBuf> {
         self.rollback_calls.fetch_add(1, Ordering::SeqCst);
+        if self.admission_refused.load(Ordering::SeqCst) {
+            return Err(CreateAdmissionRefused("refusing to create subvolume".to_string()).into());
+        }
         if let Some(message) = self.rollback_error.lock().unwrap().clone() {
             anyhow::bail!(message);
         }
@@ -574,6 +582,86 @@ async fn exact_duplicate_is_idempotent_and_conflicting_digest_is_rejected() {
     assert_eq!(fixture.backend.create_calls.load(Ordering::SeqCst), 1);
 }
 
+/// #7234: a refused space admission is a known-no-effect rejection and the
+/// same checkpoint can be retried once space is reclaimed.
+#[tokio::test]
+async fn refused_create_admission_rejects_checkpoint_and_allows_retry() {
+    let fixture = Fixture::new(true);
+    fixture
+        .backend
+        .admission_refused
+        .store(true, Ordering::SeqCst);
+    match create_checkpoint(&fixture, 1000).await {
+        Response::GuardedCheckpointV2Rejected { code, message } => {
+            assert_eq!(code, GuardedCheckpointRejectionCodeV2::InsufficientSpace);
+            assert!(message.contains("refusing to create subvolume"));
+        }
+        other => panic!("expected guarded rejection, got {other:?}"),
+    }
+
+    fixture
+        .backend
+        .admission_refused
+        .store(false, Ordering::SeqCst);
+    assert!(matches!(
+        create_checkpoint(&fixture, 1000).await,
+        Response::GuardedCheckpointV2Ok { .. }
+    ));
+}
+
+/// #7234: a refused space admission releases the rollback reservation instead
+/// of recording an uncertain outcome, so the operation can be retried.
+#[tokio::test]
+async fn refused_create_admission_rejects_rollback_and_allows_retry() {
+    let fixture = Fixture::new(true);
+    fixture.add_target_snapshot().await;
+    *fixture.backend.diff_error.lock().unwrap() =
+        Some(CreateAdmissionRefused("refusing to create subvolume".to_string()).into());
+    assert_rollback_rejected(
+        rollback_preview(
+            &fixture.state,
+            Some(1000),
+            fixture.workspace_path.to_str().expect("utf8 path"),
+            WS_ID,
+            fixture.backend.generation,
+            TARGET_ID,
+        )
+        .await,
+        GuardedRollbackRejectionCodeV2::InsufficientSpace,
+    );
+    fixture
+        .backend
+        .admission_refused
+        .store(true, Ordering::SeqCst);
+    let digest = preview_digest(&fixture, 1000).await;
+
+    assert_rollback_rejected(
+        switch(&fixture, 1000, digest).await,
+        GuardedRollbackRejectionCodeV2::InsufficientSpace,
+    );
+    assert!(matches!(
+        rollback_evidence(
+            &fixture.state,
+            Some(1000),
+            WS_ID,
+            OPERATION_ID,
+            OPERATION_DIGEST,
+        )
+        .await,
+        Response::GuardedRollbackEvidenceV2Ok { evidence: None }
+    ));
+
+    fixture
+        .backend
+        .admission_refused
+        .store(false, Ordering::SeqCst);
+    assert!(matches!(
+        switch(&fixture, 1000, digest).await,
+        Response::GuardedRollbackV2Ok { .. }
+    ));
+    assert_eq!(fixture.backend.rollback_calls.load(Ordering::SeqCst), 2);
+}
+
 #[test]
 fn evidence_limit_evicts_skipped_or_confirmed_missing_records() {
     use ws_ckpt_common::{GuardedCheckpointEvidenceV2, SnapshotMeta};
@@ -1028,6 +1116,45 @@ async fn legacy_diff_requests_preserve_path_error_classification() {
             assert_eq!(fixture.backend.diff_calls.load(Ordering::SeqCst), 1);
             assert_eq!(fixture.backend.rollback_calls.load(Ordering::SeqCst), 0);
         }
+    }
+}
+
+#[tokio::test]
+async fn legacy_requests_report_refused_create_admission_as_disk_space() {
+    // CLI clients must be able to tell space pressure from a daemon bug (#7234).
+    for request in [
+        Request::Checkpoint {
+            workspace: WS_ID.to_string(),
+            id: "legacy-ckpt".to_string(),
+            message: None,
+            metadata: None,
+            pin: false,
+        },
+        Request::Rollback {
+            workspace: WS_ID.to_string(),
+            to: Some(TARGET_ID.to_string()),
+            num_ancestors: None,
+        },
+        Request::Diff {
+            workspace: WS_ID.to_string(),
+            from: TARGET_ID.to_string(),
+            to: None,
+        },
+    ] {
+        let fixture = Fixture::new(true);
+        fixture.add_target_snapshot().await;
+        fixture
+            .backend
+            .admission_refused
+            .store(true, Ordering::SeqCst);
+        *fixture.backend.diff_error.lock().unwrap() =
+            Some(CreateAdmissionRefused("refusing to create subvolume".to_string()).into());
+        let response = dispatcher::dispatch(&fixture.state, request).await;
+        let Response::Error { code, message } = response else {
+            panic!("expected a legacy error response: {response:?}");
+        };
+        assert_eq!(code, ws_ckpt_common::ErrorCode::DiskSpaceInsufficient);
+        assert!(message.contains("refusing to create subvolume"));
     }
 }
 

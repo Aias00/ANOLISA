@@ -2,10 +2,11 @@
 
 [English](provider-protocol.md)
 
+[设计索引](README_zh.md) · [架构总览](../../../../docs/developer-guide/zh/aw/architecture.md)
+
 `aw-provider` 定义实验性的 `aw-provider/v1alpha1` 接口，供外部策略程序使用，
 并离线检查消息和请求的能力。它将统一配置衔接到 Provider 合同，本身不启动进程、
-安装 Agent Hook 或建立运行时绑定。同一套 Provider 接口面向 QwenPaw、Qoder CLI、
-OpenClaw 和 Hermes；本次交付使用合成夹具，不新增原生接入的验收结论。
+安装 Agent Hook 或建立运行时绑定。原生接入由 `aw-service` CLI 中的 Adapter 负责，支持范围见[组件 README](../../README_zh.md#hook-支持)。
 
 ## 交付边界
 
@@ -15,7 +16,7 @@ OpenClaw 和 Hermes；本次交付使用合成夹具，不新增原生接入的�
 | `aw-provider` | 校验协议消息、关联响应，并依据调用方提供的 Provider 和 Adapter 证据检查配置步骤 |
 | `aw-contracts` / `aw-core` | 通过可信 Host 和 Journal 校验、执行已有能力模型 |
 | `aw-host` | 执行 Provider 命令，限制时间和输出，处理取消，返回可关联的调用报告 |
-| 后续 Adapter 与服务 | 认证原生能力，注册回调，转换效果，管理绑定并审计原生采用情况 |
+| Adapter 与 `aw-service` | 认证原生能力，注册回调，转换效果，管理绑定并审计原生采用情况 |
 
 配置字段保持不变。`spec.providers` 中的命名对象选择 `aw-provider/v1alpha1`、
 固定的 `transport.argv` 和私有 `config`。脚本、二进制程序或后台服务的 CLI
@@ -254,7 +255,7 @@ AW 不改变外部 Hook 的顺序；外部改写 Hook 仍遵循宿主自己的�
 RTK 包装（Agent、Session、data 目录及绝对路径的 `rtk`），将
 `output_optimization: rtk` 传入 PostTool，并让此类重试通过 PreTool。
 识别时解码带引号或转义的字面量，并通过已存在祖先的规范路径比较状态目录，不创建目录。
-仅跳过[文档列明的执行前缀形式](../../../../docs/user-guide/zh/user-entrypoint/aw-tokenless.md#pretool-与权限行为)，
+仅跳过[文档列明的执行前缀形式](../../../../docs/developer-guide/zh/aw/tokenless.md#pretool-与权限行为)，
 其他命令的参数中出现归属包装并不足以确认 RTK 归属。
 裸 `rtk`、外部归属、未知或带额外选项的包装，以及复合 Shell 命令不推断 RTK 归属。这只是优化提示，不授予权限
 或恢复访问；不新增 AW 持久优化/恢复存储，也不复制压缩策略。

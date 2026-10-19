@@ -2,9 +2,15 @@
 
 [English](adapter-dispatch.md)
 
+[设计索引](README_zh.md) · [架构总览](../../../../docs/developer-guide/zh/aw/architecture.md)
+
 `aw` 可执行程序负责发现服务、绑定实例、前台进程生命周期和清理。每个原生适配器负责
 版本与入口准入、注册文件、事件归一化和宿主返回格式。这些接口位于 CLI 私有模块，
 服务的 `invoke_step` 增加可选的原生命令环境快照；既有请求可以省略。
+
+原生方言、回调解释和 Python/JavaScript 资产统一位于 `crates/aw-adapter/`。
+CLI 与服务共用这个内部库；参数解析、RPC、信号和启动目录生命周期仍由
+`aw-service` 负责。详见[架构边界](architecture-boundaries_zh.md)。
 
 ## 启动生命周期
 

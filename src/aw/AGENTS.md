@@ -28,12 +28,79 @@ final replacement step; preserve the native envelope, failure status and audit.
 Keep unsupported capabilities visible at admission. Configuration vocabulary
 and roadmap entries are not evidence of native support.
 
+## Provider collaboration and framework architecture
+
+**Concrete Providers MUST live in the independent collaboration directory
+at the repository root, `providers/<provider>/`. Reserve `src/aw/crates/` for the reusable AW framework.**
+Backend-specific security, compression and other integrations belong in this
+Provider space, not in new `src/aw/crates/aw-provider-<backend>/` directories or framework
+modules. The `aw-provider` crate is the shared protocol library, not an integration.
+
+`providers/` accepts first-party and community implementations, each with its own
+source, schemas, examples and tests. Providers may also live in independent
+repositories, use other languages and ship separately. Runtime integration uses
+`aw-provider/v1alpha1` over stdio and the configured `transport.argv`; it must not
+require a Provider to join this source tree. Follow the
+[Provider contribution guide](../../providers/README.md).
+
+Each bundled Rust Provider owns its Cargo workspace, lockfile and toolchain.
+The AW workspace contains framework packages only; the gate combines independent
+test inventories without adding Provider members or dependencies to AW.
+Provider owners own dependencies, tests and releases; the OS distributor selects
+versions, validates composition and delivers installation and upgrades. Target
+out-of-tree Provider builds against pinned public AW libraries. Third parties
+need only the public process protocol and YAML, not a Rust SDK or OS checkout.
+The bundled implementations still use local SDK paths. Preview delivers one
+build set and checks matching versions and source commits for common origin.
+Independent SDK publication and installation compatibility changes are a later
+stage, including receipt migration tests. Preserve existing package and binary
+names when moving source directories. New Provider directories
+do not automatically join the installer: inclusion requires explicit packaging
+and lifecycle validation.
+
+The root Cargo manifest is a virtual workspace. Present the nine framework
+crates separately from concrete Providers:
+
+| Responsibility | Framework crates | Boundary |
+| --- | --- | --- |
+| Build and install | `aw-package` | Package composition, installation and configuration generation |
+| Native dialects | `aw-adapter` | Catalog, registration, callbacks, native phases and effect adoption |
+| Native entrypoint and local runtime | `aw-service` | CLI, bindings, events, deadlines, cancellation and audit |
+| Hook execution | `aw-host`, `aw-exec` | Prepare Providers and execute steps; bound process lifetime and cleanup |
+| Shared validation | `aw-config`, `aw-provider`, `aw-contracts` | Configuration, Provider protocol/admission, schemas and record validation |
+| Plan API and journal | `aw-core` | Independent plan execution API and FileJournal |
+
+The Hook path is Adapter -> service -> Host -> executor -> Provider process.
+Results return to the Adapter for native adoption. The service uses
+`aw-core::journal::FileJournal`, not `Core::prepare/execute`; do not insert the
+Core plan API into this path or equate its `ProviderHost` port with `aw-host::Host`.
+Framework crates must not depend on concrete Provider implementations, including
+through dev-dependencies. `aw-adapter` must not depend on `aw-service`, `aw-host`
+or CLI internals. Keep Client, wire DTOs, full Binding, serialized HookBinding,
+argument parsing, signal handling and resource ownership in `aw-service`.
+Pass only NativeContext and typed options into the Adapter. The caller supplies
+cancellation and launch-file access; the Adapter returns plans, comparison data
+and native replies. Raw native verification must retain strict decoding and
+cannot trust a callback's self-reported verification state.
+
+Keep crate-local source, schemas and Rust tests together. Every contract schema
+in `crates/aw-contracts/schemas/` must be registered and tested. Retain supported
+versions together; remove unused drafts and use Git history for reference. Do not
+remove a contract merely because its version is older. New Core capability
+profiles require explicit schemas, Registry entries and cross-record validation;
+Provider-private data belongs to its Provider. Schema moves must preserve active
+bytes, IDs, registered names and digest vectors. Update the
+[architecture overview](../../docs/developer-guide/en/aw/architecture.md) and
+[design index](docs/design/README.md) when ownership or call paths change.
+Show runtime flow in the overview; keep compilation dependencies in separate
+framework and Provider tables, with test-only dependencies identified.
+
 ## Adding an Agent or Hook
 
 Update these together in the same change:
 
 1. Register the Adapter and its event/effect profile in
-   `crates/aw-service/src/cli/adapter/catalog.rs`; use that profile when building
+   `crates/aw-adapter/src/adapter/catalog.rs`; use that profile when building
    launch capabilities. Keep the configuration schema aligned.
 2. Implement native normalization, registration, effect adoption and teardown in
    the Adapter. Keep process ownership in `aw-exec` and common lifecycle in the
@@ -63,15 +130,19 @@ matrix case. Package acceptance separately covers real Tokenless/RTK binaries.
 
 ## Layout and CI cost
 
+Keep workspace/native acceptance under `tests/` and runtime bridge assets under
+`crates/aw-adapter/native/`. When changing crate boundaries, update `scripts/check_layout.py`
+and its behavior tests alongside the architecture documentation.
+
 Rust, Python and JavaScript (`.js`, `.mjs`, `.cjs`) files share a 699-line ceiling,
 including tests and embedded fixtures; the gate reports files at 600 lines.
-The existing 711-line `src/validation.rs` allowance is fixed, not a precedent.
+The existing 711-line `crates/aw-contracts/src/validation.rs` allowance is fixed, not a precedent.
 Split by responsibility before crossing the ceiling. Keep related helpers in
 named sibling modules, preserve test entrypoints and assertions, and avoid
 compressing code or adding size exemptions. Never add `mod.rs` except the
 repository-approved `tests/common/mod.rs` convention.
 
-Only PRs changing `src/aw/**` automatically run AW CI. Component internals belong
+Only PRs changing `src/aw/**` or `providers/**` automatically run AW CI. Component internals belong
 in component CI; explicitly validate public contract changes consumed by AW.
 Keep daily checks credential-free. The nightly integration workflow builds all
 Preview packages once and reuses checksummed candidate-SHA binaries for pinned
