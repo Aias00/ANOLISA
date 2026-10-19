@@ -245,6 +245,10 @@ anolisa install tokenless
 [源码构建](https://agentic-os.sh/zh/docs/building/) ·
 [变更日志](https://agentic-os.sh/zh/changelog/)
 
+AW 专项文档见[架构总览](docs/developer-guide/zh/aw/architecture.md)、[用户指南](docs/user-guide/zh/user-entrypoint/aw/README.md)、
+[本地编译与打包](docs/developer-guide/zh/aw/building.md)和
+[开发指南](docs/developer-guide/zh/aw/README.md)。
+
 ## 仓库目录
 
 各组件保留在同一仓库中，仍可独立构建。目录按运行能力、发行工具、评测和保留的旧版实现划分；源码位置变化不改变已安装的命令、包名或发布 tag。
@@ -252,6 +256,7 @@ anolisa install tokenless
 | 目录 | 内容 |
 |---|---|
 | [`src/`](src/) | 运行能力组件，包括 AW、cosh-ng、可观测、安全、记忆和沙箱能力。各组件保留自己的构建与测试入口。 |
+| [`providers/`](providers/README_zh.md) | AW Provider 协作空间，各实现拥有独立 workspace、示例和契约测试。 |
 | [`distribution/`](distribution/) | 发行工具。`anolisa/` 包含安装 CLI、组件清单和打包资源。 |
 | [`benchmark/`](benchmark/) | 跨组件评测工具，包括 ClawEval、SWE 和 Terminal Bench runner。组件专用 benchmark 仍保留在各组件内。 |
 | [`deprecated/`](deprecated/) | 保留的旧版实现。`copilot-shell/` 已不推荐用于新增开发；正式退役前保留现有构建、安装、CI 和发布入口。 |

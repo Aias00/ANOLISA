@@ -151,20 +151,22 @@ impl Selection {
         if matches!(self, Self::Core | Self::All) {
             aw.push("aw-service");
         }
-        if matches!(self, Self::SecCore | Self::All) {
-            aw.push("aw-provider-sec-core");
-        }
-        if matches!(self, Self::Tokenless | Self::All) {
-            aw.push("aw-provider-tokenless");
-        }
         let mut builds = vec![(repo.join("src/aw"), aw)];
         if matches!(self, Self::SecCore | Self::All) {
+            builds.push((
+                repo.join("providers/agent-sec-core"),
+                vec!["aw-provider-sec-core"],
+            ));
             builds.push((
                 repo.join("src/agent-sec-core/v2"),
                 vec!["asc-cli", "asc-daemon"],
             ));
         }
         if matches!(self, Self::Tokenless | Self::All) {
+            builds.push((
+                repo.join("providers/tokenless"),
+                vec!["aw-provider-tokenless"],
+            ));
             builds.push((repo.join("src/tokenless"), vec!["tokenless-cli"]));
         }
         builds
@@ -304,6 +306,7 @@ fn stage(
         .tempdir_in(output)?;
     let aw = repo.join("src/aw/target/release");
     let sec = repo.join("src/agent-sec-core/v2/target/release");
+    let sec_provider = repo.join("providers/agent-sec-core/target/release");
     let mut components = Vec::new();
     for name in selection.components() {
         let root = stage.path().join(name);
@@ -321,7 +324,10 @@ fn stage(
             }
         } else if *name == "aw-provider-tokenless" {
             for (binary, directory) in [
-                ("aw-provider-tokenless", aw.clone()),
+                (
+                    "aw-provider-tokenless",
+                    repo.join("providers/tokenless/target/release"),
+                ),
                 ("tokenless", repo.join("src/tokenless/target/release")),
                 ("rtk", aw.clone()),
             ] {
@@ -336,7 +342,7 @@ fn stage(
             }
         } else {
             for (binary, directory) in [
-                ("aw-provider-sec-core", &aw),
+                ("aw-provider-sec-core", &sec_provider),
                 ("agent-sec-cli", &sec),
                 ("agent-sec-daemon", &sec),
                 ("agent-sec-daemon-health", &sec),
@@ -440,11 +446,36 @@ fn stage(
         )?;
         copy(&aw.join("aw-package"), &root.join("aw-package"), cancel)?;
         for (language, name) in [("en", "README.md"), ("zh", "README_zh.md")] {
-            let text = fs::read_to_string(repo.join(format!(
-                "docs/user-guide/{language}/user-entrypoint/aw-preview.md"
+            let mut text = fs::read_to_string(repo.join(format!(
+                "docs/user-guide/{language}/user-entrypoint/aw/installation.md"
             )))?
-            .replace("../../zh/user-entrypoint/aw-preview.md", "README_zh.md")
-            .replace("../../en/user-entrypoint/aw-preview.md", "README.md");
+            .replace(
+                "../../../zh/user-entrypoint/aw/installation.md",
+                "README_zh.md",
+            )
+            .replace(
+                "../../../en/user-entrypoint/aw/installation.md",
+                "README.md",
+            );
+            // The archive contains the installation page only; follow-up guides live online.
+            let locale = if language == "zh" { "/zh" } else { "" };
+            for (source, route) in [
+                ("configuration.md", "aw/configuration"),
+                ("tokenless.md", "aw-tokenless"),
+                ("security.md", "aw-sec-core"),
+                ("operations.md", "aw/operations"),
+            ] {
+                text = text.replace(
+                    &format!("]({source})"),
+                    &format!(
+                        "](https://agentic-os.sh{locale}/docs/user-guide/user-entrypoint/{route}/)"
+                    ),
+                );
+            }
+            text = text.replace(
+                &format!("../../../../developer-guide/{language}/aw/building.md"),
+                &format!("https://agentic-os.sh{locale}/docs/developer-guide/aw/building/"),
+            );
             fs::write(root.join(name), text)?;
         }
         let destination = stage.path().join(format!("{filename}.tar.gz"));

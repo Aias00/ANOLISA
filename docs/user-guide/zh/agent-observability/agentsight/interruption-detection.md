@@ -82,6 +82,9 @@ TYPE                 SEVERITY    COUNT
 token_limit          medium          1
 ```
 
+给 `stats` 或 `count` 加上 `--agent CoshNG`，就只看该 Agent 的这份分布，而不是整台主机；不带该
+参数时两者都覆盖窗口内的所有 Agent。`count` 仍只统计未解决事件，`stats` 统计已解决与未解决事件。
+
 ### 3. 具体是哪几条
 
 ```bash
@@ -93,7 +96,8 @@ INTERRUPTION_ID                    TYPE          SEVERITY  OCCURRED_AT          
 Total: 1 event(s)
 ```
 
-常用过滤：`--severity critical`、`--agent CoshNG`、`--unresolved`、`--limit`、`--json`。
+常用过滤：`--severity critical`、`--agent CoshNG`（`stats` 与 `count` 同样可用）、
+`--unresolved`、`--limit`、`--json`。
 
 本页示例中的所有 ID 都是占位值，请替换成你自己输出里的实际 ID。
 

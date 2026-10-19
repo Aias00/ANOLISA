@@ -36,14 +36,16 @@ AW 响应数据返回。Host 独立处理 `on_error`。
 被杀后无法核实清理仍是边界。已验收的 Rust scan CLI 不另起扫描进程，而是调用
 已有 daemon；已派发的 daemon 工作由 sec-core 约束，终止客户端不会回滚这些工作。
 
-私有配置与可运行的 Host 步骤见[用户指南](../../../../docs/user-guide/zh/user-entrypoint/aw-sec-core.md)。
+私有配置与可运行的 Host 步骤见[用户指南](../../../../docs/user-guide/zh/user-entrypoint/aw/security.md)。
 示例提供完整 AWConfiguration，无需修改统一配置 schema。部署管理、原生 Hook
 调度、效果采用与持久化 AW 审计仍由 daemon 和适配器负责。使用早期实验命令
 `agent-sec-cli aw-provider` 的组合分支需要将 Provider argv 改为独立桥接。
 
 ## 验收边界
 
-`cargo test --locked -p aw-provider-sec-core` 覆盖公开 CLI fixture、请求绑定、离线
+从仓库根目录执行。
+
+`cargo test --locked --manifest-path providers/agent-sec-core/Cargo.toml` 覆盖公开 CLI fixture、请求绑定、离线
 操作、配置拒绝、精确 argv、判定与故障映射、预算和输出上限，以及 Host 取消时
 内层 CLI 的终止，以及 stdin 保持打开、Provider 等待 EOF 时的外层期限清理。
 常规 AW gate 同时运行这些测试与既有 Provider/Host/Core 测试。

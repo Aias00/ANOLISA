@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from collections.abc import AsyncGenerator, Callable
 from pathlib import Path
 from typing import Any
@@ -143,6 +144,7 @@ class TokenlessMiddleware(MiddlewareBase):
     def __init__(self, sdk: Any, data_dir: str) -> None:
         self.sdk = sdk
         self.data_dir = data_dir
+        self.post_tool_failures = 0
 
     async def on_model_call(
         self,
@@ -309,23 +311,35 @@ class TokenlessMiddleware(MiddlewareBase):
         for index, block in enumerate(content):
             if not isinstance(block, TextBlock):
                 continue
-            transformed = await self.sdk.post_tool(
-                PostToolRequest(
-                    result_kind=ResultKind.TOOL,
-                    tool_name=tool_name,
-                    content=block.text,
-                    status=status,
-                    content_origin=ContentOrigin(origin),
-                    output_optimization=optimization,
-                    capabilities=PostToolCapabilities(
-                        replace_output=True,
-                        recovery=recovery,
-                        replace_with_text=True,
-                    ),
-                    attribution=attribution,
-                    command=command,
+            try:
+                transformed = await self.sdk.post_tool(
+                    PostToolRequest(
+                        result_kind=ResultKind.TOOL,
+                        tool_name=tool_name,
+                        content=block.text,
+                        status=status,
+                        content_origin=ContentOrigin(origin),
+                        output_optimization=optimization,
+                        capabilities=PostToolCapabilities(
+                            replace_output=True,
+                            recovery=recovery,
+                            replace_with_text=True,
+                        ),
+                        attribution=attribution,
+                        command=command,
+                    )
                 )
-            )
+            except Exception:
+                # A compression failure must not turn a successful host tool
+                # response into an agent error or partially rewrite its blocks.
+                self.post_tool_failures += 1
+                logger.exception(
+                    "tokenless: post_tool failed for %s; preserving original result "
+                    "(failures=%d)",
+                    tool_name,
+                    self.post_tool_failures,
+                )
+                return response
             extra_context = extra_context or transformed.additional_context
             if transformed.output != block.text:
                 content[index] = block.model_copy(update={"text": transformed.output})
@@ -339,7 +353,14 @@ class TokenlessMiddleware(MiddlewareBase):
 def _factory(ctx: Any, agent_config: Any) -> TokenlessMiddleware:
     del agent_config
     # TokenlessConfig rejects relative data directories.
-    data_dir = str(Path(ctx.workspace.workspace_dir).expanduser().resolve() / ".tokenless")
+    configured = os.environ.get("TOKENLESS_DATA_DIR")
+    if configured:
+        configured_path = Path(configured).expanduser()
+        if not configured_path.is_absolute():
+            raise ValueError("TOKENLESS_DATA_DIR must be absolute")
+        data_dir = str(configured_path.resolve())
+    else:
+        data_dir = str(Path(ctx.workspace.workspace_dir).expanduser().resolve() / ".tokenless")
     return TokenlessMiddleware(_sdk_for(data_dir), data_dir)
 
 
