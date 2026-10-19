@@ -27,7 +27,7 @@ downloads uncached dependencies; schema validation reads only bundled resources.
 The runner, local service, Provider Host execution, command execution and FileJournal require Linux;
 this gate does not certify other operating systems or minimum supported versions.
 
-For pull requests that change `src/aw/**`,
+For pull requests that change `src/aw/**` or `providers/**`,
 [AW CI](../../.github/workflows/aw-ci.yml) runs these checks against the candidate
 merge commit. Run the command above on Linux before submitting AW changes. If CI
 fails, find the failing command in the job log and rerun it locally from `src/aw`.
@@ -59,7 +59,7 @@ based on the changed Adapter.
 
 Rust, Python and JavaScript (`.js`, `.mjs`, `.cjs`) sources, scripts and fixtures
 have a 699-line ceiling, with an advisory at 600 lines. Only the existing
-`src/validation.rs` retains its fixed 711-line ceiling. Split by responsibility
+`crates/aw-contracts/src/validation.rs` retains its fixed 711-line ceiling. Split by responsibility
 and preserve entrypoints and assertions; do not exempt test fixtures.
 Dependency/layout checks are in [check_layout.py](scripts/check_layout.py),
 compiled inventories in [check_inventory.py](scripts/check_inventory.py), and
@@ -81,7 +81,7 @@ python3 -B -m unittest discover -s tests -p 'test_ci_*.py'
 
 ## Daily CI and nightly integration
 
-PRs run AW checks only when `src/aw/**` changes. The daily gate retains all
+PRs run AW checks only when `src/aw/**` or `providers/**` changes. The daily gate retains all
 credential-free security, Tokenless, lifecycle and Agent/Hook matrix contracts,
 including native-inventory validation and source-size checks. Other components'
 internal changes are owned by their own CI. An externally changed public contract
@@ -149,26 +149,19 @@ success by retrying or omitting a framework.
 
 ## Crate boundaries
 
-| Crate | Responsibility |
-| --- | --- |
-| `aw-contracts` | Versioned capability schemas and cross-record validation |
-| `aw-config` | Desired configuration parsing and static validation |
-| `aw-provider` | External Provider protocol and capability admission; depends on `aw-config` |
-| `aw-core` | Plan execution through trusted runtime ports; depends on `aw-contracts` |
-| `aw-exec` | Bounded Linux command transport and owned process-group cleanup; independent of Provider protocols |
-| `aw-host` | Compose configuration, Provider admission and bounded transport into local preparation and invocation; depends on `aw-config`, `aw-provider` and `aw-exec` |
-| `aw-service` | Standalone service, reusable client and native launcher; uses `aw-host` for Hook execution, `aw-exec` for foreground ownership and `aw-core` Journal for metadata |
-| `aw-provider-tokenless` | PostTool Provider binary using the public Tokenless v2 CLI; no Tokenless crate dependency |
-| `aw-provider-sec-core` | Concrete Provider binary; calls public sec-core CLI through `aw-exec`, with no sec-core crate dependency |
-| `aw-package` | Rust Preview build, manifests, installation and dual-Agent configuration; `aw-service` is a test-only dependency |
+Framework crates live in `src/aw/crates/<name>/`, concrete Providers in
+the repository-root `providers/<provider>/` with independent workspaces; the root manifest only organizes the workspace. See
+[Provider collaboration](../../providers/README.md) for contribution and distribution,
+[Architecture](../../docs/developer-guide/en/aw/architecture.md) for ownership and
+dependencies, and the [design index](docs/design/README.md) for protocol reading order.
 
-Keep native framework integration outside these libraries and service; process execution belongs in `aw-exec`.
-Keep Provider message parsing and offline admission in `aw-provider`; `aw-host`
-owns their execution boundary without adding Provider semantics to raw command
-transport or replacing the Core Host/Journal contracts.
-Dependency and source-layout checks live in [scripts/check_layout.py](scripts/check_layout.py),
-with regression tests in [tests/test_ci_checks.py](tests/test_ci_checks.py).
-Changes to a crate boundary must update both the checks and their tests.
+Keep native dialects and bridge assets in `aw-adapter`; the CLI owns argument
+parsing, RPCs, signals and resources. The service owns state, budgets and audit.
+Both reuse the Adapter without exposing service internals to it.
+`aw-provider` owns offline protocol validation; process execution uses `aw-exec`.
+Changes to crate boundaries must update [check_layout.py](scripts/check_layout.py),
+its [regression tests](tests/test_ci_checks.py), and the
+[architecture tables](../../docs/developer-guide/en/aw/architecture.md).
 
 ## Build the service
 
@@ -179,7 +172,7 @@ cargo build --locked -p aw-service --bin aw
 cargo build --locked -p aw-provider --example policy
 ```
 
-The [user guide](../../docs/user-guide/en/user-entrypoint/aw.md#run-the-local-service-demo)
+The [user guide](../../docs/developer-guide/en/aw/native-agents.md#run-the-local-service-demo)
 walks through a foreground service and separate client, including state-directory
 and audit-history cleanup. The service uses the local `aw-service/v1alpha3`
 protocol; Providers retain `aw-provider/v1alpha1`. They are versioned separately.
@@ -204,7 +197,7 @@ For focused Provider Host checks, run from `src/aw` on Linux:
 
 ```bash
 cargo test --locked -p aw-host
-cargo test --locked -p aw-provider-sec-core
+cargo test --locked --manifest-path ../../providers/agent-sec-core/Cargo.toml
 ```
 
 These tests use local fixture processes to check preparation, request binding,
