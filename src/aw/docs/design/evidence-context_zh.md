@@ -128,7 +128,7 @@ Qoder 系统采集器报告小写 ID，本地 discovery 报告显示名。Hermes
 
 ## 可执行证据合同
 
-[`evidence-v1.schema.json`](../../schemas/evidence-v1.schema.json) 定义正式结构，
+[`evidence-v1.schema.json`](../../crates/aw-contracts/schemas/evidence-v1.schema.json) 定义正式结构，
 拒绝未知字段；元数据遵循 AW canonical 域。每条记录包含：
 
 | 字段 | 含义 |
@@ -167,7 +167,7 @@ AW 来源范围为服务 generation。AgentSight 来源范围为配置
 
 ## 快照选取与生命周期
 
-[`evidence-context-v1.schema.json`](../../schemas/evidence-context-v1.schema.json)
+[`evidence-context-v1.schema.json`](../../crates/aw-contracts/schemas/evidence-context-v1.schema.json)
 定义结果结构，包括主体、原始候选版本、约束内容引用、选取证据、内容对象、来源
 状态、缺口、限额、截止点，以及用十进制字符串表示的原始单调时钟 deadline。
 
@@ -212,7 +212,7 @@ AW 来源范围为服务 generation。AgentSight 来源范围为配置
 `freeze_context`。Client、callback 二进制和 daemon 必须一起升级，旧 daemon
 由其 owner 重启。Provider stdio 仍为 `aw-provider/v1alpha1`。未配置
 `agents.<target>.evidence` 的旧配置继续有效。来源配置、限额和回退操作见
-[用户参考](../../../../docs/user-guide/zh/user-entrypoint/aw-agentsight.md)。
+[用户参考](../../../../docs/user-guide/zh/user-entrypoint/aw/observability.md)。
 
 #7411 最终版本中依据可信 Host 能力决定的 Qoder 顺序保持不变。Hermes 最终入口和
 OpenClaw replacement/completion 视图保留原始事件身份、deadline 与候选。

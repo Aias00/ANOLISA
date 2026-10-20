@@ -501,6 +501,8 @@ pub enum GuardedCheckpointRejectionCodeV2 {
     WriteLockConflict,
     CallerMismatch,
     EvidenceCapacityReached,
+    /// Backend space or metadata pressure refused the snapshot; retry after cleanup.
+    InsufficientSpace,
 }
 
 /// Outcome durably bound to one guarded rollback operation.
@@ -564,6 +566,8 @@ pub enum GuardedRollbackRejectionCodeV2 {
     CwdScanFailed,
     /// A diff path cannot be represented as UTF-8; unchanged input must not be retried.
     UnsupportedWorkspacePath,
+    /// Backend space or metadata pressure refused the rollback; retry after cleanup.
+    InsufficientSpace,
 }
 
 /// Validates the canonical `ws-xxxxxx` identifier and optional `-N` collision suffix.
@@ -3665,8 +3669,9 @@ mod tests {
             GuardedCheckpointRejectionCodeV2::WriteLockConflict,
             GuardedCheckpointRejectionCodeV2::CallerMismatch,
             GuardedCheckpointRejectionCodeV2::EvidenceCapacityReached,
+            GuardedCheckpointRejectionCodeV2::InsufficientSpace,
         ];
-        for (code, expected_discriminant) in rejection_codes.iter().zip(0_u32..=11) {
+        for (code, expected_discriminant) in rejection_codes.iter().zip(0_u32..=12) {
             assert_eq!(
                 bincode::serialize(code).unwrap(),
                 expected_discriminant.to_le_bytes()
@@ -3710,8 +3715,9 @@ mod tests {
             GuardedRollbackRejectionCodeV2::CwdOccupied,
             GuardedRollbackRejectionCodeV2::CwdScanFailed,
             GuardedRollbackRejectionCodeV2::UnsupportedWorkspacePath,
+            GuardedRollbackRejectionCodeV2::InsufficientSpace,
         ];
-        for (code, expected_discriminant) in rollback_rejections.iter().zip(0_u32..=16) {
+        for (code, expected_discriminant) in rollback_rejections.iter().zip(0_u32..=17) {
             assert_eq!(
                 bincode::serialize(code).unwrap(),
                 expected_discriminant.to_le_bytes()

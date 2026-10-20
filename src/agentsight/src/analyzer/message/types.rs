@@ -202,18 +202,23 @@ pub enum OpenAIContent {
 }
 
 impl OpenAIContent {
-    /// Extract text content as a single string
+    /// Extract text content as a single string.
+    ///
+    /// Multi-block content is joined with `\n` (empty text blocks skipped) to
+    /// match the raw path's `joined_text_parts`: `IdResolver` derives its keys
+    /// from this text on both the typed and the raw path, so the two paths
+    /// must agree on the same request.
     pub fn as_text(&self) -> String {
         match self {
             OpenAIContent::Text(s) => s.clone(),
             OpenAIContent::Parts(parts) => parts
                 .iter()
                 .filter_map(|p| match p {
-                    OpenAIContentPart::Text { text } => Some(text.as_str()),
+                    OpenAIContentPart::Text { text } if !text.is_empty() => Some(text.as_str()),
                     _ => None,
                 })
                 .collect::<Vec<_>>()
-                .join(""),
+                .join("\n"),
         }
     }
 }
@@ -606,6 +611,10 @@ pub struct OpenAiSseChoice {
     /// an increment. Kept untyped because its shape is the terminal message.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<serde_json::Value>,
+    /// Legacy `/v1/completions` fragment. That protocol puts the generated
+    /// text directly on the choice, with no `delta` or `message` object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
     /// Reason for finishing (stop, length, tool_calls, etc.)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
@@ -940,7 +949,20 @@ mod tests {
                 text: "World".to_string(),
             },
         ]);
-        assert_eq!(parts_content.as_text(), "Hello World");
+        assert_eq!(parts_content.as_text(), "Hello \nWorld");
+
+        let with_empty = OpenAIContent::Parts(vec![
+            OpenAIContentPart::Text {
+                text: String::new(),
+            },
+            OpenAIContentPart::Text {
+                text: "A".to_string(),
+            },
+            OpenAIContentPart::Text {
+                text: "B".to_string(),
+            },
+        ]);
+        assert_eq!(with_empty.as_text(), "A\nB");
     }
 
     #[test]

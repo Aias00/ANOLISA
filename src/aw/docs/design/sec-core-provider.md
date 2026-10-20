@@ -46,7 +46,7 @@ process; it calls the existing daemon. Already-dispatched daemon work is bounded
 by sec-core and is not rolled back by terminating its client.
 
 The private configuration and runnable Host walkthrough are documented in the
-[user guide](../../../../docs/user-guide/en/user-entrypoint/aw-sec-core.md).
+[user guide](../../../../docs/user-guide/en/user-entrypoint/aw/security.md).
 The sample supplies an entire AWConfiguration; no common configuration schema
 changes are required. Deployment ownership, native Hook scheduling, effect
 adoption and persistent AW auditing remain responsibilities of the daemon and
@@ -55,7 +55,9 @@ aw-provider` command must switch their Provider argv to this standalone bridge.
 
 ## Validation boundary
 
-`cargo test --locked -p aw-provider-sec-core` exercises public CLI fixtures,
+Run from the repository root.
+
+`cargo test --locked --manifest-path providers/agent-sec-core/Cargo.toml` exercises public CLI fixtures,
 request binding, offline operations, config rejection, exact argv, decision and
 failure mapping, budget/output limits, Host cancellation of the nested CLI and
 external deadline cleanup while the Provider waits for EOF on an open stdin.
