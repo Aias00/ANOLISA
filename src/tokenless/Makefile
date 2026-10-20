@@ -393,7 +393,9 @@ test-benchmark-rtk-probe:
 	@echo "==> Testing benchmark RTK version probe..."
 	bash tests/test-benchmark-rtk-version-probe.sh
 
+# Hook counterfactuals need both real binaries to rule out fail-open success.
 test-rtk-integration: test-benchmark-rtk-probe
+	cargo build --locked -p tokenless-cli
 	bash scripts/setup-rtk.sh
 	cargo build --release --locked --manifest-path third_party/rtk/Cargo.toml
 	TOKENLESS_TEST_RTK_BINARY="$(CURDIR)/third_party/rtk/target/release/rtk" \
@@ -451,6 +453,8 @@ test-adapters: build-openclaw-plugin build-dsh-plugin test-npm-package
 	bash tests/test-dsh-adapter.sh
 	@echo "==> Testing qoder adapter installer..."
 	bash tests/test-qoder-adapter-install.sh
+	@echo "==> Testing Claude Code adapter installer..."
+	bash tests/test-claude-code-adapter-install.sh
 	@echo "==> Testing Qwen Code adapter installer..."
 	python3 tests/test_qwencode_install.py
 	@echo "==> Testing OpenCode adapter..."

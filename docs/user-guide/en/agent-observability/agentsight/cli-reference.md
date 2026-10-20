@@ -12,8 +12,8 @@ it is a real capture.
 |---|---|
 | Privileges | `trace` needs root (or `CAP_BPF` + `CAP_PERFMON`). Query commands need read access to `/var/log/sysak/.agentsight`, which the packaged service owns — use `sudo`. |
 | Config file | Commands that read rules accept `--config`, default `/etc/agentsight/config.json`. `discover` reads the same file `trace` does, so it reflects your custom rules. |
-| Data location | Fixed at `/var/log/sysak/.agentsight`. `serve`, `dashboard`, `skill-metrics`, `audit`, `metrics`, `summary`, and `interruption` accept `--db` to point at a different database file. |
-| Machine output | `--json` is available on `discover`, `token`, `audit`, `summary`, `interruption *`, and `skill-metrics *`. |
+| Data location | Fixed at `/var/log/sysak/.agentsight`. `serve`, `dashboard`, `skill-metrics`, `audit`, `metrics`, `summary`, `interruption`, and `token` accept `--db` to point at a different database file. |
+| Machine output | `--json` is available on `discover`, `token`, `metrics`, `audit`, `summary`, `interruption *`, and `skill-metrics *`. |
 | Output language | `summary`, `metrics`, and `interruption` print English; `discover` and `token` print Chinese regardless of locale. Use `--json` for stable, language-neutral text. |
 | Platform | On macOS only `trace` (trajectory collector) and `serve` exist. |
 | Sample IDs | Session, conversation, trace, and interruption IDs in the examples are placeholders — substitute the ones from your own output. |
@@ -158,6 +158,7 @@ One-command health picture for a recent window.
 FLAGS:
         --json                          Output as JSON
 OPTIONS:
+        --agent <agent>                 Scope the session and interruption totals to one agent
         --db <db>                       Override the sessions database path
         --last <last>                   Query the last N hours (default: 24) [default: 24]
         --tokenless-db <tokenless-db>   Override the tokenless stats database path
@@ -190,6 +191,20 @@ the reading host's own data.
 agentsight summary --last 24 --db /backup/agentsight/genai_events.db
 ```
 
+`--agent` narrows the Sessions and Interruptions sections to one agent, and the two sections match
+the same way their own stores do. Sessions compare the label the session listing already resolves —
+the recorded agent name, falling back to the process name — while interrupts compare the
+`agent_name` column only, which is what `interruption list --agent` filters on. Both matches are
+case-insensitive. The heading and the JSON gain an `agent` key naming the scope; without the flag
+both sections cover every agent and the report keeps its previous shape.
+
+```bash
+agentsight summary --last 24 --agent CoshNG
+```
+
+Tokenless savings are recorded per session and carry no agent, so an agent-scoped report leaves
+that section out and says so rather than printing host-wide numbers beside agent-scoped totals.
+
 ## agentsight token
 
 Token consumption for a period, optionally compared with the previous one.
@@ -201,9 +216,18 @@ FLAGS:
 
 OPTIONS:
         --data-file <data-file>    Custom data file path
+        --db <db>                  Override the database path (same as --data-file)
         --hours <hours>            Query last N hours
         --period <period>          Query by fixed time period
                                    [possible values: today, yesterday, week, last_week, month, last_month]
+```
+
+`--db` is the same override every other query command spells that way; it was added after
+`--data-file`, which stays supported. Pass one or the other — giving both is a usage error.
+
+```bash
+# read a copy of the database instead of the default location
+agentsight token --db /backup/agentsight/agentsight.db --period week
 ```
 
 ```bash
@@ -334,6 +358,23 @@ agentsight_token_input_total{agent="Cosh"} 50000
 agentsight_token_output_total{agent="CoshNG"} 10000
 ```
 
+`--json` prints the same per-agent rows as objects (`agent_name`, `input_tokens`, `output_tokens`,
+`total_tokens`, `request_count`) instead of the exposition format, for scripts that would otherwise
+have to parse it:
+
+```bash
+$ sudo agentsight metrics --json
+[
+  {
+    "agent_name": "CoshNG",
+    "input_tokens": 100000,
+    "output_tokens": 10000,
+    "total_tokens": 110000,
+    "request_count": 42
+  }
+]
+```
+
 The running server exposes the same content at `GET /metrics` (localhost only), which is usually
 easier to scrape. See [Data and storage](data-and-storage.md#prometheus-metrics).
 
@@ -386,6 +427,40 @@ OPTIONS:
         --severity <severity>    [possible values: critical, high, medium, low]
 ```
 
+`stats` and `count` take the same `--agent` filter `list` does, so one agent's breakdown can be
+read without post-processing `list --json`:
+
+```
+FLAGS:
+        --json          Output as JSON
+
+OPTIONS:
+        --agent <agent>          Filter by agent name (exact match)
+        --last <last>            Query last N hours (default: 24) [default: 24]
+```
+
+`stats` additionally takes the `--unresolved` / `--resolved` pair, so the per-type table can
+answer "what is still open in this window" without also counting events someone already closed:
+
+```
+FLAGS:
+        --json          Output as JSON
+        --resolved      Count only resolved events
+        --unresolved    Count only unresolved events
+```
+
+```
+$ sudo agentsight interruption stats --last 168 --unresolved
+TYPE                 SEVERITY    COUNT
+----------------------------------------
+token_limit          medium          3
+llm_error            high            1
+```
+
+Without either flag `stats` keeps its previous scope and reports the whole window (resolved and
+unresolved); the two flags are mutually exclusive. `count` is unchanged and still reports
+unresolved events only. Without `--agent` both cover every agent on the host.
+
 ```bash
 $ sudo agentsight interruption list --last 24
 INTERRUPTION_ID                    TYPE          SEVERITY  OCCURRED_AT              RESOLVED  AGENT    SESSION_ID
@@ -420,13 +495,27 @@ Interruption Event Detail
 # per-type counts for the last week
 sudo agentsight interruption stats --last 168
 
+# the same breakdown for one agent only
+sudo agentsight interruption stats --last 168 --agent CoshNG
+
 # unresolved counts by severity
 sudo agentsight interruption count --last 24
+
+# unresolved counts for one agent only
+sudo agentsight interruption count --last 24 --agent CoshNG
 
 # everything that hit one session, then close one event
 sudo agentsight interruption session 00000000-1111-2222-3333-444444444444
 sudo agentsight interruption resolve 11111111222222223333333344444444
+
+# only what is still open in that session
+sudo agentsight interruption session 00000000-1111-2222-3333-444444444444 --unresolved
 ```
+
+`session` and `conversation` take the same `--unresolved` / `--resolved` pair `list` and `stats`
+do, so a per-id view can be narrowed to the events still open (or already closed) without reading
+the `RESOLVED` column by eye. The two flags are mutually exclusive; without either the command
+prints the id's whole history, as before.
 
 > `--type` accepts every interruption type the detector can produce (the values are derived from
 > `InterruptionType::ALL`). `agentsight interruption list --help` prints the current list; the full
@@ -450,14 +539,26 @@ OPTIONS (all subcommands):
         --db <db>          Override database path
         --last <last>      Query last N hours (default: 168 = 7 days) [default: 168]
         --json             Output as JSON
+
+OPTIONS (all, hotness):
+        --granularity <granularity>    Bucket the hotness trend by day or week
+                                       [possible values: day, week] [default: week]
 ```
 
 ```bash
 sudo agentsight skill-metrics all --last 168
 sudo agentsight skill-metrics hotness --agent CoshNG --json
+
+# daily buckets instead of the weekly default
+sudo agentsight skill-metrics hotness --last 168 --granularity day
 ```
 
-The same numbers appear on the Dashboard's Skill Metrics page.
+The same numbers appear on the Dashboard's Skill Metrics page, which switches the same
+day/week granularity on its hotness chart. `--granularity` buckets only the hotness trend, so
+`all` and `hotness` accept it and the four metric-specific subcommands do not — passing it
+there is a usage error, the same refusal `GET /api/skill-metrics/downloads` and its siblings
+return. Without the flag the trend keeps its weekly buckets, and the text and JSON output are
+unchanged.
 
 ## Related pages
 

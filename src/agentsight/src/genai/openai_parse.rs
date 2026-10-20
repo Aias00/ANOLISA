@@ -263,10 +263,11 @@ impl GenAIBuilder {
             // `max_output_tokens`. Read whichever the request carries so
             // the token-limit interruption rules and the
             // `gen_ai.request.max_tokens` telemetry keep working.
+            // A null legacy `max_tokens` is not a cap and must not stop the
+            // search before a newer spelling that carries one.
             max_tokens: ["max_tokens", "max_completion_tokens", "max_output_tokens"]
                 .iter()
-                .find_map(|key| param(key))
-                .and_then(|v| v.as_u64())
+                .find_map(|key| param(key).and_then(|v| v.as_u64()))
                 .map(|v| v as u32),
             frequency_penalty: param("frequency_penalty").and_then(|v| v.as_f64()),
             presence_penalty: param("presence_penalty").and_then(|v| v.as_f64()),
@@ -628,6 +629,13 @@ impl GenAIBuilder {
                     (Some(delta), _) => (delta, false),
                     (None, Some(message)) => (message, true),
                     (None, None) => {
+                        // Legacy `/v1/completions` streams carry their
+                        // fragment directly on the choice, with neither a
+                        // `delta` nor a `message` object, so skipping the
+                        // choice dropped the whole answer of a drained call.
+                        if let Some(text) = choice.get("text").and_then(|v| v.as_str()) {
+                            content_buf.push_str(text);
+                        }
                         // Even a choice with no payload can carry the terminal
                         // finish reason.
                         if let Some(fr) = choice.get("finish_reason").and_then(|v| v.as_str()) {
@@ -936,32 +944,52 @@ impl GenAIBuilder {
                     let Some(index) = chunk.get("index").and_then(|v| v.as_u64()) else {
                         continue;
                     };
+                    // Match `content_block_start`: a delta must not revive an
+                    // index the start event refuses to allocate.
+                    if index >= MAX_TOOL_CALL_SLOTS {
+                        continue;
+                    }
                     let Some(delta) = chunk.get("delta") else {
                         continue;
                     };
                     match delta.get("type").and_then(|v| v.as_str()) {
                         Some("text_delta") => {
-                            if let (Some(text), Some(Block::Text(buf))) = (
-                                delta.get("text").and_then(|v| v.as_str()),
-                                blocks.get_mut(&index),
-                            ) {
-                                buf.push_str(text);
+                            if let Some(text) = delta.get("text").and_then(|v| v.as_str()) {
+                                // A drain capture can attach after the
+                                // block-start event. The live analyzer
+                                // creates the missing block on the first
+                                // delta; dropping it here lost every text
+                                // fragment of a mid-stream capture.
+                                let block = blocks
+                                    .entry(index)
+                                    .or_insert_with(|| Block::Text(String::new()));
+                                if let Block::Text(buf) = block {
+                                    buf.push_str(text);
+                                }
                             }
                         }
                         Some("thinking_delta") => {
-                            if let (Some(text), Some(Block::Thinking(buf))) = (
-                                delta.get("thinking").and_then(|v| v.as_str()),
-                                blocks.get_mut(&index),
-                            ) {
-                                buf.push_str(text);
+                            if let Some(text) = delta.get("thinking").and_then(|v| v.as_str()) {
+                                let block = blocks
+                                    .entry(index)
+                                    .or_insert_with(|| Block::Thinking(String::new()));
+                                if let Block::Thinking(buf) = block {
+                                    buf.push_str(text);
+                                }
                             }
                         }
                         Some("input_json_delta") => {
-                            if let (Some(fragment), Some(Block::ToolUse { args_json, .. })) = (
-                                delta.get("partial_json").and_then(|v| v.as_str()),
-                                blocks.get_mut(&index),
-                            ) {
-                                args_json.push_str(fragment);
+                            if let Some(fragment) =
+                                delta.get("partial_json").and_then(|v| v.as_str())
+                            {
+                                let block = blocks.entry(index).or_insert_with(|| Block::ToolUse {
+                                    id: String::new(),
+                                    name: String::new(),
+                                    args_json: String::new(),
+                                });
+                                if let Block::ToolUse { args_json, .. } = block {
+                                    args_json.push_str(fragment);
+                                }
                             }
                         }
                         _ => {}
@@ -1674,6 +1702,20 @@ mod tests {
         assert_eq!(req.max_tokens, Some(2048));
     }
 
+    /// A null legacy spelling is not a cap: the chain must keep looking so a
+    /// newer key carrying the real cap is not shadowed.
+    #[test]
+    fn test_parse_request_body_null_max_tokens_falls_back() {
+        let body = r#"{
+            "model": "o3",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": null,
+            "max_completion_tokens": 2048
+        }"#;
+        let req = GenAIBuilder::parse_request_body(body).expect("body parses");
+        assert_eq!(req.max_tokens, Some(2048));
+    }
+
     /// The DashScope/Bailian native protocol nests its sampling parameters
     /// under `parameters`; reading only top level left the output cap and every
     /// other parameter empty for that traffic.
@@ -2072,6 +2114,60 @@ mod tests {
         ));
     }
 
+    /// A drain capture often attaches after `content_block_start`. The live
+    /// analyzer creates the missing block on the first delta; the drain merger
+    /// used to drop every delta whose start was never seen, leaving the call
+    /// with no output at all.
+    #[test]
+    fn test_merge_anthropic_sse_chunks_deltas_without_block_starts() {
+        let body = r#"[
+            {"type":"message_start","message":{"id":"msg_1","model":"claude","usage":{"input_tokens":5}}},
+            {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"weigh"}},
+            {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"hello"}},
+            {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"/tmp/a\"}"}}
+        ]"#;
+        let (parts, _) = GenAIBuilder::extract_parts_from_sse_body(body)
+            .expect("a delta-only Anthropic capture must still yield parts");
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Reasoning { content } if content == "weigh"
+        ));
+        assert!(matches!(
+            &parts[1],
+            MessagePart::Text { content } if content == "hello"
+        ));
+        assert!(
+            parts.iter().any(|p| matches!(
+                p,
+                MessagePart::ToolCall { arguments, .. }
+                    if arguments == &Some(serde_json::json!({"path": "/tmp/a"}))
+            )),
+            "the streamed tool input must survive: {parts:?}"
+        );
+    }
+
+    /// `content_block_start` refuses indices at or above
+    /// `MAX_TOOL_CALL_SLOTS`; a delta on the same index must not revive the
+    /// block the start path rejected.
+    #[test]
+    fn test_merge_anthropic_sse_chunks_ignores_out_of_range_delta_index() {
+        let body = r#"[
+            {"type":"message_start","message":{"id":"msg_1","model":"claude","usage":{"input_tokens":5}}},
+            {"type":"content_block_delta","index":256,"delta":{"type":"text_delta","text":"ghost"}}
+        ]"#;
+        // The merger falls back when it has no block to report, so `None` and
+        // an empty part list both mean the delta was dropped.
+        let parts = GenAIBuilder::extract_parts_from_sse_body(body)
+            .map(|(parts, _)| parts)
+            .unwrap_or_default();
+        assert!(
+            !parts
+                .iter()
+                .any(|p| matches!(p, MessagePart::Text { content } if content == "ghost")),
+            "an out-of-range delta index must be dropped: {parts:?}"
+        );
+    }
+
     /// A Gemini `streamGenerateContent` body carries no `choices` and no
     /// sentinel frame: each chunk is a standalone generation payload. The
     /// merger must merge text parts across chunks, map whole `functionCall`
@@ -2467,6 +2563,25 @@ mod tests {
         let (parts, finish) = GenAIBuilder::extract_parts_from_sse_body(body).unwrap();
         assert_eq!(finish, Some("length".to_string()));
         assert!(matches!(&parts[0], MessagePart::Text { content } if content == "hi"));
+    }
+
+    /// Legacy `/v1/completions` streams carry each fragment on the choice
+    /// itself, with no `delta` or `message` object. `merge_sse_chunks` skipped
+    /// every such chunk, so a drained legacy stream produced no output
+    /// message at all while the token extractor counted its text.
+    #[test]
+    fn test_merge_sse_chunks_reads_legacy_completion_text() {
+        let body = r#"[
+            {"id":"cmpl-1","object":"text_completion","choices":[{"index":0,"text":"The capital of "}]},
+            {"id":"cmpl-1","object":"text_completion","choices":[{"index":0,"text":"France is Paris.","finish_reason":"stop"}]}
+        ]"#;
+        let (parts, finish) = GenAIBuilder::extract_parts_from_sse_body(body)
+            .expect("a drained legacy stream must produce output parts");
+        assert_eq!(finish, Some("stop".to_string()));
+        assert!(
+            matches!(&parts[0], MessagePart::Text { content } if content == "The capital of France is Paris."),
+            "{parts:?}"
+        );
     }
 
     #[test]

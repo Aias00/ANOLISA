@@ -26,19 +26,25 @@ use crate::genai::semantic::{LLMCall, MessagePart, ToolUse};
 /// the client executes it before asking again, so the stream completed
 /// normally and must not be treated as truncation.
 fn is_normal_finish(reason: Option<&str>) -> bool {
-    matches!(
-        reason,
-        Some(
-            "stop"
-                | "tool_calls"
-                | "function_call"
-                | "end_turn"
-                | "tool_use"
-                | "stop_sequence"
-                | "pause_turn"
-                | "refusal"
-        )
-    )
+    /// The stop reasons a completed turn may report. Compared ASCII
+    /// case-insensitively: the casing is the provider's, not the protocol's,
+    /// and Gemini spells every one of them in upper case (`STOP`), which the
+    /// detector stored verbatim and then failed to recognise.
+    const NORMAL: &[&str] = &[
+        "stop",
+        "tool_calls",
+        "function_call",
+        "end_turn",
+        "tool_use",
+        "stop_sequence",
+        "pause_turn",
+        "refusal",
+    ];
+    reason.is_some_and(|reason| {
+        NORMAL
+            .iter()
+            .any(|known| reason.eq_ignore_ascii_case(known))
+    })
 }
 
 /// Whether the finish reason indicates a token-limit stop (handled by rule 9).
@@ -46,7 +52,13 @@ fn is_normal_finish(reason: Option<&str>) -> bool {
 /// Both spellings are in use: OpenAI and the DashScope native protocol report
 /// `length`, Anthropic reports `max_tokens`.
 fn is_token_limit_finish(reason: Option<&str>) -> bool {
-    matches!(reason, Some("length" | "max_tokens"))
+    // Gemini reports the same cap as `MAX_TOKENS`; like the normal stop
+    // reasons below it is matched case-insensitively.
+    reason.is_some_and(|reason| {
+        ["length", "max_tokens"]
+            .iter()
+            .any(|known| reason.eq_ignore_ascii_case(known))
+    })
 }
 
 /// Structured error reported inside a `200` SSE body, if any.
@@ -305,10 +317,21 @@ fn tool_response_failure_text(value: &serde_json::Value) -> Option<String> {
 }
 
 fn traced_tool_failure(call: &LLMCall) -> Option<(&'static str, Option<String>, String)> {
+    // Only the trailing run of tool-result messages belongs to the turn this
+    // call answers. Earlier results stay in the replayed history, and scanning
+    // them blamed every later call for a failure that was already handled
+    // (unified stamps each call's interruption_type from this event).
     let request_parts = call
         .request
         .messages
         .iter()
+        .rev()
+        .take_while(|message| {
+            message
+                .parts
+                .iter()
+                .any(|part| matches!(part, MessagePart::ToolCallResponse { .. }))
+        })
         .flat_map(|message| message.parts.iter());
     let response_parts = call
         .response
@@ -438,10 +461,13 @@ impl InterruptionDetector {
         // Bound here rather than at the safety-filter rule below: the
         // context-overflow rule needs it too, and it has to run before the
         // stream rules that read the same value.
+        // Multi-choice responses (`n > 1`) carry one message per choice; the
+        // last choice is decisive, matching the turn-terminal probe in
+        // `call_builder` and the SSE aggregation that takes the final chunk.
         let finish_reason = call
             .response
             .messages
-            .first()
+            .last()
             .and_then(|m| m.finish_reason.as_deref());
 
         let is_context_overflow = combined_error.contains("context_length_exceeded")
@@ -458,7 +484,8 @@ impl InterruptionDetector {
             // a terminal stop reason of its own ("treat the response as
             // truncated"): the answer was cut at the window boundary, not by
             // the stream, so it is a context overflow and not `sse_truncated`.
-            || finish_reason == Some("model_context_window_exceeded")
+            || finish_reason
+                .is_some_and(|reason| reason.eq_ignore_ascii_case("model_context_window_exceeded"))
             // HTTP 413 from some gateways
             || status_code == 413;
 
@@ -635,7 +662,7 @@ impl InterruptionDetector {
 
         // ── 6. SafetyFilter (finish_reason == "content_filter") ───────────────
         // 必须在 LlmError 之前检查：部分厂商对 content_filter 返回 200 + finish_reason
-        if finish_reason == Some("content_filter") {
+        if finish_reason.is_some_and(|reason| reason.eq_ignore_ascii_case("content_filter")) {
             let detail = serde_json::json!({
                 "model": call.model,
                 "finish_reason": "content_filter",
@@ -767,7 +794,7 @@ impl InterruptionDetector {
         // ── 10. Context overflow via finish_reason (200 response, input overflow)
         // 有些模型在输入超出上下文窗口时仍返回 200 + finish_reason="length"。
         // 通过 input_tokens >> max_tokens 启发式判定（input > max_tokens * 4）
-        if finish_reason == Some("length") {
+        if finish_reason.is_some_and(|reason| reason.eq_ignore_ascii_case("length")) {
             if let Some(usage) = &call.token_usage {
                 if let Some(max_tokens) = call.request.max_tokens {
                     // If input tokens are much larger than the output cap, this
@@ -1112,6 +1139,68 @@ mod tests {
         assert_eq!(
             events[0].interruption_type,
             InterruptionType::ContextOverflow
+        );
+    }
+
+    /// Gemini reports every finish reason in upper case (`STOP`, `MAX_TOKENS`,
+    /// `SAFETY`), and `finish_reason` is stored exactly as the wire carried it.
+    /// The detector compared it against lower-case spellings only, so a Gemini
+    /// stream that ended normally matched no normal-stop spelling and rule 8
+    /// reported `sse_truncated` (High) on every completed generation.
+    #[test]
+    fn test_gemini_uppercase_stop_is_a_normal_finish() {
+        let detector = InterruptionDetector::default();
+        let mut call = make_base_call();
+        call.metadata
+            .insert("is_sse".to_string(), "true".to_string());
+        call.duration_ns = 5_000_000_000; // > 1 second min
+        call.response.messages = vec![OutputMessage {
+            role: "assistant".to_string(),
+            parts: vec![MessagePart::Text {
+                content: "4".to_string(),
+            }],
+            name: None,
+            finish_reason: Some("STOP".to_string()),
+        }];
+        let events = detector.detect(&call);
+        assert!(
+            events.is_empty(),
+            "a complete Gemini answer must not report an interruption, got {events:?}"
+        );
+    }
+
+    /// The token-limit spelling is cased by the provider too: Gemini answers
+    /// `MAX_TOKENS` where OpenAI answers `length`. Rule 8 must skip it (rule 9
+    /// owns it) and rule 9 must still fire on the ratio.
+    #[test]
+    fn test_gemini_uppercase_max_tokens_is_a_token_limit() {
+        let detector = InterruptionDetector::default();
+        let mut call = make_base_call();
+        call.metadata
+            .insert("is_sse".to_string(), "true".to_string());
+        call.duration_ns = 5_000_000_000;
+        call.request.max_tokens = Some(4096);
+        call.token_usage = Some(TokenUsage {
+            input_tokens: 1000,
+            output_tokens: 3900, // 3900/4096 = 0.952 >= 0.95
+            total_tokens: 4900,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+        });
+        call.response.messages = vec![OutputMessage {
+            role: "assistant".to_string(),
+            parts: vec![MessagePart::Text {
+                content: "partial".to_string(),
+            }],
+            name: None,
+            finish_reason: Some("MAX_TOKENS".to_string()),
+        }];
+        let events = detector.detect(&call);
+        assert!(
+            events
+                .iter()
+                .any(|e| e.interruption_type == InterruptionType::TokenLimit),
+            "an upper-case MAX_TOKENS stop must report TokenLimit, got {events:?}"
         );
     }
 
@@ -2017,6 +2106,108 @@ mod tests {
         );
     }
 
+    /// A failure that has already been answered stays in the replayed request
+    /// history. Scanning the whole history re-reported it for every later
+    /// call, stamping those calls with a `tool_failure` they did not have.
+    #[test]
+    fn test_historical_tool_failure_is_not_reported_for_a_later_call() {
+        let detector = InterruptionDetector::default();
+        let mut call = make_base_call();
+        call.request.messages = vec![
+            InputMessage {
+                role: "user".to_string(),
+                parts: vec![MessagePart::Text {
+                    content: "inspect the file".to_string(),
+                }],
+                name: None,
+            },
+            InputMessage {
+                role: "assistant".to_string(),
+                parts: vec![MessagePart::ToolCall {
+                    id: Some("call_old".to_string()),
+                    name: "read".to_string(),
+                    arguments: None,
+                }],
+                name: None,
+            },
+            InputMessage {
+                role: "user".to_string(),
+                parts: vec![MessagePart::ToolCallResponse {
+                    id: Some("call_old".to_string()),
+                    response: serde_json::json!({
+                        "is_error": true,
+                        "content": "ENOENT: no such file or directory"
+                    }),
+                }],
+                name: None,
+            },
+            InputMessage {
+                role: "assistant".to_string(),
+                parts: vec![MessagePart::ToolCall {
+                    id: Some("call_new".to_string()),
+                    name: "read".to_string(),
+                    arguments: None,
+                }],
+                name: None,
+            },
+            InputMessage {
+                role: "user".to_string(),
+                parts: vec![MessagePart::ToolCallResponse {
+                    id: Some("call_new".to_string()),
+                    response: serde_json::json!({
+                        "is_error": false,
+                        "content": "ok"
+                    }),
+                }],
+                name: None,
+            },
+        ];
+
+        call.response.messages = vec![OutputMessage {
+            role: "assistant".to_string(),
+            parts: vec![MessagePart::Text {
+                content: "the file is missing".to_string(),
+            }],
+            name: None,
+            finish_reason: Some("stop".to_string()),
+        }];
+
+        let events = detector.detect(&call);
+        assert!(
+            events.is_empty(),
+            "the answered failure must not follow the call: {events:?}"
+        );
+    }
+
+    /// Parallel results arrive as one trailing message; a failure in any of
+    /// them still belongs to the call being answered.
+    #[test]
+    fn test_trailing_parallel_tool_failure_is_still_reported() {
+        let detector = InterruptionDetector::default();
+        let mut call = make_base_call();
+        call.request.messages = vec![InputMessage {
+            role: "user".to_string(),
+            parts: vec![
+                MessagePart::ToolCallResponse {
+                    id: Some("call_a".to_string()),
+                    response: serde_json::json!({"is_error": true, "content": "ENOENT"}),
+                },
+                MessagePart::ToolCallResponse {
+                    id: Some("call_b".to_string()),
+                    response: serde_json::json!({"is_error": false, "content": "ok"}),
+                },
+            ],
+            name: None,
+        }];
+
+        let events = detector.detect(&call);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].interruption_type, InterruptionType::ToolFailure);
+        let detail: serde_json::Value =
+            serde_json::from_str(events[0].detail.as_ref().unwrap()).unwrap();
+        assert_eq!(detail["tool_use_id"], "call_a");
+    }
+
     #[test]
     fn test_successful_tool_result_is_not_a_failure() {
         // A result that declares success keeps its content, and command
@@ -2653,5 +2844,68 @@ mod tests {
         let events = detector.detect_tool_use(&tool, None, None);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].interruption_type, InterruptionType::ToolFailure);
+    }
+    #[test]
+    fn multi_choice_uses_the_last_finish_reason() {
+        // OpenAI's `n > 1` responses carry one message per choice and the
+        // pipeline treats the last choice as decisive (call_builder's
+        // turn-terminal probe does the same). Reading only the first choice
+        // missed a cap on the last one and reported an earlier safety stop as
+        // the outcome of a call that finished normally.
+        let detector = InterruptionDetector::default();
+        let mut capped = make_base_call();
+        capped
+            .metadata
+            .insert("is_sse".to_string(), "true".to_string());
+        capped.duration_ns = 2_000_000_000;
+        capped.request.max_tokens = Some(4096);
+        capped.token_usage = Some(TokenUsage {
+            input_tokens: 100,
+            output_tokens: 3900,
+            total_tokens: 4000,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+        });
+        capped.response.messages = vec![
+            OutputMessage {
+                role: "assistant".to_string(),
+                parts: vec![],
+                name: None,
+                finish_reason: Some("stop".to_string()),
+            },
+            OutputMessage {
+                role: "assistant".to_string(),
+                parts: vec![],
+                name: None,
+                finish_reason: Some("length".to_string()),
+            },
+        ];
+        let events = detector.detect(&capped);
+        assert!(
+            events
+                .iter()
+                .any(|e| e.interruption_type == InterruptionType::TokenLimit),
+            "the capped last choice must raise TokenLimit"
+        );
+
+        let mut normal = make_base_call();
+        normal.response.messages = vec![
+            OutputMessage {
+                role: "assistant".to_string(),
+                parts: vec![],
+                name: None,
+                finish_reason: Some("content_filter".to_string()),
+            },
+            OutputMessage {
+                role: "assistant".to_string(),
+                parts: vec![],
+                name: None,
+                finish_reason: Some("stop".to_string()),
+            },
+        ];
+        assert!(
+            detector.detect(&normal).is_empty(),
+            "a normal last choice must not inherit the first choice's safety stop"
+        );
     }
 }

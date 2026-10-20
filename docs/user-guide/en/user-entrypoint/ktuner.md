@@ -1,6 +1,6 @@
 # ktuner
 
-ktuner is a deterministic kernel-tuning engine for AI agents. It evaluates 207 rules against the running system and outputs structured JSON recommendations, so an agent (or a human) can diagnose, apply, and roll back kernel parameter changes safely.
+ktuner is a deterministic kernel-tuning engine for AI agents. It evaluates 208 rules against the running system and outputs structured JSON recommendations, so an agent (or a human) can diagnose, apply, and roll back kernel parameter changes safely.
 
 ---
 

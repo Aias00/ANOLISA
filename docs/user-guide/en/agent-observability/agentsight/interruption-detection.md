@@ -85,6 +85,10 @@ TYPE                 SEVERITY    COUNT
 token_limit          medium          1
 ```
 
+Add `--agent CoshNG` to `stats` or `count` to read that breakdown for one agent instead of the
+whole host; without the flag both cover every agent in the window. `count` stays unresolved-only,
+`stats` counts resolved and unresolved events.
+
 ### 3. Which events
 
 ```bash
@@ -96,7 +100,8 @@ INTERRUPTION_ID                    TYPE          SEVERITY  OCCURRED_AT          
 Total: 1 event(s)
 ```
 
-Useful filters: `--severity critical`, `--agent CoshNG`, `--unresolved`, `--limit`, `--json`.
+Useful filters: `--severity critical`, `--agent CoshNG` (also on `stats` and `count`),
+`--unresolved`, `--limit`, `--json`.
 
 All IDs shown in this page's examples are placeholders — use the ones from your own output.
 

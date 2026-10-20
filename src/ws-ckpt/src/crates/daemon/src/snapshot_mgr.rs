@@ -284,10 +284,8 @@ pub async fn checkpoint(
         });
     }
 
-    // 5. Disk space note: btrfs snapshot creation is a pure metadata/COW
-    //    operation that succeeds even on a full disk, so we do NOT block
-    //    checkpoint here.  Space reporting is still available via `ws-ckpt status`
-    //    and the health-check scheduler.
+    // 5. Disk space: the backend refuses subvolume creation under data or
+    //    metadata pressure before any side effect (#7234).
 
     // 6. Construct paths
     let snap_dir = state.index_dir(&ws.ws_id);
